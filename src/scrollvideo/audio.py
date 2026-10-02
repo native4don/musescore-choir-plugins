@@ -19,6 +19,8 @@ from typing import List, Optional
 
 from lxml import etree
 
+from src import musescore_cli as ms_cli
+
 VOLUME_CTRL = "7"
 # The CLI occasionally wedges (a stuck dialog, another instance); without a bound
 # it hangs the whole render. Long enough for a big score to export audio.
@@ -33,19 +35,24 @@ def musescore_cli() -> str:
 
 
 def run_musescore(input_path: str, output_path: str, timeout: int = CLI_TIMEOUT) -> str:
-    """Convert/export via the MuseScore CLI; returns output_path."""
+    """Convert/export via the MuseScore CLI; returns output_path.
+
+    Whether the run worked is `musescore_cli.ok`'s decision, not this function's:
+    MuseScore 4 writes its file and then crashes on the way out, and that is not
+    a failed export.
+    """
     try:
-        result = subprocess.run([musescore_cli(), input_path, "-o", output_path],
-                                capture_output=True, text=True, timeout=timeout)
+        result = ms_cli.run([musescore_cli(), input_path, "-o", output_path],
+                            output_path, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError(
             f"MuseScore CLI did not finish within {timeout}s writing "
             f"{os.path.basename(output_path)}. A stuck MuseScore process will do this; "
             "check for a running mscore and kill it.") from None
-    if result.returncode != 0 or not os.path.exists(output_path):
+    if not ms_cli.ok(result):
         raise RuntimeError(
             f"MuseScore CLI failed writing {os.path.basename(output_path)}. "
-            "Check MUSESCORE_CLI_PATH.\n" + (result.stderr or result.stdout or ""))
+            "Check MUSESCORE_CLI_PATH.\n" + result.said)
     return output_path
 
 

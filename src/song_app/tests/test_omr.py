@@ -660,8 +660,8 @@ def test_a_runaway_slur_swallows_syllable_slots_and_the_rule_gives_them_back(tmp
             '<part-list><score-part id="P1"><part-name>V</part-name></score-part>'
             f'</part-list>{etree.tostring(part, encoding="unicode")}</score-partwise>')
         mscx = str(tmp_path / f"{name}.mscx")
-        subprocess.run([_musescore(), "-o", mscx, str(path)],
-                       check=True, capture_output=True, timeout=300)
+        from src import musescore_cli
+        musescore_cli.export(_musescore(), str(path), mscx, timeout=300)
         counts = slot_counts(etree.parse(mscx).getroot())
         return sum(sum(bars.values()) for bars in counts.values())
 
