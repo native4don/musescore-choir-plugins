@@ -155,28 +155,52 @@ def _midi(path: str) -> bool:
     return tracks > 0 and position == len(data)
 
 
-def _wav(path: str) -> bool:
-    """RIFF/WAVE, no longer than it says it is, with a data chunk that is all there.
+def wav_details(path: str) -> Optional[Dict[str, int]]:
+    """What a whole WAV holds, or ``None`` if it is not one.
 
-    Read by hand rather than with the ``wave`` module, which refuses anything but
-    integer PCM: a float WAV is a complete file and this is not the place to turn
-    it away.
+    ``format`` (1 integer PCM, 3 floating point, ...), ``channels``, ``rate`` and
+    ``frames``. Whole means: RIFF/WAVE, no longer than it says it is, naming at
+    least one channel and a sample rate, with a data chunk that has audio in it and
+    is all there.
+
+    Read by hand rather than with the ``wave`` module, for two reasons that pull in
+    opposite directions. That module reads integer PCM and nothing else, and
+    MuseScore 4 writes floating point: ``wave.Error: unknown format: 3`` on a file
+    that plays. And it believes the header, so a file cut short opens without
+    complaint.
     """
     size = os.path.getsize(path)
     with open(path, "rb") as source:
         head = source.read(12)
         if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
-            return False
+            return None
         if struct.unpack("<I", head[4:8])[0] + 8 > size:
-            return False
+            return None
+        described = None
         position = 12
         while position + 8 <= size:
             source.seek(position)
             kind, length = struct.unpack("<4sI", source.read(8))
-            if kind == b"data":
-                return length > 0 and position + 8 + length <= size
+            if kind == b"fmt ":
+                if length < 16:
+                    return None
+                described = struct.unpack("<HHIIHH", source.read(16))
+            elif kind == b"data":
+                if described is None:
+                    return None
+                tag, channels, rate, _byte_rate, block, _bits = described
+                if channels <= 0 or rate <= 0 or block <= 0 or length <= 0:
+                    return None
+                if position + 8 + length > size:
+                    return None
+                return {"format": tag, "channels": channels, "rate": rate,
+                        "frames": length // block}
             position += 8 + length + (length & 1)
-    return False
+    return None
+
+
+def _wav(path: str) -> bool:
+    return wav_details(path) is not None
 
 
 def _pdf(path: str) -> bool:

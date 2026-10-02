@@ -12,9 +12,9 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
-import wave
 from typing import List, Optional
 
 from lxml import etree
@@ -103,11 +103,17 @@ def render_mix(mscx_path: str, focus: Optional[str], out_path: str, **volumes) -
 
 
 def _valid_wav(path: str) -> bool:
-    """A cache entry is reusable only after a complete, readable WAV was written."""
+    """A cache entry is reusable only after a complete WAV with audio in it was written.
+
+    Whichever kind of WAV it is. This used to ask Python's `wave` module to open
+    the file, and that module reads integer PCM only: MuseScore 4 writes floating
+    point, so every mix it rendered was called invalid with a playable file on
+    disk. It also believes the header, so a file cut short was accepted. What a
+    whole WAV is lives in `musescore_cli.wav_details`.
+    """
     try:
-        with wave.open(path, "rb") as wav:
-            return wav.getnchannels() > 0 and wav.getframerate() > 0 and wav.getnframes() > 0
-    except (FileNotFoundError, EOFError, wave.Error):
+        return ms_cli.wav_details(path) is not None
+    except (OSError, struct.error):
         return False
 
 
