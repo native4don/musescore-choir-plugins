@@ -143,7 +143,7 @@ def test_new_issue_link_is_global_and_mobile_safe(live_app, own_answers, page):
     )
     expect(link).to_be_visible()
     assert link.get_attribute("href") == (
-        "https://github.com/eerovil/musescore-choir-plugins/issues/new"
+        "https://github.com/native4don/musescore-choir-plugins/issues/new"
         "?template=issue-for-agent-to-fix.md"
     )
     assert link.get_attribute("target") == "_blank"
