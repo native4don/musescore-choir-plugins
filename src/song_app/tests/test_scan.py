@@ -13,6 +13,7 @@ assembled score untested, which is where a hole would go unnoticed.
 
 import json
 import os
+from fractions import Fraction
 import time
 
 import pytest
@@ -62,6 +63,7 @@ class Reader:
         self.cropped = []
         self.read = []
         self.engines = []
+        self.bar_lengths = []
         self.fail = {}
         self.staves, self.bars = staves, bars
         # What `read_page` would stamp the parse with when the caller named no
@@ -79,9 +81,11 @@ class Reader:
             images.append(pdf_systems.SystemImage(bounds=band, path=path))
         return images
 
-    def read_system(self, image, out_dir, log=None, queue=True, engine=None):
+    def read_system(self, image, out_dir, log=None, queue=True, engine=None,
+                    bar_length=None):
         self.read.append(image.index)
         self.engines.append(engine)
+        self.bar_lengths.append(bar_length)
         boom = self.fail.get(image.index)
         if boom:
             raise boom
@@ -395,6 +399,26 @@ def test_a_score_still_starts_at_clean(client, songs):
                     files={"xml": ("s.musicxml", b"<score/>", "text/xml")})
     assert r.status_code == 200
     assert state.load(r.json()["slug"]).stage == "clean"
+
+
+def test_a_blank_name_falls_back_to_the_pdfs_file_name(client, songs):
+    r = client.post("/api/songs", data={"name": "  "},
+                    files={"pdf": ("Laulun_aika.pdf", b"%PDF-1.4\n", "application/pdf"),
+                           "xml": ("other.musicxml", b"<score/>", "text/xml")})
+    assert r.status_code == 200
+    assert state.load(r.json()["slug"]).name == "Laulun aika"
+
+
+def test_a_blank_name_with_only_a_score_takes_the_scores_file_name(client, songs):
+    r = client.post("/api/songs", files={"xml": ("Hanget soi.mscz", b"x", "application/zip")})
+    assert r.status_code == 200
+    assert state.load(r.json()["slug"]).name == "Hanget soi"
+
+
+def test_a_typed_name_wins_over_the_file_name(client, songs):
+    r = client.post("/api/songs", data={"name": "Typed"},
+                    files={"pdf": ("page.pdf", b"%PDF-1.4\n", "application/pdf")})
+    assert state.load(r.json()["slug"]).name == "Typed"
 
 
 def test_neither_a_score_nor_a_pdf_is_refused(client, songs):
@@ -840,6 +864,29 @@ def test_another_homr_reading_the_same_music_costs_nothing(songs, reader, monkey
         assert fresh.stage == "clean"
 
 
+def test_note_positions_are_not_part_of_the_content_stamp(tmp_path):
+    """homr's ``imgpos`` comments say where it looked, not what it read (#220).
+
+    So a parse carrying them stamps as the same parse without them, and the
+    first re-read after the upgrade lapses nobody's approval -- while a parse
+    whose music differs still stamps differently.
+    """
+    note = ("<note><pitch><step>{}</step><octave>4</octave></pitch>"
+            "<duration>4</duration><voice>1</voice>{}</note>")
+    doc = '<?xml version="1.0"?><score-partwise><part id="P1"><measure number="1">{}</measure></part></score-partwise>'
+    plain = tmp_path / "plain.musicxml"
+    marked = tmp_path / "marked.musicxml"
+    other = tmp_path / "other.musicxml"
+    plain.write_text(doc.format(note.format("C", "") + note.format("D", "")))
+    marked.write_text(doc.format(note.format("C", "<!-- imgpos: 45, 231 -->")
+                                 + note.format("D", "<!-- imgpos: 80, 229 -->")))
+    other.write_text(doc.format(note.format("C", "<!-- imgpos: 45, 231 -->")
+                                + note.format("E", "<!-- imgpos: 80, 229 -->")))
+
+    assert scan.content_stamp(str(marked)) == scan.content_stamp(str(plain))
+    assert scan.content_stamp(str(other)) != scan.content_stamp(str(plain))
+
+
 def test_a_different_reading_still_costs_what_it_always_did(songs, reader, tmp_path):
     """The other half: this is not a licence to keep answers that went stale."""
     with per_system.use_answer_file(str(tmp_path / "answers.json")):
@@ -870,7 +917,7 @@ def _moved(reader, **by_system):
     """Make the stub report moved rests for the named systems."""
     original = reader.read_system
 
-    def read_system(image, out_dir, log=None, queue=True, engine=None):
+    def read_system(image, out_dir, log=None, queue=True, engine=None, bar_length=None):
         produced = original(image, out_dir, log=log, queue=queue, engine=engine)
         produced.moved_rests = [
             omr.MovedRest(measure=str(bar), staff="2", was="5", now="7")
@@ -1081,3 +1128,109 @@ def test_nothing_is_attributed_from_a_health_record_about_an_older_score(songs, 
     assert scan.status(song)["findings"] is None
     # ...and the two stages agree about why.
     assert verification.summary(song, systems=3)["health"]["status"] == "stale"
+
+
+# --- bars on the bands (#243) ---------------------------------------------
+#
+# A PDF-only song has its bands drawn before any score exists, so they are saved
+# with no bars, and the comparison and the by-system lyric editor skip a band with
+# none. The scan and the clean are where a score with line breaks first exists.
+# Converting the assembled MusicXML needs MuseScore, so a real converted score with
+# seven printed systems stands in for its output.
+
+LAULUN_AIKA = os.path.join(os.path.dirname(__file__), "..", "..", "clean_score",
+                           "tests", "test_files", "laulun_aika.mscx")
+LAULUN_AIKA_BARS = [(1, 6), (7, 11), (12, 15), (16, 19), (20, 25), (26, 29), (30, 35)]
+
+
+def _bars_on_bands(song):
+    return [(b.measure_start, b.measure_end) for b in pdf_systems.load_bounds(song.dir)]
+
+
+def test_a_finished_scan_labels_the_bands_with_their_bars(songs, reader, monkeypatch):
+    song = _song(songs, bands=7)
+    assert _bars_on_bands(song) == [(0, 0)] * 7
+    converted = []
+    monkeypatch.setattr(pipeline, "convert_to_mscx",
+                        lambda path, out_dir, log=None: converted.append(path) or LAULUN_AIKA)
+    server._run_scan(song.slug, {})
+    song = _reload(song)
+    assert converted and converted[-1] == song.path(scan.ASSEMBLED_NAME)
+    assert _bars_on_bands(song) == LAULUN_AIKA_BARS
+    # Geometry is the band stamp, so labelling throws nothing away.
+    assert scan.reconcile(song) == []
+    assert scan.status(song)["holes"] == []
+
+
+def test_a_scan_with_a_hole_labels_nothing(songs, reader, monkeypatch):
+    song = _song(songs, bands=7)
+    reader.fail[3] = omr.HomrError("could not read it")
+    monkeypatch.setattr(pipeline, "convert_to_mscx",
+                        lambda path, out_dir, log=None: LAULUN_AIKA)
+    server._run_scan(song.slug, {})
+    assert _bars_on_bands(_reload(song)) == [(0, 0)] * 7
+
+
+def test_labelling_keeps_the_geometry_and_refuses_a_count_that_disagrees(songs):
+    song = _song(songs, bands=7)
+    before = pdf_systems.load_bounds(song.dir)
+    assert pipeline.label_system_bounds(song.dir, LAULUN_AIKA)
+    after = pdf_systems.load_bounds(song.dir)
+    assert [(b.index, b.page, b.top, b.bottom) for b in after] == \
+        [(b.index, b.page, b.top, b.bottom) for b in before]
+    assert not pipeline.label_system_bounds(song.dir, LAULUN_AIKA)  # nothing new
+
+    other = _song(songs, bands=3)
+    assert not pipeline.label_system_bounds(other.dir, LAULUN_AIKA)
+    assert _bars_on_bands(other) == [(0, 0)] * 3
+
+
+def test_a_clean_labels_the_bands_of_a_song_scanned_before_this(songs, monkeypatch, tmp_path):
+    song = _song(songs, bands=7)
+    import shutil
+    cleaned = song.path("score_cleaned.mscx")
+    shutil.copy(LAULUN_AIKA, cleaned)
+    song.data["sources"]["xml"] = "scanned.musicxml"
+    song.save()
+    monkeypatch.setattr(pipeline, "run_clean",
+                        lambda *a, **k: (cleaned, LAULUN_AIKA))
+    server._run_clean(song.slug)
+    song = _reload(song)
+    assert song.data.get("cleaned") == "score_cleaned.mscx"
+    assert _bars_on_bands(song) == LAULUN_AIKA_BARS
+
+
+# --- the bar length a system is read in (#245) ---------------------------
+
+def test_each_system_is_read_knowing_the_bar_length_the_one_before_ended_in(songs, reader):
+    song = _song(songs, bands=3)
+
+    scan.run(song)
+
+    # The first system has nothing before it; the stub's fragments are in 4/4.
+    assert reader.bar_lengths == [None, Fraction(1), Fraction(1)]
+
+
+def test_the_bar_length_is_the_meter_in_force_at_the_end_of_the_previous_system(songs, reader):
+    song = _song(songs, bands=2)
+    scan.run(song)
+    fresh = _reload(song)
+    path = fresh.path(fresh.data["scan"]["systems"]["1"]["musicxml"])
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    # A change to 3/4 in the last bar is what the next system starts in.
+    text = text.replace('<measure number="2">', '<measure number="2"><attributes><time>'
+                        '<beats>3</beats><beat-type>4</beat-type></time></attributes>', 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    assert scan.bar_length_before(fresh, 2) == Fraction(3, 4)
+    assert scan.bar_length_before(fresh, 1) is None
+
+
+def test_no_bar_length_without_a_readable_previous_fragment(songs, reader):
+    song = _song(songs, bands=2)
+    scan.run(song)
+    fresh = _reload(song)
+    os.remove(fresh.path(fresh.data["scan"]["systems"]["1"]["musicxml"]))
+    assert scan.bar_length_before(fresh, 2) is None

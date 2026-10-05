@@ -130,10 +130,20 @@ def _new_song(page, base, name, per_system=True):
     page.get_by_placeholder("Song name").fill(name)
     page.locator("#f-xml").set_input_files(FIXTURE)
     page.locator("select").select_option("men")     # laulun_aika is a male-choir score
-    if per_system:
-        page.locator("input[type=checkbox]").check()
     page.get_by_role("button", name="Create").click()
     expect(page.locator(".stagebar")).to_be_visible()
+    if per_system:
+        _use_per_system(page, base)
+        expect(page.locator(".stagebar")).to_be_visible()
+
+
+def _use_per_system(page, base):
+    """Switch the song just created to per-system mode, as the Clean panel's
+    toggle does: the New song form no longer asks."""
+    slug = page.url.split("#/song/", 1)[1]
+    response = page.request.post(f"{base}/api/songs/{slug}/mode", data={"mode": "per-system"})
+    assert response.ok, response.text()
+    page.reload()
 
 
 def test_per_system_answers_clean_the_score_and_lyrics_land_on_their_cell(live_app, own_answers, page):
@@ -572,18 +582,47 @@ def test_creating_a_song_needs_one_file_and_says_which_are_missing(page, live_ap
     page.wait_for_url("**/#/song/**", timeout=30_000)
     expect(page.locator(".stagebar .step.active")).to_have_text("Clean")
 
+def test_a_blank_name_takes_the_files_own_name(page, live_app):
+    """Choosing a file fills a blank name with the file's own name (#241)."""
+    page.goto(live_app)
+    page.get_by_role("button", name="+ New song").click()
+    name = page.get_by_placeholder("Song name")
+    page.locator("#f-pdf").set_input_files(PDF_FIXTURE)
+    stem = os.path.splitext(os.path.basename(PDF_FIXTURE))[0].replace("_", " ")
+    expect(name).to_have_value(stem)
+    # A typed name is never replaced by a later file choice.
+    name.fill("Typed")
+    page.locator("#f-xml").set_input_files(FIXTURE)
+    expect(name).to_have_value("Typed")
+    # Cleared again, the next choice fills it, and the PDF's name still leads.
+    page.locator("#f-xml").set_input_files([])
+    name.fill("")
+    page.locator("#f-xml").set_input_files(FIXTURE)
+    expect(name).to_have_value(stem)
+    page.locator("#f-xml").set_input_files([])
+    page.locator("select").select_option("men")
+    if evidence := os.getenv("EVIDENCE_DIR"):
+        page.screenshot(path=os.path.join(evidence, "new-song-blank-name.png"))
+    page.get_by_role("button", name="Create").click()
+
+    page.wait_for_url("**/#/song/**", timeout=30_000)
+    expect(page.locator("#crumb")).to_contain_text(stem)
+    if evidence := os.getenv("EVIDENCE_DIR"):
+        page.screenshot(path=os.path.join(evidence, "song-named-from-file.png"))
+
+
 def test_finding_the_systems_fills_the_editor_and_saves_nothing(
         page, live_app, bounds_song, monkeypatch):
     """The button proposes; the person still saves.
 
-    Stubbed, because what homr says is pinned against real scans in
-    test_system_finder.py and this is about what the editor then does with it:
+    Stubbed, because what the finder says is pinned against real scans in
+    test_quick_system_finder.py and this is about what the editor then does with it:
     the bands arrive unsaved and the song still holds what it held.
     """
     from src.song_app import pdf_systems, system_finder
 
     slug, _, stored = bounds_song
-    monkeypatch.setattr(system_finder, "find_bands", lambda *a, **k: [
+    monkeypatch.setattr(system_finder, "quick_bands", lambda *a, **k: [
         pdf_systems.SystemBounds(index=i + 1, page=1, top=t, bottom=t + 0.3)
         for i, t in enumerate((0.05, 0.35, 0.65))
     ])

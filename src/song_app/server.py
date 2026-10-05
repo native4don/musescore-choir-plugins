@@ -16,9 +16,10 @@ from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
                                Response)
 from fastapi.staticfiles import StaticFiles
 
-from . import (agentdeck, health, heavy_slot, job_state, omr, pdf_systems,
-               pipeline, pwa_assets, scan, state, system_finder, verification)
+from . import (agentdeck, health, heavy_slot, homr_install, job_state, omr,
+               pdf_systems, pipeline, pwa_assets, scan, state, system_finder, verification)
 from src.clean_score.utils.score_fixes import FixError
+from src.scrollvideo.score import format_groups, parse_groups
 
 SCRIPT_DIR = state.SCRIPT_DIR
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -337,9 +338,15 @@ def api_import() -> Dict:
     return {"imported": import_legacy()}
 
 
+def name_from_filename(filename: str) -> str:
+    """`Laulun_aika.pdf` -> `Laulun aika`: the stem, underscores as spaces."""
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    return " ".join(stem.replace("_", " ").split())
+
+
 @app.post("/api/songs")
 async def api_create(
-    name: str = Form(...),
+    name: str = Form(""),
     per_system: bool = Form(False),
     voicing: str = Form(""),
     xml: UploadFile = None,
@@ -354,16 +361,19 @@ async def api_create(
     manual route (#86), and a song that arrives with a score is past scanning by
     definition.
     """
-    if not name.strip():
-        raise HTTPException(400, "Name is required")
     has_xml = xml is not None and bool(xml.filename)
     has_pdf = pdf is not None and bool(pdf.filename)
     if not (has_xml or has_pdf):
         raise HTTPException(400, "A MuseScore/MusicXML file or a PDF is required")
+    # A blank name falls back to the file's own name, the PDF first since that
+    # is the ordinary way in (#241).
+    name = name.strip() or name_from_filename(pdf.filename if has_pdf else xml.filename)
+    if not name:
+        raise HTTPException(400, "Name is required")
 
     if voicing and voicing not in ("men", "women", "mixed"):
         raise HTTPException(400, "voicing must be men, women or mixed")
-    song = state.create(name.strip(), per_system, voicing)
+    song = state.create(name, per_system, voicing)
     sources = song.data.setdefault("sources", {})
     if has_xml:
         xml_name = os.path.basename(xml.filename)
@@ -388,7 +398,8 @@ def api_song(slug: str) -> Dict:
 # --------------------------------------------------------------------------
 # Scan stage — read the score off the PDF, one printed system at a time
 # --------------------------------------------------------------------------
-def _run_scan(slug: str, opts: Dict) -> None:
+def _run_scan(slug: str, opts: Dict,
+              reader: Optional[homr_install.Reader] = None) -> None:
     song = _require(slug)
     log = lambda m: _job_emit(slug, "scan", m)
     try:
@@ -398,6 +409,8 @@ def _run_scan(slug: str, opts: Dict) -> None:
         result = scan.run(song, log=log, only=opts.get("systems"),
                           engine=opts.get("engine"))
         holes = result["holes"]
+        if not holes:
+            _label_bounds(song, _bounds_score(_require(slug)))
         log(f"Read {result['read']} of {result['systems']} system(s)."
             + (f" Still to read: {', '.join(str(i) for i in holes)}." if holes
                else " Check it against the page, then say it is right."))
@@ -407,6 +420,8 @@ def _run_scan(slug: str, opts: Dict) -> None:
         _job_emit(slug, "scan", str(exc), "error")
         _job_finish(song, "scan", str(exc))
     finally:
+        if reader:
+            reader.release()
         lock = _scan_lock_path(song)
         if os.path.exists(lock):
             os.remove(lock)
@@ -427,6 +442,21 @@ async def api_scan(slug: str, body: Dict = None) -> Dict:
         raise HTTPException(
             400, "Page(s) " + ", ".join(str(p) for p in gaps) + " have no "
             "printed systems marked. Mark every page in the Systems viewer first.")
+    # Held from here until the scan's worker finishes: an install cannot start
+    # while it is, and this cannot start while an install runs.
+    try:
+        reader = homr_install.begin_read()
+    except homr_install.Refused as exc:
+        raise HTTPException(409, str(exc)) from None
+    try:
+        return _start_scan(song, slug, body, reader)
+    except BaseException:
+        reader.release()
+        raise
+
+
+def _start_scan(song: state.Song, slug: str, body: Optional[Dict],
+                reader: homr_install.Reader) -> Dict:
     opts = dict(body or {})
     try:
         opts["systems"] = [int(i) for i in (opts.get("systems") or [])]
@@ -457,7 +487,32 @@ async def api_scan(slug: str, body: Dict = None) -> Dict:
     except Exception as exc:
         _job_finish(song, "scan", str(exc))
         raise
-    asyncio.get_running_loop().run_in_executor(None, _run_scan, slug, opts)
+    asyncio.get_running_loop().run_in_executor(None, _run_scan, slug, opts, reader)
+    return {"started": True}
+
+
+
+@app.get("/api/homr/install")
+def api_homr_install_status(refresh: bool = False) -> Dict:
+    """Which homr is installed, whether the fork has moved on, and the install log.
+
+    `refresh` asks GitHub again rather than trusting the ten-minute cache.
+    """
+    return homr_install.status(refresh=refresh)
+
+
+@app.post("/api/homr/install")
+async def api_homr_install() -> Dict:
+    """Run scripts/install-homr.sh: install homr, or update it to the fork's main.
+
+    A press, never automatic, and refused while any song job is running — the
+    script replaces files inside the venv a scan would be reading from.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        homr_install.start(lambda work: loop.run_in_executor(None, work))
+    except homr_install.Refused as exc:
+        raise HTTPException(409, str(exc)) from None
     return {"started": True}
 
 
@@ -552,10 +607,14 @@ def _run_clean(slug: str) -> None:
     xml = song.source_path("xml")
     log = lambda m: _job_emit(slug, "clean", m)
     try:
+        opens: Dict = {}
         cleaned, source_mscx = pipeline.run_clean(
             xml, song.dir, per_system=(song.mode == "per-system"), log=log,
-            voicing=song.data.get("voicing") or None,
+            voicing=song.data.get("voicing") or None, check=opens,
         )
+        # A song scanned before the scan stage labelled its bands gets them here,
+        # off the same converted input.
+        _label_bounds(song, source_mscx)
         rel = os.path.relpath(cleaned, song.dir)
         song.data["cleaned"] = rel
         song.data["cleaned_fingerprint"] = state.file_fingerprint(cleaned)
@@ -563,8 +622,11 @@ def _run_clean(slug: str) -> None:
         song.data.setdefault("verification", {})["notes"] = {
             **note_check, "checked_against": song.data["cleaned_fingerprint"],
         }
+        song.data["verification"]["musescore"] = {
+            **opens, "checked_against": song.data["cleaned_fingerprint"],
+        }
         # Run the health check.
-        found = health.scan(cleaned)
+        found = _health_scan(song, cleaned)
         prev = song.data.get("health", {}).get("issues", [])
         song.data["health"] = {
             "checked_against": song.data["cleaned_fingerprint"],
@@ -606,18 +668,53 @@ async def api_clean(slug: str) -> Dict:
 # --------------------------------------------------------------------------
 # Fix stage — health check
 # --------------------------------------------------------------------------
+def _health_scan(song: state.Song, cleaned: str) -> List[Dict]:
+    """The health findings, plus anything MuseScore 3 still refuses in this score.
+
+    MuseScore's verdict comes from the clean (`pipeline.check_opens_in_musescore`) and
+    holds only for the file it was given: a score saved since then has been through
+    MuseScore, so its own check has had its say and those rows go.
+    """
+    found = health.scan(cleaned)
+    opens = song.data.get("verification", {}).get("musescore") or {}
+    if opens.get("rejected") and opens.get("checked_against") == state.file_fingerprint(cleaned):
+        found += pipeline.musescore_findings(cleaned, opens["rejected"])
+    return found
+
+
 def _rescan(song: state.Song) -> None:
+    """Re-check the cleaned score's health and record what it was checked against.
+
+    This owns two fields and nothing else, so it writes only those, onto the state
+    as it is on disk *now*. Saving the copy the caller loaded used to undo whatever
+    a route had saved in the meantime: the file watcher loaded a song, a lyric
+    import rewrote the score and saved its `lyrics` record and stage, and the
+    watcher's save put the pre-import state back (#252). `song` is refreshed to
+    what was written, so a caller answering with `_derived(song)` is not stale.
+    """
     cleaned = song.cleaned_path()
     if not cleaned or not os.path.exists(cleaned):
         return
+    fingerprint = state.file_fingerprint(cleaned)
     found = health.scan(cleaned)
-    prev = song.data.get("health", {}).get("issues", [])
-    song.data["cleaned_fingerprint"] = state.file_fingerprint(cleaned)
-    song.data["health"] = {
-        "checked_against": song.data["cleaned_fingerprint"],
-        "issues": health.merge_issues(found, prev),
-    }
-    song.save()
+    with state.song_lock(song.slug):
+        fresh = state.load(song.slug) or song
+        current = fresh.data.get("health", {})
+        # The score moved again while it was being checked, so these findings are
+        # about a file that is gone. Whoever moved it rescans it (the watcher sees
+        # the save); writing these now would record the older file over theirs.
+        moved = state.file_fingerprint(cleaned) != fingerprint
+        # Somebody already checked this exact file and said so — typically the
+        # route whose write woke the watcher. Theirs is the record; leave it.
+        if not moved and not (fresh.data.get("cleaned_fingerprint") == fingerprint
+                              and current.get("checked_against") == fingerprint):
+            fresh.data["cleaned_fingerprint"] = fingerprint
+            fresh.data["health"] = {
+                "checked_against": fingerprint,
+                "issues": health.merge_issues(found, current.get("issues", [])),
+            }
+            fresh.save()
+    song.data = fresh.data
 
 
 @app.post("/api/songs/{slug}/rescan")
@@ -851,16 +948,18 @@ def api_lyrics(slug: str, body: Dict) -> Dict:
     }
     # Import may add full-measure rests to otherwise empty measures, so health must
     # be checked again rather than rebound to the new fingerprint without evidence.
+    # Pitch events do not change during lyric placement, so this narrower result can
+    # safely follow the controlled XML edit without repeating the source comparison.
+    # Nor do note lengths, which are all MuseScore's own check looks at.
+    for name in ("notes", "musescore"):
+        data = song.data.get("verification", {}).get(name, {})
+        if data.get("checked_against") == previous_fingerprint:
+            data["checked_against"] = current_fingerprint
     previous_issues = song.data.get("health", {}).get("issues", [])
     song.data["health"] = {
         "checked_against": current_fingerprint,
-        "issues": health.merge_issues(health.scan(cleaned), previous_issues),
+        "issues": health.merge_issues(_health_scan(song, cleaned), previous_issues),
     }
-    # Pitch events do not change during lyric placement, so this narrower result can
-    # safely follow the controlled XML edit without repeating the source comparison.
-    note_data = song.data.get("verification", {}).get("notes", {})
-    if note_data.get("checked_against") == previous_fingerprint:
-        note_data["checked_against"] = current_fingerprint
     song.data["cleaned_fingerprint"] = current_fingerprint
     if result.ok:
         song.set_stage("review")
@@ -888,6 +987,14 @@ def _bounds_score(song) -> str:
         return pipeline.convert_to_mscx(xml, song.dir)
     except Exception:
         return ""
+
+
+def _label_bounds(song, mscx_path: str) -> None:
+    """Give the stored bands their bars, now there is a score to read them off."""
+    try:
+        pipeline.label_system_bounds(song.dir, mscx_path)
+    except Exception:  # a label is a convenience; never fail a scan or clean on it
+        traceback.print_exc()
 
 
 @app.get("/api/songs/{slug}/bounds")
@@ -933,11 +1040,34 @@ async def api_find_systems(slug: str, body: Dict = None) -> Dict:
     not. Nothing here writes `.systems.json`, so a wrong reading costs a drag
     rather than a scan of the wrong music.
 
-    Slow enough to watch — seconds a page — so its progress goes to the song's
-    live log while the request is still open.
+    Two ways to find them. `{"method": "quick"}`, the default, reads the page
+    itself in well under a second a page and needs no homr. `{"method": "homr"}`
+    asks homr, which is seconds a page, so its progress goes to the song's live
+    log while the request is still open.
     """
     song = _require(slug)
     pdf = _song_pdf(song)
+    method = (body or {}).get("method") or "quick"
+    if method not in ("quick", "homr"):
+        raise HTTPException(400, f"Unknown method {method!r}: use quick or homr")
+    if method == "quick":
+        log = lambda m: hub.emit(slug, {"type": "log", "line": m})
+        try:
+            found = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: pipeline.quick_system_bands(song.dir, pdf, log=log))
+        except Exception as exc:
+            traceback.print_exc()
+            raise HTTPException(500, str(exc)) from None
+        return {"systems": found}
+    try:
+        reader = homr_install.begin_read()
+    except homr_install.Refused as exc:
+        raise HTTPException(409, str(exc)) from None
+    with reader:
+        return await _find_with_homr(slug, pdf, body)
+
+
+async def _find_with_homr(slug: str, pdf: str, body: Optional[Dict]) -> Dict:
     key = (body or {}).get("engine")
     engine = None
     if key and key != omr.DEFAULT_ENGINE:
@@ -1178,8 +1308,22 @@ def _margin(value, label: str) -> float:
     return margin
 
 
-def _remember_margins(song: state.Song, top: float, bottom: float) -> None:
+def _staff_groups(cleaned: str, text) -> str:
+    """A staff grouping ("S1+S2, A1+A2") checked against this score, written the
+    one way it is stored. Blank is no grouping; a part the video does not have is
+    a 400 saying which."""
+    try:
+        return format_groups(pipeline.staff_groups(cleaned, str(text or "")))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+def _remember_margins(song: state.Song, top: float, bottom: float,
+                      staff_groups: Optional[str] = None) -> None:
     """Keep the framing this song was last shown at.
+
+    The staff grouping (#246) is part of the framing — it changes what is drawn,
+    not what is heard — so it is kept the same way, when given.
 
     Written when a render is asked for and when a preview succeeds, so nudging a
     margin to see what it looks like is enough to keep it — that is the moment the
@@ -1189,13 +1333,14 @@ def _remember_margins(song: state.Song, top: float, bottom: float) -> None:
     the same reason.
     """
     rec = song.data.get("record", {})
-    if (rec.get("top_margin"), rec.get("bottom_margin")) == (top, bottom):
+    wanted = {"top_margin": top, "bottom_margin": bottom}
+    if staff_groups is not None:
+        wanted["staff_groups"] = staff_groups
+    if all(rec.get(key) == value for key, value in wanted.items()):
         return
     if is_recording(song):
         return
-    rec = song.data.setdefault("record", {})
-    rec["top_margin"] = top
-    rec["bottom_margin"] = bottom
+    song.data.setdefault("record", {}).update(wanted)
     song.save()
 
 
@@ -1203,7 +1348,7 @@ def _remember_margins(song: state.Song, top: float, bottom: float) -> None:
 async def api_scroll_preview(slug: str, quality: str = "4k",
                              top_margin: float = DEFAULT_TOP_MARGIN_PERCENT,
                              bottom_margin: float = DEFAULT_BOTTOM_MARGIN_PERCENT,
-                             bpm: Optional[int] = None):
+                             bpm: Optional[int] = None, staff_groups: str = ""):
     """The scrolling render as pictures the browser can play, before any video exists.
 
     This is the picture without the encoding: the same engraving, viewport, clock,
@@ -1233,6 +1378,8 @@ async def api_scroll_preview(slug: str, quality: str = "4k",
         # preview has to be told the same grouping the render is told.
         "system_starts": _printed_systems(song),
     }
+    groups = _staff_groups(cleaned, staff_groups)
+    settings["staff_groups"] = parse_groups(groups)
     try:
         payload = await asyncio.get_running_loop().run_in_executor(
             None, lambda: pipeline.scroll_preview(song.dir, cleaned, **settings))
@@ -1243,7 +1390,7 @@ async def api_scroll_preview(slug: str, quality: str = "4k",
     # Only once the picture came out: a framing the renderer refuses is not one to
     # come back to. Reloaded, because preparing can take seconds.
     _remember_margins(_require(slug), settings["top_margin_percent"],
-                      settings["bottom_margin_percent"])
+                      settings["bottom_margin_percent"], groups)
     return JSONResponse(payload, headers=dict(REVALIDATE))
 
 
@@ -1267,7 +1414,7 @@ async def api_scroll_preview_audio(slug: str, revision: str, mix: str = "ALL",
                                    quality: str = "4k",
                                    top_margin: float = DEFAULT_TOP_MARGIN_PERCENT,
                                    bottom_margin: float = DEFAULT_BOTTOM_MARGIN_PERCENT,
-                                   bpm: Optional[int] = None):
+                                   bpm: Optional[int] = None, staff_groups: str = ""):
     """One selected MuseScore mix, prepared lazily for the browser preview."""
     song = _require(slug)
     cleaned = song.cleaned_path()
@@ -1280,6 +1427,7 @@ async def api_scroll_preview_audio(slug: str, revision: str, mix: str = "ALL",
         "initial_bpm": bpm if bpm and not pipeline.has_opening_tempo(cleaned) else None,
         "system_starts": _printed_systems(song),
     }
+    settings["staff_groups"] = parse_groups(_staff_groups(cleaned, staff_groups))
     try:
         path, reused = await asyncio.get_running_loop().run_in_executor(
             None, lambda: pipeline.scroll_preview_audio(
@@ -1354,6 +1502,8 @@ def _run_record(slug: str, opts: Dict) -> None:
                                                     hardware_encoding=hardware_encoding,
                                                     initial_bpm=opts.get("bpm"),
                                                     system_starts=_printed_systems(song),
+                                                    staff_groups=parse_groups(
+                                                        opts.get("staff_groups")),
                                                     log=slot.guard(log),
                                                     progress=slot.guard(progress),
                                                     **margin_options)
@@ -1366,6 +1516,7 @@ def _run_record(slug: str, opts: Dict) -> None:
             rec["hardware_encoding"] = hardware_encoding
             rec["top_margin"] = top_margin
             rec["bottom_margin"] = bottom_margin
+            rec["staff_groups"] = opts.get("staff_groups") or ""
             rec["outputs"] = [os.path.basename(p) for p in outputs]
             rec["rendered_against"] = start_fingerprint
             rec["verification"] = verification.verify_media(
@@ -1475,7 +1626,11 @@ async def api_record(slug: str, body: Dict = None) -> Dict:
                 ("top_margin", "Top", DEFAULT_TOP_MARGIN_PERCENT),
                 ("bottom_margin", "Bottom", DEFAULT_BOTTOM_MARGIN_PERCENT)):
             opts[key] = _margin(opts.get(key, remembered.get(key, default)), label)
-        _remember_margins(song, opts["top_margin"], opts["bottom_margin"])
+        if cleaned and os.path.exists(cleaned):
+            opts["staff_groups"] = _staff_groups(
+                cleaned, opts.get("staff_groups", remembered.get("staff_groups", "")))
+        _remember_margins(song, opts["top_margin"], opts["bottom_margin"],
+                          opts.get("staff_groups"))
     if scrolling_render and cleaned and os.path.exists(cleaned) \
             and not pipeline.has_opening_tempo(cleaned):
         try:
@@ -1574,14 +1729,21 @@ async def _watch_cleaned() -> None:
                 slug = os.path.basename(os.path.dirname(path))
                 touched.add(slug)
         for slug in touched:
-            song = state.load(slug)
-            if not song:
-                continue
-            # Only react if the file actually changed since our last scan.
-            fp = state.file_fingerprint(song.cleaned_path())
-            if fp and fp != song.data.get("cleaned_fingerprint"):
-                _rescan(song)
+            if _on_cleaned_saved(slug):
                 hub.emit(slug, {"type": "state"})
+
+
+def _on_cleaned_saved(slug: str) -> bool:
+    """React to a saved cleaned score; True when the health record was re-taken."""
+    song = state.load(slug)
+    if not song:
+        return False
+    # Only react if the file actually changed since our last scan.
+    fp = state.file_fingerprint(song.cleaned_path())
+    if not fp or fp == song.data.get("cleaned_fingerprint"):
+        return False
+    _rescan(song)
+    return True
 
 
 @app.on_event("startup")

@@ -65,6 +65,9 @@ fixtures/                In-repo prototyping song + the OMR benchmark's PD slice
                          (see fixtures/*/README.md, STEPS.md)
 songs/                   Per-song working dirs (gitignored, output lives here)
 backup/                  Gitignored .mscz backups (created by backup.sh)
+README.md                The web app, for people using it (screenshots in docs/images/)
+TOOLS.md                 The CLI tools and MuseScore plugins, run by hand
+CHANGELOG.md             What changed, by merge date — add a line for each user-facing PR
 *.txt prompts            lyric_json_prompt.txt, lyrics_txt_prompt.txt (LLM prompts for lyric fixing)
 ```
 
@@ -80,7 +83,9 @@ backup/                  Gitignored .mscz backups (created by backup.sh)
   `YOUTUBE_CLIENT_SECRETS_PATH`. Never commit real secrets;
   `.env`, `client_secrets.json`, and `token.pickle` are gitignored.
 - The CLI wrappers import the package via `from src.clean_score... import ...`,
-  so **run them from the repo root** (e.g. `./clean_score.py ...`).
+  so **run them from the repo root** (e.g. `./clean_score.py ...`). Their shebang is the
+  system `python3`, which lacks the dependencies, so unless `.venv` is activated run them
+  as `.venv/bin/python clean_score.py ...`.
 - `./song.py` prefers port 8000, scans the next 49 ports when it is occupied,
   and enables uvicorn source reload by default (watching only `src/`). Use
   `--port`, `--no-browser`, or `--no-reload` when needed.
@@ -124,7 +129,8 @@ read it — and it is free to change shape as the app does.
 automatic passes refuse to guess at (`utils/score_fixes.py`). Each entry names a
 staff, measure and chord, and says **why**. Applying is strict: an entry that no
 longer matches raises, so a pipeline change that moves the note fails the build
-instead of quietly leaving the defect in.
+instead of quietly leaving the defect in. Fix a song's defect from the printed page into
+that song's `fixes.json`, with the reason; do not add a deterministic repair pass for it.
 
 **Every song gets this, not just the fixture.** `run_clean` applies
 `<song dir>/fixes.json` right after cleaning (`pipeline.apply_recorded_fixes`), so a
@@ -222,7 +228,9 @@ See `fixtures/omr-benchmark/README.md`.
 
 An issue worker gets a fresh worktree under `.worktrees/issue-N`, and a fresh worktree
 has **no `.venv`, no `.env` and no `songs/`** — all three are gitignored and live only
-in the main checkout at `~/musescore-choir-plugins`. Without them nothing runs: there is
+in the main checkout at `~/musescore-choir-plugins`. Interactive sessions use their own
+worktree too (`git worktree add .worktrees/<topic> -b <branch> origin/main`), never that
+shared checkout: several sessions share it, and a dirty one blocks the deploy timer. Without them nothing runs: there is
 no interpreter with lxml in it, `MUSESCORE_CLI_PATH` is unset, and the app has no songs.
 Link them in before doing anything else:
 
@@ -342,15 +350,9 @@ Key test modules:
   chosen engine's argv *and environment* are what read the page. `test_install_homr.py`
   pins the other end — the one venv, what it says about itself, and an explicit
   `HOMR_SOURCE` being its own label.
-  A second half is added for #113: the **slurs**, written as little token streams
-  (`"1( 1) 3( 5)"`) because that is the level the defect lives at. A slur inside a bar
-  and one across a single barline survive; two barlines is dropped and the slurs on
-  either side of it are not; a redundant start, an unmatched stop and a start that
-  never stops all go; B5's own m46 shape resolves in one pass and finds nothing on a
-  second; `read_page` applies it and says so in the log; and a parse with nothing to
-  change comes back byte for byte as homr wrote it. The last needs MuseScore and is the
-  defect where it is felt: twelve notes over three bars offer four lyric slots with the
-  runaway and twelve without it.
+  The **slurs** half added for #113 moved to the fork with the repair (#144); what is
+  left pins that the app passes homr's slurs through untouched and that a parse with
+  nothing to change comes back byte for byte as homr wrote it.
   A third half is added for #164: the **whole-measure rests**. Most of it is little
   measures written note by note — a shared rest moves out, the notes behind it move back
   into the room it was taking (12 divisions, not 16, because the lost quarter rest is not
@@ -452,11 +454,8 @@ Key test modules:
   `test_scan.py` carries the attribution itself — the bar-to-system mapping, a collapsed
   row shared over the bars it names rather than landing on the first, and the three ways
   of refusing to attribute at all.
-- `src/song_app/tests/test_system_finder.py` — added by this pull request. Two tiers.
-  **No dependencies**: the grouping rule, written as little pages of staves and barlines
-  — staves carrying the same bars are one system, the end lines are not evidence, a
-  break needs the white to go with it, a staff with no barline of its own falls back to
-  the gap, and where the band edges land. **homr** (marked `omr`, ~70s): the acceptance,
+- `src/song_app/tests/test_system_finder.py` — the grouping-rule tier moved to the fork
+  with the rule (#144). **homr** (marked `omr`, ~70s): the acceptance,
   against the bands a person drew — the fixture's 15 across four pages and both Herää
   Suomi scans, each boundary within 0.02 of the hand-drawn one. The route and the button
   are pinned where they live: `test_bounds_api.py` (a proposal saves nothing, a page
@@ -487,6 +486,26 @@ Key test modules:
   renderer is not under test and a real MuseScore run would make it slow and
   host-dependent. Both were verified by sabotage: breaking the cell attachment or the
   `-` rule in `app.js` fails the matching test.
+- `test_shared_rests.py` / `src/song_app/tests/test_musescore_check.py` — added for
+  #235. The first: a rest shared at the end or in the middle of a bar reaches both
+  voices, a gap the other voice sings through or that its rests do not cover exactly is
+  left, a rest in a triplet is not copied, and a second run changes nothing. The
+  second: a reset bar is one whole-bar rest of the bar's own length naming the notes it
+  held, the other staff and bars are untouched, a tie or slur into it is cut; the real
+  MuseScore (skips without it) names a bar it refuses and accepts it once reset; no
+  MuseScore is "not checked"; the sentence is written once, replaced on a re-clean,
+  removed when the clean passes, and never touches a typed one.
+- `test_cross_voice_slurs.py` / `test_long_bars.py` / `src/song_app/tests/test_clean_marks.py`
+  — added for #238. A slur from one voice into the other loses both halves, is
+  reported as one slur, marks both bars and gives the lower voice its syllable back,
+  while a slur inside one voice is untouched. A bar an eighth too long comes back 4/4
+  with the cut notes named in its mark; a note across the barline is shortened, a
+  triplet across it goes whole, a voice off the beat grid is left short rather than
+  padded wrong, a tie into the cut-away part goes, and short bars, bars printing their
+  own signature and the bars either side are untouched. Then the marks: red, `⚠`,
+  listed by health until deleted, one Fix-panel sentence each replaced on every clean
+  (a typed one never touched), put on a bar MuseScore rejected, and absent from the
+  video.
 - `test_missing_tuplets.py` — the dropped-tuplet cross-voice auto-fix (mirror
   within/across staves; well-formed and donor-less voices left untouched).
 - `test_revoice.py` / `test_interactive.py` — the re-voicing plan and the
@@ -501,6 +520,13 @@ Key test modules:
   refusal (no reason, a span past the bar, a slur already there) writes neither. The
   third is the browser: the bar shown as its own notes, the cost said before the
   write, the warning when lyrics are already imported, and that it fits a phone.
+- `src/song_app/tests/test_state_race.py` — added for #252. The file watcher used to
+  save the whole song state it had loaded, so a lyric import that saved while the
+  watcher was checking health was silently undone. It drives both interleavings (a
+  copy loaded before the import, and the import landing mid-check) and asserts the
+  import's `lyrics` record and stage survive. The rule it pins: `_rescan` writes only
+  health and the fingerprint, onto the state re-read under `state.song_lock`, and
+  every `Song.save` takes that lock and writes by rename.
 - `src/song_app/tests/test_score_file.py` / `test_score_file_ui.py` — added by this
   pull request for taking the score away to MuseScore and bringing it back (#216).
   The first is mostly about what must **not** be replaced: a PDF, a transfer that
@@ -521,12 +547,14 @@ Scanning is split across two repositories — `eerovil/homr` (the fork) and this
 and until this pull request there was no written rule saying which gets a given fix.
 One was being followed consistently enough to be real and inconsistently enough that
 "why is this here?" had a different answer per case. This section is that rule,
-proposed by this pull request and settled on #141. **This file is the only place it is
-written down.** A short statement of it for the fork's `README.md` exists but is not
-merged — it is sitting on `eerovil/homr#22`, opened for #141 and now well behind that
-fork's `main` — so anybody reading `eerovil/homr` today finds nothing about which
-repository a fix belongs in. It stays that way until a person merges that pull request:
-`/merge` releases work in this repository and cannot release a fork's.
+proposed by this pull request and settled on #141. This file carries the full
+reasoning; the fork's `README.md` carries a short statement of the rule ("About this
+fork", merged as `eerovil/homr#22`).
+
+`/merge` on a card here releases a fork pull request too, as long as its description
+names the card in full (`eerovil/musescore-choir-plugins#<n>` or the issue URL; a bare
+`#<n>` does not count). It goes through the same review and test gates and is not
+merged by hand.
 
 **The fork is a permanent home we own.** Not a staging area, not a waiting room on the
 way upstream. `scripts/install-homr.sh` installs it and a second host reproduces it by
@@ -549,12 +577,27 @@ be repaired in either place and the call went both ways for reasons that lived o
 commit messages. Under this one it cannot: a runaway slur is not on the page, so it is
 homr's to not emit.
 
-**Which means this repo's OMR boundary layer was drift.** `omr.resolve_slurs`,
-`omr_systems`' per-system reading and `system_finder` are all "make the parse match the
-page", and all three are on the fork's side of the rule. They are staying where they
-are for now — **the rule binds new fixes**, and #141 files a separate issue, blocked by
-it, to move them. Until that lands, the code here contradicts the rule in three visible
-places and this paragraph is the reason why.
+**Which means this repo's OMR boundary layer was drift, and #144 moved it.** Slur
+pairing (`omr.resolve_slurs`), per-system reading and the system finder are all "make the
+parse match the page", so all three were ported into the fork (eerovil/homr#62, #63,
+#65). Once the fork was installed here (`main @ 7652330`) and re-measured on 21 printed
+systems, #144 took the app's copies of the **slur repair** and the **system finder's
+grouping rule** out: the old slur pass dropped nothing on the fork's output, and *Find
+systems* now only asks homr (`--find-system-bounds`). A homr older than that fork is
+refused for *Find systems* and its slurs go unrepaired — update it rather than reviving
+the copies. **The per-system cropping stays in `omr_systems`, and #223 measured why.**
+homr's own `--system-bounds` mode cuts the same padded band at the same dpi with the
+same pixel rounding; the one difference is the rasteriser (pypdfium where the app uses
+poppler). Re-measured on the fork after the upstream sync (`main @ 8512194`, 200 dpi,
+2% pad) with `scripts/system_bounds_vs_crop.py`, on the Virta fixture's 15 systems and
+B1a/B1b's 3 each: staves and bars agree on 21/21, the parses are identical on only 4,
+note counts differ by at most one per system, and against B1's hand transcription
+(onsets only — it writes every notehead as a C) the app's crop gets **107/120** onsets
+on B1a against homr's **106**, and **88/120** on B1b both ways, with homr's crop losing
+one slur on B1a system 2. The card's rule was to switch only if homr's route was at
+least as good, and it is not, so nothing moved. The gap is at noise level, so this is
+worth measuring again when a new scanned fixture with note-level truth exists — the
+script reuses reads it already has under `--out`.
 
 **`clean_score`'s OCR repairs are the known tension.** `fix_missing_tuplets`,
 `fix_spurious_timesigs`, `fix_overfull_measures`, `add_missing_ties` and the recorded
@@ -564,24 +607,32 @@ scores that never went through it — imported MusicXML, the songs already in `s
 and homr has no equivalent of a human-authorised `fixes.json` entry. Recorded here as a
 tension rather than as a plan, so nobody acts on the principle without the context.
 
-**Upstreaming is opportunistic: no obligation, no backlog.** The fork is a hundred-odd
-commits ahead of `liebharc/homr` and one or two behind — roughly a third of them the
-measurement harness, the rest general OMR fixes and choir fixtures. (Approximate on
-purpose: the fork moves most weeks, and an exact tally in this file is a number that
-goes stale the day after it is written.) If one is clean and somebody feels like
-sending it, good — nothing is tracked, nothing is owed, and no decision here ever waits
-on upstream review.
+**The fork follows upstream and takes all of it.** This replaces #158's rule that
+upstream is "a source of ideas rather than truth", and the owner changed it on #220: we
+do not pick commits out of `liebharc/homr` `main` or judge each one on our pages first —
+**every upstream commit is merged, new models included**, and the fork's own commits sit
+on top. A sync is one `git merge upstream/main` into the fork (so `git log` says which
+upstream commit the fork is on), and it is a card like #220, started when upstream moves.
+The harness still measures what a sync did to our repertoire, but **it reports; it does
+not decide**: #220 took model 465 although it read three of the five fixtures worse than
+model 426 had (`sammon-ryosto` 98% → 41%), and lowered their accepted levels rather than
+refuse the model.
 
-**And taking fixes *from* upstream is not the direction that matters either**, which is
-what this file used to say. #158 settled it: the fork is a permanent home we own, and
-**upstream is a source of ideas rather than truth**. #130 is the evidence — upstream
-`main` measured on this repertoire is *worse* than the pinned v0.7.0: 34 health findings
-against 24, meters invented on a piece the pin read as 4/4 with none declared, and
-`scripts/install-homr.sh` broken because onnxruntime had moved into a `[cpu]` extra. That
-is not bad luck: **we have measured our own repertoire and upstream has not.** Choral
-engraving — divisi written as chords, staff counts varying between systems, voices
-sharing a staff — is not what a general OMR project optimises for. So a fix comes in when
-it is good on *our* pages, judged by the harness, and not because it is upstream.
+Where upstream and the fork changed the same code, the resolution takes **upstream's
+version** unless the fork's is something upstream has no equivalent for. #220 is the
+example both ways: the note-timing fix upstream wrote for the bug the fork had fixed
+itself (df36447 against the fork's per-staff cursors) replaced the fork's, while the
+fork's voice, stem and system-bounds work, which upstream has nothing like, stayed and was
+wired to upstream's new second-voice tokens (`upper2`/`lower2`).
+
+#130's warning still stands as a fact about the past — upstream `main` once measured worse
+on this repertoire than a pinned release, and broke `scripts/install-homr.sh` by moving
+onnxruntime into a `[cpu]` extra — which is why a sync is measured and the numbers are
+published on its pull request. It is no longer a reason to stay behind.
+
+**Upstreaming our own changes is opportunistic: no obligation, no backlog.** If a fork
+commit is clean and somebody feels like sending it, good — nothing is tracked, nothing is
+owed, and no decision here ever waits on upstream review.
 
 **The harness stays in the fork.** `fixturecheck/`, `choir-bench.py`,
 `choir-worktree.sh` and `choir-k8s.sh` have to run inside homr's venv against a homr
@@ -601,6 +652,13 @@ over the existing scripts** — it adds no musical logic; it shells out to
 (`create_video.run`), and drives MuseScore via `open -a`. Full rationale and the
 state model are in `DESIGN.md`.
 
+- **Before working a song, check its source.** Song input scores come from Soundslice plus
+  hand fixes, so a reference built from a cleaned score is not ground truth: treat any
+  homr-vs-reference disagreement as a candidate and check it against the printed band.
+  Check that the input in `.song.json` is the raw import ("Track N" part names, crowded
+  voices, partial lyrics), not a finished score beside it; cross-check it bar by bar
+  (allowing a small offset) against another copy in `songs/`; and assume OCR lyrics are
+  mojibake and read the words off the page.
 - **A Song** = a folder `songs/<slug>/` plus `.song.json` (the state file *is* the
   UX). `state.py` owns the slug, the human display name, the stage machine
   (`register → scan → clean → fix → lyrics → review → record → upload`), and file
@@ -834,11 +892,26 @@ state model are in `DESIGN.md`.
   the explicit `min-height: 0`, or they refuse to shrink below their content and
   `overflow: auto` never fires.
 - `static/` **on a phone**: the three panes cannot share a 390px screen, so below the
-  breakpoint one is shown at a time and a bar at the bottom of the workspace switches
-  between them (Stages · the current stage · Score). The bar is in the DOM at every
-  width and the stylesheet hides it above the breakpoint — there is no width-sniffing
+  breakpoint the panel and the viewer are shown one at a time and a bar at the bottom
+  switches between them (the current stage · Score). The stage list is the same
+  left-hand sidebar as on desktop, slid in over the page by a ☰ in the header (#258);
+  opening it adds a history entry, so Android's Back closes it instead of leaving the
+  song. The bar, the ☰ and the drawer's backdrop are in the DOM at every
+  width and the stylesheet hides them above the breakpoint — there is no width-sniffing
   in `app.js` that could disagree with the media query, and every mobile rule is
-  additive, so the desktop layout is untouched. The breakpoint is
+  additive, so the desktop layout is untouched.
+  **The bar must never leave the screen**, and on an Android phone it did (#258) — not
+  reproduced in an emulated phone, so the fix does not rest on one cause. The bar is
+  pinned to the bottom of the window (`position: fixed`) with the workspace padded to
+  leave room, rather than being the grid's last row; the page snaps back to the top if
+  anything scrolls it (a field brought into view, the keyboard closing); the keyboard
+  shrinks the page instead of covering it (`interactive-widget=resizes-content`); and
+  the page cannot be pinch-zoomed below the breakpoint (`touch-action: pan-x pan-y`),
+  since a zoomed page carries the bar off with it. The score zooms itself instead —
+  pinch on it, or − / + / Fit in its tab row — redrawing the PDF at the new size
+  (`zoomPdf`). Those buttons are deliberately not `.vtab`: `rendering_state.js`
+  remembers a `.vtab` click as the document to reopen and replays it after every
+  redraw, and its `MOBILE_PANES` list is the bar's tabs by position. The breakpoint is
   `max-width: 840px, max-height: 500px`; the second condition catches a phone held
   sideways, which is wider than the breakpoint but nothing like tall enough. Two
   things had to change beyond CSS: the viewer's "wait for layout" retry now stops
@@ -1086,6 +1159,18 @@ state model are in `DESIGN.md`.
   So: a `uv`-managed python 3.12 venv outside the checkout, built by
   **`scripts/install-homr.sh`** (idempotent; `HOMR_VENV` moves it), called as a
   subprocess. A fresh clone runs one script.
+  **And the app can run that script itself** (#249, `homr_install.py`): the
+  Scan panel's *homr* box (moved there from the Library page by #261, since that is
+  where homr is used and where "not installed" is said) shows the installed commit against the fork's `main`
+  (`git ls-remote`, cached ten minutes) and an **Install / Update homr** button,
+  with the script's log fetched every 2s while it runs. It is still a press and
+  never automatic — the deploy does not touch homr, so the day a parse changes is a
+  day somebody chose. It runs under one heavy slot, is refused while any song job
+  runs (it replaces files inside the venv a scan reads from), and scans and *Ask
+  homr* answer 409 while it runs — each read holds a token file taken under the same `flock` as the install, so neither can start in the gap after the other's check, even across the old and new server during a restart; a pid lock file beside the songs keeps it to one
+  at a time. The button always installs `main` (an explicit `HOMR_SOURCE` is a
+  shell's business), and the script now fetches `uv` into `~/.local/bin` when a
+  host has none, which was the one step that stopped a fresh install cold.
   **Where homr comes from is one variable in that script, `HOMR_SOURCE`.** It defaulted
   to the immutable `eerovil/homr` commit matching upstream `v0.7.0`; this pull request
   moves it to **`@main`**, the fork's tip, which today is upstream's own tip. An
@@ -1094,11 +1179,13 @@ state model are in `DESIGN.md`.
   because the app only ever sees homr's output and by then the staves are gone; all
   three later landed upstream too, and `choir-0.7.0` is exactly the v0.7.0 tag. The
   fork **carrying nothing of its own** was true for about a month and is not true now:
-  it is a hundred-odd commits ahead of `liebharc/homr` and one or two behind — general
-  OMR fixes, choir fixtures, and the measurement harness — and it is not going back,
-  since the harness alone is about a third of that and belongs there. (Approximate on
-  purpose; see the section for why.) See "Where an OMR fix belongs"
-  above for which side of the line a new fix falls on.
+  it is a couple of hundred commits ahead of `liebharc/homr` — general OMR fixes, choir
+  fixtures, and the measurement harness — and it is not going back, since the harness
+  alone is a large share of that and belongs there. Since #220 it is **level with
+  upstream `main`** at each sync: everything upstream has is merged in (see "Where an OMR
+  fix belongs" above, which also says which side of the line a new fix falls on).
+  The app passes homr **`--no-title`**: it never uses the title homr reads, and since
+  upstream's 9ec3a78 reading one means fetching OCR weights first.
   What following a branch costs is worth saying rather than skipping: an install is no
   longer reproducible from the checkout alone, so two hosts set up a month apart get
   different OMR and so does one host reinstalled. What buys it back is that **nothing
@@ -1202,8 +1289,10 @@ state model are in `DESIGN.md`.
   pages already read are on disk. A caller that would rather hold one lease across a
   whole song passes `queue=False` and wraps the loop itself, so the two never nest
   (nesting would deadlock a one-slot pool).
-  **Every parse comes back with its slurs paired and the runaways dropped**
-  (`resolve_slurs`, proposed by this pull request for #113). homr predicts
+  **Slur pairing used to happen here and is homr's now** (#144: eerovil/homr#62's
+  `homr/slur_resolution.py`; the app copy was removed once the fork was installed and the
+  old pass dropped nothing on its output). What follows is why it exists, kept because
+  the reasoning is the fork's justification too. It was `resolve_slurs`, added for #113. homr predicts
   `slurStart` / `slurStop` one note at a time and never pairs them, and the MusicXML
   `number` that pairing depends on is the *staff* number — the same for every slur on
   the staff. So a dropped stop does not merely lose its own slur: it leaves the start
@@ -1256,7 +1345,7 @@ state model are in `DESIGN.md`.
   shorter; relabelling the `<voice>` alone would leave it exactly as long as it was. It
   needs **no meter**, and that is what makes it a boundary repair rather than
   `clean_score`'s: a per-system crop usually declares no time signature at all, so a rule
-  that had to know the bar length could not run here. Same argument as `resolve_slurs`.
+  that had to know the bar length could not run here.
   **It is narrow, and measured.** All 41 whole rests across the seven benchmark parses
   and the fixture's nine crops carry a full whole note whatever the meter; the rule fires
   on **two** of them, the two that share a voice. The other 39 rest alone in their voice,
@@ -1300,7 +1389,10 @@ state model are in `DESIGN.md`.
   its notes carry, so a fused two-staff "Piano" contributes two exactly where a pair of
   "Voice" parts would. **`part-name` is never read** — homr says "Voice" and "Piano"
   and means neither, and since the notes of a fused part are fully separable,
-  grand-staff fusion is a labelling detail with no information loss. `assemble` writes
+  grand-staff fusion is a labelling detail with no information loss *in flattening*. homr
+  itself fuses braced staves before decoding, though, and on a crowded bar the fused pass
+  can drop noteheads: before blaming the model for a lost note, re-read the band one staff
+  at a time and check `--output-confidence`. `assemble` writes
   the systems out as one score, one part per staff column.
   **What flattening must not do is move the notes, and until this pull request it did**
   (#172). Splitting a part on its `<staff>` means the `<backup>` and `<forward>` homr
@@ -1707,10 +1799,12 @@ state model are in `DESIGN.md`.
   half a degree of skew, at 20% ink dropout, and on the editions that print no bracket
   (it agreed with the score twice out of nine songs). This asks **homr**, which finds
   staves for a living: the same segmentation network and the same `detect_staff` that
-  read the music, stopped before any of it is parsed. `scripts/homr_staves.py` is the
-  helper that runs inside homr's venv and reports the staves and barlines as fractions
-  of the page; it is reached through the same `Engine` the scan uses, so proposing bands
-  and reading music are the same homr. A page is ~8s (a segmentation pass, not a parse)
+  read the music, stopped before any of it is parsed. Since #144 the whole proposal is
+  homr's own command (`--find-system-bounds`, eerovil/homr#65, documented in the fork's
+  `SYSTEM_BOUNDS.md`): this module only schedules it a page at a time and turns its JSON
+  into `SystemBounds`. It is reached through the same `Engine` the scan uses, so proposing
+  bands and reading music are the same homr, and a homr too old to have the command is
+  refused by name rather than answered by an app-side copy of the rule. A page is ~8s (a segmentation pass, not a parse)
   and takes **one heavy slot per page**, `omr.py`'s rule unchanged.
   **The grouping is decided by the barlines, and that is the whole idea.** Which staves
   make one system is what homr does not answer — its `MultiStaff` is a brace or a grand
@@ -1731,8 +1825,22 @@ state model are in `DESIGN.md`.
   **Measured against the bands a person actually drew**: all 15 of the fixture's, plus
   B1a and B1b. Every page comes back with the systems it prints, and every internal
   boundary within 0.02 of page height of the hand-drawn one (worst 0.020 on B1b, the
-  rest ≤0.014). That is what `test_system_finder.py`'s `omr` tier pins; the rule itself
-  is pinned without homr on little pages of staves and barlines.
+  rest ≤0.014). That is what `test_system_finder.py`'s `omr` tier pins, and it still
+  passes through the fork's command; the rule itself is pinned in the fork.
+  **`Find systems` no longer asks homr by default; it reads the page itself** (#234,
+  `system_finder.quick_bands`). Asking homr is ~8s a page and needs homr installed, and a
+  person drags the bands into place anyway, so the default is a deterministic finder that
+  takes well under a second a page. It answers #80's two failures: staff lines are found
+  in 24 narrow vertical strips and kept when a quarter of the strips agree, so a tilted or
+  broken line is still whole across one strip; and two staves are one system when a single
+  column of ink spans the gap between them — the systemic barline, which every scan on this
+  host prints whether or not it has a bracket. When nothing on a page joins, the gaps decide
+  if they clearly come in two sizes. Measured against the hand-drawn bands of all 14
+  scanned songs here and B1a/B1b: every page comes back with the number of systems it
+  prints, internal boundaries within ~0.035 of the hand ones (it cuts halfway between
+  systems). `Ask homr` (`{"method": "homr"}`) is still there, shown only when homr is
+  installed. `test_quick_system_finder.py` pins it: drawn pages for the rules, the fixture
+  and both B1 scans for the acceptance (needs poppler, no homr).
 - The **Scan panel** is added by this pull request (#116), replacing the holding one that
   #115 left. Its whole job is to stop a tidy-looking parse becoming a practice track, and
   every piece of it follows from that.
@@ -1791,6 +1899,26 @@ state model are in `DESIGN.md`.
   redrawing reloads every crop; a system read while it is open therefore appears in it.
   On a phone it is the existing pane switcher and the compare rows, both already built
   for 390px.
+- **Every clean asks MuseScore 3 whether it would open the result** (#235). MuseScore
+  checks a score as it opens it (`Score::sanityCheck`: voice 1 of each staff must fill
+  the bar exactly, no other voice may run past it) and calls one that fails
+  "corrupted" -- on Sangerhilsen the app crashed instead. Only the app runs that check;
+  a command-line export does not, which is why every render went through and nobody
+  heard of it until a person opened the file. The one export that does run it is
+  `-o x.mlog`, so `pipeline.musescore_check` asks MuseScore itself rather than keeping
+  a copy of its rule here. Note MuseScore fills *gaps* with rests while reading, so a
+  short voice passes; what fails is a voice that runs past the bar, typically a
+  misread triplet. `check_opens_in_musescore` runs after the recorded fixes: each
+  staff-bar MuseScore rejects is reset to a whole-bar rest (`rejected_bars.clear_bar`,
+  which also cuts a tie or slur reaching into it), the notes taken out are written into
+  `fixes.json` as a `text` entry (`source: "musescore-check"`, replaced on every clean
+  so a bar a better reading fixed stops being listed), and the score is checked again.
+  Anything still refused becomes a `musescore-corrupt` health row
+  (`server._health_scan`). The outcome is kept as `verification.musescore` and shown as
+  the Review stage's **Opens in MuseScore** row. Without a MuseScore it says "not
+  checked", never "fine". The reset loses notes on purpose: there is no reading of the
+  page left in such a bar, and a file that will not open blocks the one route a person
+  has for putting the right notes back.
 - **Hazards guarded:** re-cleaning warns it discards manual edits (the Clean
   button label changes once a cleaned file exists); lyric import uses `--replace`.
   No automatic LLM (users have no API key) — the lyrics stage supports either a
@@ -1837,6 +1965,14 @@ against the `laulun_aika.mscx` and `simple_1` fixtures.
    gaps, or a voice looks complete on its notes while the file has it occupying more
    of the bar. The fixture's m26 cost two wrong versions before that shape — see its
    STEPS.md.
+1b. `share_rests` (`utils/shared_rests.py`) gives both voices of a staff the rest the
+   page prints once for the two of them. The scan writes it into one voice only, which
+   is right on a shared staff (MuseScore fills the other voice's gap as it reads) and
+   wrong the moment the split puts each voice on its own staff: the other voice's bar
+   ends early. A gap is filled only with copies of the other voice's rests, and only
+   when they cover it exactly; a gap the other voice sings through is a missing note
+   and stays for the health check. On Sangerhilsen this was 19 of 29 findings (#235).
+   Runs in both modes, since the per-system rebuild pulls one voice at a time too.
 2. Decide which staves actually contain 2 voices; only those get split.
    Staff ids are renumbered to leave a gap after each split staff
    (split staff `n` → `n` and `n+1`), tracked in `GLOBALS.STAFF_MAPPING`.
@@ -1869,6 +2005,23 @@ against the `laulun_aika.mscx` and `simple_1` fixtures.
    the score. Then `detect_part_types` (clef + pitch-range heuristics name parts
    S/A/T/B and set clefs), apply names/clefs, strip brackets/barLineSpan.
 7. `--add SSAA` appends new empty staves (rests) with the right clef per letter.
+8. `mark_scan_damage` runs last, in both modes, and takes out two things a scan gets
+   wrong that nothing can repair from the score (#238). A **slur joining two singers**
+   (`utils/cross_voice_slurs.py`): homr pairs a slur by the staff's number, so on a
+   shared staff it can start in one voice and stop in the other, and after the split
+   each half points at nothing, the end half costing that singer a syllable. Both halves
+   go. A **bar longer than its time signature** (`utils/long_bars.py`): a misread
+   rhythm leaves `len="9/8"` under 4/4 and every part plays an extra eighth; each voice
+   is cut at the barline, a note across it shortened or taken out, a tuplet across it
+   taken out whole, rests put back only where they spell the gap exactly. Neither
+   guesses the right music back. Instead each bar it changed gets a **red mark**
+   (`utils/problem_marks.py`): a staff text starting with `⚠`, saying what was taken
+   out. The app's clean also marks each bar the MuseScore check resets. Deleting a mark
+   in MuseScore is how a person says the bar is fixed: until then health lists it
+   (`marked-problem`) and `pipeline.record_clean_marks` puts its sentence in the Fix
+   panel (`source: "clean-marker"`, replaced on every clean). The scrolling video
+   strips marks (`scrollvideo/score.prepare`), so a forgotten one never reaches a
+   practice track.
 
 Voice-count anomalies run first: a measure with >2 voices is beyond the splitter
 (which makes an upper/lower pair) and is either an OCR glitch or a real multi-way
@@ -2078,7 +2231,8 @@ bars:
 build_videos(mscx_path, out_dir, parts=None, height=2160, width=3840,
              fps=60, with_audio=True, keep_silent=False, emphasise=False,
              combined=True, spacing_ratio=1.3, smooth_seconds=2.0,
-             basename=None, system_starts=None, log=...) -> [video paths]
+             basename=None, system_starts=None, staff_groups=None,
+             log=...) -> [video paths]
 preview(mscx_path, out_dir, width=3840, height=2160, fps=60, ...) -> payload
 ```
 
@@ -2192,6 +2346,23 @@ to `entry["tstamp"]`.
   otherwise cost a staff of height in every frame and each get their own pointless
   practice video. The original file is never touched; with nothing to drop it is used
   as-is. `build_videos(..., keep_silent=True)` / `--keep-silent` turns it off.
+- **Two parts can share a staff in the picture** (#246): `staff_groups=[("S1",
+  "S2"), ("A1", "A2")]`, `--merge S1+S2`, or the Record panel's *Shared staves*
+  field (kept in `record.staff_groups`). `score.merge_staves` moves the lower part
+  into the upper part's staff as voice 2, on a copy, before MuseScore exports the
+  MusicXML, so MuseScore lays out the two voices (stems, rests, beams) itself. The
+  staff takes the lower part's clef and is labelled `S1/S2`; words both sing are
+  printed once and differing words go on a second line; a bar both rest through
+  gets one rest. **Only the picture changes**: the MIDI the clock comes from and
+  the score the mixes come from stay unmerged, so the files, the mixes and the
+  audio cache are the same as without it, and the 98% alignment check measures the
+  merged picture against the real sound. At most two parts a staff, and a part that
+  already has two voices in a bar is refused naming the bar. The shared staff's
+  clefs are all the lower part's, its later changes included, each put at the same
+  beat in voice 1 (`_walk` counts dots, tuplets and `location` gaps to find it);
+  the upper part's own clef changes are not drawn.
+  `Prepared.staff_of` says which staff each part is drawn on, which is what
+  `--emphasise` and the preview's part highlight use.
 - `engrave.py` renders with `breaks: "none"` so the whole score is one system
   (one page — a second page is an error, not something to stitch). Notes are
   `<g id=... class="note">` and the timemap's `on`/`off` lists name those same ids;
@@ -2471,6 +2642,10 @@ without it, like the browser tests:
   clean jump rather than three smeared ones.
 - `test_score.py` — which parts count as silent, that dropping one takes its staff
   with it, and that the original file is never modified.
+- `test_merge_staves.py` — sharing a staff: which voice each part lands in, the
+  clef, the label, words once or on a second line, one rest for two, stems left to
+  MuseScore, the refusals, and (with MuseScore) two parts engraving as one staff
+  with the same notes and the same unmerged audio source.
 - `test_audio.py` / `test_build.py` — the volume edit (replaced, not duplicated;
   pan/program untouched), the D.C.-jump refusal, that section repeats/voltas are
   *not* refused, and the alignment measure itself (full when highlights match the
@@ -2514,9 +2689,9 @@ straight at the wrong answer. What tells them apart: sharing shows up as a voice
 per-measure note counts match another voice's exactly, while a runaway shows up as
 **one bar losing most of its slots to a slur crossing several barlines**. Look for the
 long slur first, since that is a single check: `lyric_txt.syllable_slots(root, staff,
-measure)` says note by note which are being swallowed. This pull request proposes
-repairing it at the boundary for homr parses (`omr.resolve_slurs`), which would leave
-a score scanned before that, or one from another OMR tool, as the cases to watch for.
+measure)` says note by note which are being swallowed. homr now pairs its own slurs
+(eerovil/homr#62), which leaves a score scanned with an older homr, or one from another
+OMR tool, as the cases to watch for.
 
 **Voices sing words that are not printed under them.** Older choral engraving prints
 a text once and expects more than one voice to use it, so notes with no text beneath
@@ -2581,7 +2756,7 @@ This is heavily environment-dependent: it relies on specific macOS apps, global
 keyboard shortcuts wired in QuickRecorder/MuseScore, `MUSESCORE_EXPORT_PATH`,
 `VIDEO_EXPORT_PATH`, and `ffmpeg`/`ffprobe`. It is not portable or testable in
 CI. The `.scpt` AppleScript files and the keyboard shortcuts described in
-`README.md`/`record_stemmanauha.py --help` must match. The CLI still skips a
+`TOOLS.md`/`record_stemmanauha.py --help` must match. The CLI still skips a
 stage when its output exists; the web app exposes the redo flags instead.
 
 ## This host: the live app, the deploy, the board

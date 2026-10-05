@@ -1,13 +1,14 @@
-"""Ask homr to propose printed-system bounds, with the pre-#213 path as fallback.
+"""Ask homr to propose printed-system bounds.
 
-The supported implementation now belongs to the homr fork.  This adapter keeps the
-song app's one-heavy-slot-per-page scheduling and turns homr's machine-readable JSON
-into the existing :class:`SystemBounds` values.  It never saves a proposal.
+The grouping rule belongs to the homr fork (``homr/system_finder.py``,
+eerovil/homr#65).  This adapter keeps the song app's one-heavy-slot-per-page
+scheduling and turns homr's machine-readable JSON into the existing
+:class:`SystemBounds` values.  It never saves a proposal.
 
-Until the merged fork has been installed and re-measured on the host, an older homr
-that does not know ``--find-system-bounds`` falls back to the previous app-side helper.
-That fallback is deliberately isolated in :mod:`system_finder_legacy`; new grouping
-work belongs in homr, not here.
+A homr older than that fork does not know ``--find-system-bounds``.  The app-side
+copy of the rule that used to stand in for it was removed by #144, once the fork was
+installed and re-measured, so such a homr is told to update rather than quietly
+answered by a second implementation.
 """
 
 from __future__ import annotations
@@ -19,28 +20,13 @@ import subprocess
 from contextlib import nullcontext
 from typing import Callable, List, Optional
 
-from . import heavy_slot, omr, pdf_systems, system_finder_legacy as legacy
+from . import heavy_slot, omr, pdf_systems
 from .omr import Engine, HomrError, HomrMissing
 from .pdf_systems import SystemBounds
 
 Logger = Callable[[str], None]
 FIND_DPI = int(os.getenv("SYSTEM_FIND_DPI", "200"))
 DEFAULT_TIMEOUT = 300
-
-# Compatibility exports for callers/tests written before #213.  Production proposal
-# work below does not use these; they stay only while the old installed homr may need
-# the fallback implementation.
-TOL_X = legacy.TOL_X
-EDGE_X = legacy.EDGE_X
-AGREE = legacy.AGREE
-SLACK = legacy.SLACK
-group_staves = legacy.group_staves
-bands_for_page = legacy.bands_for_page
-_interior_barlines = legacy._interior_barlines
-_agreement = legacy._agreement
-_gap_threshold = legacy._gap_threshold
-staves_on_page = legacy.staves_on_page
-
 
 def _noop(_message: str) -> None:
     pass
@@ -57,9 +43,9 @@ def _engine_command(engine: Engine) -> List[str]:
 
 
 def _unsupported(stderr: str) -> bool:
-    """Only an explicit rejection of the proposal flag permits legacy fallback."""
+    """Whether homr rejected the proposal flag itself, i.e. is too old to have it."""
     # argparse also prints supported options in its usage text. Finding the flag
-    # there must not turn an unrelated CLI error into a successful legacy result.
+    # there must not turn an unrelated CLI error into "update homr".
     return re.search(
         r"(?:unrecognized arguments|no such option):[^\r\n]*"
         r"(?<![\w-])--find-system-bounds(?![\w-])",
@@ -76,8 +62,8 @@ def _page_from_homr(
     dpi: int,
     log: Logger,
     timeout: int = DEFAULT_TIMEOUT,
-) -> Optional[List[SystemBounds]]:
-    """Ask supported homr for one page; return ``None`` only for an older CLI."""
+) -> List[SystemBounds]:
+    """Ask homr for one page's proposal."""
     command = _engine_command(engine) + [
         pdf_path,
         "--gpu",
@@ -106,7 +92,11 @@ def _page_from_homr(
             log(line.rstrip())
     if result.returncode != 0:
         if _unsupported(result.stderr or ""):
-            return None
+            raise HomrError(
+                f"This homr ({engine.label}) is too old to propose systems: it has no "
+                "--find-system-bounds. Update it (scripts/install-homr.sh, or git pull "
+                "in a working copy) or draw the bands by hand."
+            )
         raise HomrError(
             f"homr could not propose systems for page {page}.\n"
             + "\n".join((result.stderr or "").splitlines()[-20:])
@@ -146,7 +136,7 @@ def find_bands(
     dpi: int = FIND_DPI,
     queue: bool = True,
 ) -> List[SystemBounds]:
-    """Request homr's proposal page by page, unsaved, falling back only for old homr."""
+    """Request homr's proposal page by page, unsaved."""
     engine = engine or omr.default_engine()
     if not engine:
         raise HomrMissing(
@@ -173,16 +163,6 @@ def find_bands(
                 log=watched,
             )
             slot.check()
-        if found is None:
-            log("Installed homr has no supported system-bound proposal; using compatibility fallback")
-            return legacy.find_bands(
-                pdf_path,
-                out_dir=out_dir,
-                engine=engine,
-                log=log,
-                dpi=dpi,
-                queue=queue,
-            )
         log(f"Page {page}: {len(found)} system(s)")
         for bound in found:
             proposed.append(
@@ -195,4 +175,149 @@ def find_bands(
                     measure_end=bound.measure_end,
                 )
             )
+    return proposed
+
+
+# --- the quick finder: no homr, no heavy slot ------------------------------
+#
+# Asking homr is ~8s a page and needs homr installed. Most of the time a person
+# is going to drag the bands into place anyway, so a proposal that is nearly
+# right in under a second a page is worth more than one that is right in a
+# minute. This reads the page itself, deterministically: the same page always
+# comes back as the same bands.
+#
+# #80 tried reading the page and failed on two things, and this answers each.
+# Staff lines broke at half a degree of skew and at ink dropout because they
+# were looked for across the whole page width; here the page is cut into narrow
+# vertical strips, each strip finds its own five-line staves, and a staff is
+# kept when enough strips agree on it — a tilted or broken line is still
+# straight and whole across one strip. And grouping relied on a bracket only
+# some editions print; here two staves belong to one system when any single
+# column of ink runs unbroken across the gap between them, which the systemic
+# barline at the left does in every edition on this host, bracket or not.
+#
+# Measured against the bands a person drew on all 14 scanned songs on this host
+# and the benchmark's B1a/B1b: every page comes back with the number of systems
+# it prints, with each internal boundary within ~0.03 of page height of the
+# hand-drawn one. The proposal is still only a proposal.
+
+QUICK_DPI = 150          # the dpi the Systems editor shows, so the render is shared
+_INK = 230               # grey up to this is ink; scans print faint staff lines
+_STRIPS = 24             # narrow enough that a skewed line stays in a few rows
+_LINE_FILL = 0.45        # share of a strip's width a staff line row has to cover
+_STRIP_AGREE = 0.25      # share of strips that must see a staff for it to count
+_JOIN_FILL = 0.9         # share of the gap a joining column must cover
+_EDGE = 0.03             # page edges ignored for joins: a scan's border is a line
+
+
+def _strip_staves(strip) -> List[tuple]:
+    """Five evenly spaced line rows in one vertical strip: (top, bottom, spacing)."""
+    import numpy as np
+
+    fill = strip.mean(axis=1)
+    lines: List[List[int]] = []
+    for row in np.flatnonzero(fill >= _LINE_FILL).tolist():
+        if lines and row - lines[-1][1] <= 1:
+            lines[-1][1] = row
+        else:
+            lines.append([row, row])
+    centres = [(a + b) / 2 for a, b in lines if b - a <= 6]   # thicker is a beam
+    found = []
+    i = 0
+    while i + 4 < len(centres):
+        gaps = np.diff(centres[i:i + 5])
+        if gaps.min() >= 3 and gaps.max() <= 1.35 * gaps.min() and gaps.max() <= 40:
+            found.append((centres[i], centres[i + 4], float(gaps.mean())))
+            i += 5
+        else:
+            i += 1
+    return found
+
+
+def _staves(ink) -> List[tuple]:
+    """Every staff on the page, top to bottom: (top row, bottom row, line spacing)."""
+    import numpy as np
+
+    width = ink.shape[1]
+    edges = np.linspace(width * 0.08, width * 0.92, _STRIPS + 1).astype(int)
+    seen = sorted(s for k in range(_STRIPS)
+                  for s in _strip_staves(ink[:, edges[k]:edges[k + 1]]))
+    clusters: List[List[tuple]] = []
+    for s in seen:
+        if clusters:
+            here = float(np.median([(t[0] + t[1]) / 2 for t in clusters[-1]]))
+            if abs((s[0] + s[1]) / 2 - here) <= (s[1] - s[0]) * 0.6:
+                clusters[-1].append(s)
+                continue
+        clusters.append([s])
+    need = max(2, int(_STRIPS * _STRIP_AGREE))
+    return [tuple(float(np.median([t[k] for t in c])) for k in range(3))
+            for c in clusters if len(c) >= need]
+
+
+def _joined(ink, upper: tuple, lower: tuple) -> bool:
+    """Whether one column of ink spans the whole gap between two staves."""
+    space = max(upper[2], lower[2])
+    # A staff space clear of each staff, so a tilted page's lines are not counted.
+    lo, hi = int(upper[1] + space * 1.2), int(lower[0] - space * 1.2)
+    if hi - lo < 3:
+        return True
+    gap = ink[lo:hi]
+    gap = gap[:, :-2] | gap[:, 1:-1] | gap[:, 2:]      # a barline can lean a pixel
+    margin = int(gap.shape[1] * _EDGE)
+    return bool(gap[:, margin:gap.shape[1] - margin].mean(axis=0).max() >= _JOIN_FILL)
+
+
+def page_systems(image: "Image.Image") -> List[tuple]:
+    """The printed systems of one page image, as (top, bottom) fractions of height."""
+    import numpy as np
+
+    ink = np.asarray(image.convert("L")) < _INK
+    height = ink.shape[0]
+    staves = _staves(ink)
+    if not staves:
+        return []
+    joins = [_joined(ink, a, b) for a, b in zip(staves, staves[1:])]
+    if len(staves) > 2 and not any(joins):
+        # Nothing joins anything: either one-staff systems, or an edition that
+        # prints no systemic barline. Let the gaps decide when they clearly split
+        # into two sizes, and otherwise call each staff its own system.
+        gaps = [b[0] - a[1] for a, b in zip(staves, staves[1:])]
+        if max(gaps) > 1.25 * min(gaps):
+            cut = (max(gaps) + min(gaps)) / 2
+            joins = [g < cut for g in gaps]
+
+    systems: List[List[float]] = []
+    for i, staff in enumerate(staves):
+        if i and joins[i - 1]:
+            systems[-1][1] = staff[1]
+        else:
+            systems.append([staff[0], staff[1]])
+
+    # Edges halfway between systems, so the lyrics under a system's last staff
+    # stay with it. The first and last get a little more than the room their
+    # neighbour gets: a generous band costs white paper, a tight one cuts words off.
+    halves = [(b[0] - a[1]) / 2 for a, b in zip(systems, systems[1:])]
+    outer = 1.2 * max(halves) if halves else 8 * float(np.median([s[2] for s in staves]))
+    bands = []
+    for i, (top, bottom) in enumerate(systems):
+        lo = (systems[i - 1][1] + top) / 2 if i else max(0.0, top - outer)
+        hi = (bottom + systems[i + 1][0]) / 2 if i + 1 < len(systems) else min(height, bottom + outer)
+        bands.append((round(lo / height, 4), round(hi / height, 4)))
+    return bands
+
+
+def quick_bands(pdf_path: str, out_dir: str, log: Logger = _noop) -> List[SystemBounds]:
+    """Propose a band for every printed system without homr, unsaved."""
+    from PIL import Image
+
+    pages = pdf_systems.page_count(pdf_path)
+    proposed: List[SystemBounds] = []
+    for page in range(1, pages + 1):
+        image = Image.open(pdf_systems.render_page(pdf_path, page, QUICK_DPI, out_dir))
+        found = page_systems(image)
+        log(f"Page {page}: {len(found)} system(s)")
+        for top, bottom in found:
+            proposed.append(SystemBounds(index=len(proposed) + 1, page=page,
+                                         top=top, bottom=bottom))
     return proposed

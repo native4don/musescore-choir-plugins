@@ -13,6 +13,7 @@ homr installed (scripts/install-homr.sh) and poppler, and skips without them.
 import contextlib
 import json
 import os
+from fractions import Fraction
 import shutil
 import stat
 import subprocess
@@ -297,6 +298,18 @@ def test_the_gpu_is_switched_off_explicitly(monkeypatch, tmp_path):
     assert "--gpu no" in open(tmp_path / "args").read()
 
 
+def test_the_title_is_not_read(monkeypatch, tmp_path):
+    # The app never uses the title homr reads, and since upstream 9ec3a78 reading
+    # it means fetching OCR weights first (#220).
+    monkeypatch.setenv("HOMR_BIN", stub_homr(
+        tmp_path,
+        'echo "$@" > ' + str(tmp_path / "args") + '\n'
+        'echo "<score/>" > "${!#%.*}.musicxml"\n',
+    ))
+    omr.read_page(a_page(tmp_path))
+    assert "--no-title" in open(tmp_path / "args").read().split()
+
+
 def test_progress_reaches_the_log(monkeypatch, tmp_path):
     monkeypatch.setenv("HOMR_BIN", stub_homr(
         tmp_path,
@@ -483,154 +496,33 @@ def test_a_scanned_page_comes_back_as_musicxml(tmp_path):
     assert lines
 
 
-# --- slurs ---------------------------------------------------------------
+# --- slurs are homr's now --------------------------------------------------
 #
-# homr writes ``slurStart`` / ``slurStop`` one note at a time and never pairs
-# them, and the ``number`` they would pair by is the staff number, the same for
-# every slur on the staff. These read as little token streams for that reason:
-# ``"1( 1) 3( 5)"`` is a start and a stop in bar 1 and a slur from bar 3 to bar
-# 5, which is the level the defect lives at.
+# Pairing homr's slur tokens and dropping runaways moved into the fork
+# (eerovil/homr#62, #144). The app must not do it a second time: a slur that
+# reaches the app is homr's claim about the page and is kept as written.
 
 
-def a_slurred_part(stream, bars=8, per_bar=4):
-    """A one-staff part whose slur tokens are ``"1( 2) ..."`` -- bar and end."""
-    wanted = {}
-    for token in stream.split():
-        wanted.setdefault(int(token[:-1]), []).append(
-            "start" if token[-1] == "(" else "stop")
-
-    measures = []
-    for bar in range(1, bars + 1):
-        attributes = ("<attributes><divisions>1</divisions>"
-                      "<key><fifths>0</fifths></key>"
-                      "<time><beats>4</beats><beat-type>4</beat-type></time>"
-                      "<clef><sign>G</sign><line>2</line></clef></attributes>"
-                      if bar == 1 else "")
-        notes = ""
-        for n in range(per_bar):
-            slurs = ""
-            here = wanted.get(bar, [])
-            # One token per note, in the order they were written.
-            if n < len(here):
-                slurs = f'<notations><slur type="{here[n]}" number="1"/></notations>'
-            notes += ("<note><pitch><step>C</step><octave>4</octave></pitch>"
-                      f"<duration>1</duration><type>quarter</type>{slurs}</note>")
-        measures.append(f'<measure number="{bar}">{attributes}{notes}</measure>')
-    return etree.fromstring(f'<part id="P1">{"".join(measures)}</part>')
-
-
-def slur_pairs(part):
-    """The pairs left in a part, as ``(start bar, stop bar)``, in order."""
-    seen, open_bars = [], []
-    for bar, measure in enumerate(part.findall("measure"), 1):
-        for slur in measure.findall("note/notations/slur"):
-            if slur.get("type") == "start":
-                open_bars.append(bar)
-            else:
-                seen.append((open_bars.pop(), bar))
-    assert not open_bars, "a start was left open"
-    return seen
-
-
-def test_a_slur_inside_one_bar_is_kept():
-    part = a_slurred_part("1( 1)")
-    assert omr.resolve_slurs(part) == 0
-    assert slur_pairs(part) == [(1, 1)]
-
-
-def test_a_melisma_across_one_barline_is_kept():
-    """``il-man il-ki-rii-vi-`` is the worked example in the lyric tests: a
-    word whose syllables span a barline is real music, and the rule must not
-    eat it. One barline is the most any slur in the benchmark crosses."""
-    part = a_slurred_part("1( 2)")
-    assert omr.resolve_slurs(part) == 0
-    assert slur_pairs(part) == [(1, 2)]
-
-
-def test_a_slur_across_two_barlines_is_dropped():
-    part = a_slurred_part("1( 3)")
-    assert omr.resolve_slurs(part) == 1
-    assert slur_pairs(part) == []
-
-
-def test_a_runaway_does_not_take_the_slurs_around_it_with_it():
-    part = a_slurred_part("1( 1) 2( 6) 7( 7)")
-    assert omr.resolve_slurs(part) == 1
-    assert slur_pairs(part) == [(1, 1), (7, 7)]
-
-
-def test_a_start_made_while_one_is_open_goes():
-    """MuseScore keeps the first and discards the second, so this changes
-    nothing about how the file reads -- and it is what stops a removed runaway
-    promoting the leftover start onto a stop further away still."""
-    part = a_slurred_part("1( 1( 2)")
-    assert omr.resolve_slurs(part) == 0
-    assert slur_pairs(part) == [(1, 2)]
-
-
-def test_a_stop_that_closes_nothing_goes():
-    """#112 measured a lone dangler as cosmetic, and in isolation it is. In a
-    stream it is not: four bars through the MuseScore CLI with one unmatched
-    stop lose every later slur of that number too."""
-    part = a_slurred_part("1) 2( 2)")
-    assert omr.resolve_slurs(part) == 0
-    assert slur_pairs(part) == [(2, 2)]
-
-
-def test_a_start_that_never_stops_goes():
-    part = a_slurred_part("1( 1) 3(")
-    assert omr.resolve_slurs(part) == 0
-    assert slur_pairs(part) == [(1, 1)]
-
-
-def test_the_b5_shape_leaves_one_alternating_stream():
-    """B5's own m46 region: five starts and one stop, then music that is fine.
-
-    Resolving it once has to settle it -- running again must find nothing, or
-    the fix is a cascade rather than a repair. Removing the runaway pairs alone
-    left the real B5 with a fresh 2-bar runaway at m51.
-    """
-    part = a_slurred_part("1( 1( 2( 3( 3) 4( 4) 5( 6) 7( 7)", bars=8)
-    assert omr.resolve_slurs(part) == 1
-    assert slur_pairs(part) == [(4, 4), (5, 6), (7, 7)]
-    assert omr.resolve_slurs(part) == 0
-
-
-def test_an_empty_notations_element_does_not_survive_its_slur():
-    part = a_slurred_part("1( 3)")
-    omr.resolve_slurs(part)
-    assert part.findall(".//notations") == []
-
-
-def _musescore():
-    import dotenv
-    dotenv.load_dotenv(".env")
-    return os.getenv("MUSESCORE_CLI_PATH")
-
-
-def test_a_page_comes_back_with_its_slurs_resolved(monkeypatch, tmp_path):
-    """The seam: what ``read_page`` hands back has been through the rule.
-
-    A whole page and one cropped system both come through here, which is the
-    reason it lives at this boundary rather than in the assembler -- the
-    ``number`` the mis-pairing turns on is the staff number, and nothing about
-    that is per-crop.
-    """
-    part = etree.tostring(a_slurred_part("1( 1) 2( 6) 7( 7)"), encoding="unicode")
-    score = ('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0">'
-             '<part-list><score-part id="P1"><part-name>V</part-name></score-part>'
-             f'</part-list>{part}</score-partwise>')
+def test_the_app_leaves_homrs_slurs_alone(monkeypatch, tmp_path):
+    """A slur across three barlines is homr's to not emit, not the app's to drop."""
+    notes = "".join(
+        f'<measure number="{bar}"><note><pitch><step>C</step><octave>4</octave></pitch>'
+        f'<duration>4</duration><voice>1</voice><type>whole</type>{slur}</note></measure>'
+        for bar, slur in ((1, '<notations><slur type="start" number="1"/></notations>'),
+                          (2, ""), (3, ""),
+                          (4, '<notations><slur type="stop" number="1"/></notations>')))
     written = tmp_path / "homr-said.musicxml"
-    written.write_text(score)
+    written.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0">'
+        '<part-list><score-part id="P1"><part-name>V</part-name></score-part>'
+        f'</part-list><part id="P1">{notes}</part></score-partwise>')
     monkeypatch.setenv("HOMR_BIN", stub_homr(
         tmp_path, f'cp "{written}" "${{!#%.*}}.musicxml"\n'))
 
-    lines = []
-    produced = omr.read_page(a_page(tmp_path), out_dir=str(tmp_path / "out"),
-                             log=lines.append)
+    produced = omr.read_page(a_page(tmp_path), out_dir=str(tmp_path / "out"))
 
-    assert slur_pairs(etree.parse(produced).getroot().find("part")) == [(1, 1), (7, 7)]
-    assert any("slur" in line for line in lines), lines
+    assert omr.strip_provenance(open(produced, "rb").read()) == written.read_bytes()
+    assert not hasattr(omr, "resolve_slurs")
 
 
 def test_a_page_homr_got_right_is_not_rewritten(monkeypatch, tmp_path):
@@ -640,35 +532,6 @@ def test_a_page_homr_got_right_is_not_rewritten(monkeypatch, tmp_path):
     # The provenance line is the only thing between what homr wrote and what is
     # on disk, and taking it off gives homr's bytes back exactly.
     assert omr.strip_provenance(open(produced, "rb").read()) == b"<score-partwise/>\n"
-
-
-@pytest.mark.skipif(not _musescore() or not os.path.exists(_musescore() or ""),
-                    reason="needs the MuseScore CLI")
-def test_a_runaway_slur_swallows_syllable_slots_and_the_rule_gives_them_back(tmp_path):
-    """The defect and the repair, measured where they are felt.
-
-    A slur continuation takes no syllable, so a slur nobody engraved is a lyric
-    line that will not fit. This is B5's m46 in miniature: twelve notes over
-    three bars, a start in the first and an unrelated stop in the third.
-    """
-    from src.clean_score.lyric_txt import slot_counts
-
-    def slots(part, name):
-        path = tmp_path / f"{name}.musicxml"
-        path.write_text(
-            '<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0">'
-            '<part-list><score-part id="P1"><part-name>V</part-name></score-part>'
-            f'</part-list>{etree.tostring(part, encoding="unicode")}</score-partwise>')
-        mscx = str(tmp_path / f"{name}.mscx")
-        from src import musescore_cli
-        musescore_cli.export(_musescore(), str(path), mscx, timeout=300)
-        counts = slot_counts(etree.parse(mscx).getroot())
-        return sum(sum(bars.values()) for bars in counts.values())
-
-    assert slots(a_slurred_part("1( 3)", bars=3), "runaway") == 4
-    resolved = a_slurred_part("1( 3)", bars=3)
-    assert omr.resolve_slurs(resolved) == 1
-    assert slots(resolved, "resolved") == 12
 
 
 def test_the_installed_engine_says_which_commit_it_is(monkeypatch, tmp_path):
@@ -976,6 +839,44 @@ def test_moving_one_twice_finds_nothing_the_second_time(tmp_path):
     assert omr.split_measure_rests_in(str(path)) == []
 
 
+# --- homr's note positions (#220) ----------------------------------------
+#
+# Upstream homr writes where each note sits on the image as a comment inside
+# every <note> (dda4d2f). The repair at this boundary reads the notes, so it
+# must do the same with the comments there as without them.
+
+
+def with_image_positions(data):
+    """``data`` with an ``imgpos`` comment in every note, as homr writes it."""
+    out, n = b"", 0
+    for piece in data.split(b"</note>")[:-1]:
+        out += piece + f"<!-- imgpos: {10 + n}, {200 + n} -->".encode() + b"</note>"
+        n += 1
+    return out + data.split(b"</note>")[-1]
+
+
+def test_note_positions_are_not_content():
+    data = open(FRAGMENT, "rb").read()
+    marked = with_image_positions(data)
+    assert marked != data and marked.count(b"imgpos") == data.count(b"</note>")
+    assert omr.strip_image_positions(marked) == data
+    assert omr.strip_image_positions(data) == data, "nothing to strip is untouched"
+
+
+def test_shared_rests_move_the_same_with_note_positions(tmp_path):
+    plain, marked = tmp_path / "plain.musicxml", tmp_path / "marked.musicxml"
+    shutil.copy(FRAGMENT, plain)
+    marked.write_bytes(with_image_positions(open(FRAGMENT, "rb").read()))
+
+    moves = [(m.measure, m.staff, m.was, m.now)
+             for m in omr.split_measure_rests_in(str(plain))]
+    assert moves == [("2", "2", "5", "7")]
+    assert [(m.measure, m.staff, m.was, m.now)
+            for m in omr.split_measure_rests_in(str(marked))] == moves
+    assert (omr.strip_image_positions(marked.read_bytes())
+            == plain.read_bytes())
+
+
 def test_a_page_comes_back_with_its_shared_rests_moved(monkeypatch, tmp_path):
     """The seam: what ``read_page`` hands back has been through the rule.
 
@@ -993,3 +894,45 @@ def test_a_page_comes_back_with_its_shared_rests_moved(monkeypatch, tmp_path):
     assert voice_lengths(etree.parse(produced).getroot().find("part"), "2") == {
         "5": 12, "1": 16, "7": 16}
     assert any("whole-measure rest" in line for line in lines), lines
+
+
+# --- the bar length of the music before the page (#245) ------------------
+
+def _engine_with_source(tmp_path, binary, knows_flag):
+    """An installed-style engine whose homr source does or does not have --bar-length."""
+    venv = tmp_path / "venv"
+    package = venv / "lib" / "python3.12" / "site-packages" / "homr"
+    package.mkdir(parents=True)
+    (package / "main.py").write_text('parser.add_argument("--bar-length")\n' if knows_flag
+                                     else 'parser.add_argument("--no-title")\n')
+    (venv / "bin").mkdir()
+    target = venv / "bin" / "homr"
+    os.symlink(binary, target)
+    return omr.Engine(key="default", label="installed", command=[str(target)], default=True)
+
+
+def test_the_bar_length_is_passed_to_a_homr_that_takes_it(tmp_path):
+    binary = stub_homr(tmp_path, 'echo "$@" > ' + str(tmp_path / "args") + '\n'
+                                 'echo "<score/>" > "${!#%.*}.musicxml"\n')
+    engine = _engine_with_source(tmp_path, binary, knows_flag=True)
+    omr.read_page(a_page(tmp_path), engine=engine, bar_length=Fraction(3, 4), queue=False)
+    args = open(tmp_path / "args").read().split()
+    assert args[args.index("--bar-length") + 1] == "3/4"
+    # And the image is still the last argument, where homr expects it.
+    assert args[-1].endswith("page-1.png")
+
+
+def test_the_bar_length_is_not_passed_to_a_homr_that_would_refuse_it(tmp_path):
+    binary = stub_homr(tmp_path, 'echo "$@" > ' + str(tmp_path / "args") + '\n'
+                                 'echo "<score/>" > "${!#%.*}.musicxml"\n')
+    engine = _engine_with_source(tmp_path, binary, knows_flag=False)
+    omr.read_page(a_page(tmp_path), engine=engine, bar_length=Fraction(1), queue=False)
+    assert "--bar-length" not in open(tmp_path / "args").read()
+
+
+def test_no_bar_length_means_no_flag(tmp_path):
+    binary = stub_homr(tmp_path, 'echo "$@" > ' + str(tmp_path / "args") + '\n'
+                                 'echo "<score/>" > "${!#%.*}.musicxml"\n')
+    engine = _engine_with_source(tmp_path, binary, knows_flag=True)
+    omr.read_page(a_page(tmp_path), engine=engine, queue=False)
+    assert "--bar-length" not in open(tmp_path / "args").read()

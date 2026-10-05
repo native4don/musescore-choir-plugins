@@ -68,6 +68,7 @@ looked.
 from __future__ import annotations
 
 import dataclasses
+from fractions import Fraction
 import hashlib
 import os
 import subprocess
@@ -146,10 +147,14 @@ def content_stamp(path: str) -> str:
     is the hours of re-reading #154 decided against. Stripping it textually also
     keeps every stamp already recorded on this host unchanged — a file with no
     such line hashes exactly as it always did.
+
+    **Nor are the note positions** homr writes inside every ``<note>``
+    (:func:`omr.strip_image_positions`): where the decoder looked is not what it
+    read, and a file without them hashes as it always did.
     """
     try:
         with open(path, "rb") as f:
-            data = omr.strip_provenance(f.read())
+            data = omr.strip_image_positions(omr.strip_provenance(f.read()))
     except OSError:
         return ""
     return hashlib.sha1(data).hexdigest()[:12]
@@ -622,7 +627,9 @@ def _read_one(song: state.Song, pdf: str, band: SystemBounds, stamp: str,
     try:
         log(f"System {band.index} of {total}: cropping")
         image = pdf_systems.crop_systems(pdf, [padded(band, pad)], out_dir, dpi=dpi)[0]
-        produced = omr_systems.read_system(image, out_dir, log=log, engine=engine)
+        produced = omr_systems.read_system(
+            image, out_dir, log=log, engine=engine,
+            bar_length=bar_length_before(song, band.index))
         entry.update(
             musicxml=os.path.relpath(produced.musicxml, song.dir),
             content=content_stamp(produced.musicxml),
@@ -653,6 +660,35 @@ def _read_one(song: state.Song, pdf: str, band: SystemBounds, stamp: str,
     # nothing to say: that is what takes an old sentence away once a re-read stops
     # moving anything.
     _record_repairs(song, band.index, moved, log)
+
+
+def bar_length_before(song: state.Song, index: int) -> Optional[Fraction]:
+    """The bar length system ``index - 1`` ends in, read off its fragment.
+
+    The time signature in force at the end of the previous system's reading, as
+    a fraction of a whole note. homr reads each band on its own, so this is how
+    a system that reads equally well at two bar lengths learns which one the
+    music was already in. None when there is no earlier fragment, or it cannot
+    be read, or it states no meter.
+    """
+    previous = _fragments(song).get(index - 1, {})
+    path = previous.get("musicxml")
+    if not path:
+        return None
+    try:
+        root = etree.parse(os.path.join(song.dir, path)).getroot()
+    except (OSError, etree.XMLSyntaxError):
+        return None
+    first_part = root.find("part")
+    times = first_part.findall(".//time") if first_part is not None else []
+    if not times:
+        return None
+    try:
+        beats = int(times[-1].findtext("beats") or "")
+        beat_type = int(times[-1].findtext("beat-type") or "")
+    except ValueError:
+        return None
+    return Fraction(beats, beat_type) if beats > 0 and beat_type > 0 else None
 
 
 def _record_repairs(song: state.Song, index: int, moved: List[Dict],

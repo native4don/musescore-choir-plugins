@@ -26,6 +26,46 @@ const DEFAULT_TOP_MARGIN = 0;
 const DEFAULT_BOTTOM_MARGIN = 5;
 const STAGE_LABEL = { register: "Start", scan: "Scan", clean: "Clean", fix: "Fix", lyrics: "Lyrics", review: "Review", record: "Record", upload: "Upload" };
 
+const stageMenu = document.getElementById("stagemenu");
+
+// The phone's stage drawer (#258). Opening it adds a history entry, so Android's Back
+// closes the drawer rather than leaving the song; every other way of closing it goes
+// back through that entry too, so the history never collects stale ones.
+const drawerWs = () => document.querySelector(".ws.drawer-open");
+const markDrawer = (ws, open) => {
+  ws.classList.toggle("drawer-open", open);
+  stageMenu.setAttribute("aria-expanded", open ? "true" : "false");
+};
+function openDrawer(ws) {
+  if (ws.classList.contains("drawer-open")) return;
+  markDrawer(ws, true);
+  history.pushState({ drawer: true }, "");
+}
+function closeDrawer() {
+  const ws = drawerWs();
+  if (!ws) return;
+  markDrawer(ws, false);
+  if (history.state && history.state.drawer) history.back();
+}
+window.addEventListener("popstate", () => { const ws = drawerWs(); if (ws) markDrawer(ws, false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+
+// On a phone the bottom bar is the way around a song, so the page itself must never
+// end up scrolled: it does not scroll on its own (html and body are overflow:hidden),
+// but a browser scrolling a focused field into view still can, and leaves it there
+// after the keyboard closes — the bar is then below the screen (#258). Put it back
+// whenever the page scrolls, the window's shape changes or a field lets go of the
+// focus.
+const unscrollPage = () => {
+  const root = document.scrollingElement || document.documentElement;
+  if (root.scrollTop || root.scrollLeft) root.scrollTo(0, 0);
+};
+window.visualViewport?.addEventListener("resize", unscrollPage);
+window.addEventListener("scroll", unscrollPage, { passive: true });
+window.addEventListener("resize", unscrollPage);
+window.addEventListener("orientationchange", unscrollPage);
+document.addEventListener("focusout", () => setTimeout(unscrollPage, 0));
+
 // ---- router --------------------------------------------------------------
 window.addEventListener("hashchange", route);
 window.addEventListener("DOMContentLoaded", route);
@@ -45,6 +85,7 @@ const SORTS = {
 
 async function renderLibrary() {
   crumb.textContent = "";
+  stageMenu.hidden = true;     // the Library has no stages
   const songs = await getJSON("/api/songs");
   const sortKey = SORTS[localStorage.getItem("songSort")] ? localStorage.getItem("songSort") : "updated";
   songs.sort(SORTS[sortKey].fn);
@@ -86,9 +127,83 @@ async function renderLibrary() {
                    : el("p", { className: "hint" }, "No songs yet. Create one to begin.")));
 }
 
+// ---- installing homr ---------------------------------------------------------
+// Which homr this host reads scans with, whether the fork's main has moved past
+// it, and a button that runs scripts/install-homr.sh (#249). Updating is a press,
+// never automatic: the day a parse changes is a day somebody chose. It lives in
+// the Scan panel (#261), where homr is used and where "not installed" is said.
+const short = (c) => (c ? c.slice(0, 7) : "");
+
+function homrBox() {
+  const line = el("p", { className: "homr-line" }, "homr: checking…");
+  const btn = el("button", { hidden: true });
+  const again = el("button", { hidden: true }, "Reinstall");
+  const out = el("pre", { className: "log homr-log", hidden: true });
+  const box = el("details", { className: "homr-box" },
+    el("summary", {}, "homr — reads scanned pages"), line,
+    el("div", { className: "row" }, btn, again), out);
+  let timer = null;
+
+  function draw(st) {
+    const installed = st.installed ? `${st.label || "installed"}` : null;
+    const r = st.result || {};
+    if (st.running) {
+      line.textContent = "Installing homr… this takes a few minutes the first time.";
+    } else if (r.finished_at && !r.ok) {
+      line.textContent = "Install failed — see the log below.";
+    } else if (!installed) {
+      line.textContent = "homr: not installed. Scanning a PDF needs it.";
+    } else if (st.up_to_date) {
+      line.textContent = `homr: ${installed} — up to date`;
+    } else if (st.up_to_date === false) {
+      line.textContent = `homr: ${installed} — newer on GitHub: main @ ${short(st.latest)}`;
+    } else {
+      line.textContent = `homr: ${installed} — couldn't reach GitHub to check for a newer one`;
+    }
+    if (r.finished_at && r.ok && !st.running) {
+      line.textContent = `Installed ${installed || "homr"}` + (st.up_to_date ? " — up to date" : "");
+    }
+    btn.disabled = !!st.running;
+    btn.textContent = st.running ? "Installing…" : installed ? "Update homr" : "Install homr";
+    btn.hidden = !st.running && !!installed && st.up_to_date !== false;
+    again.hidden = st.running || !installed || !btn.hidden;
+    const lines = st.log || [];
+    out.hidden = !lines.length;
+    out.textContent = lines.join("\n");
+    out.scrollTop = out.scrollHeight;
+    if (st.running || r.finished_at && !r.ok || !installed) box.open = true;
+  }
+
+  async function poll() {
+    clearTimeout(timer);
+    if (!box.isConnected) return;  // the panel was left or redrawn; stop asking
+    try {
+      const st = await getJSON("/api/homr/install");
+      draw(st);
+      if (st.running) timer = setTimeout(poll, 2000);
+    } catch (err) { line.textContent = "homr: " + err.message; }
+  }
+
+  async function install() {
+    btn.disabled = again.disabled = true;
+    try { await postJSON("/api/homr/install"); }
+    catch (err) { alert(err.message); }
+    again.disabled = false;
+    poll();
+  }
+  btn.onclick = install;
+  again.onclick = () => {
+    if (confirm("Install homr again from the fork's main? It is already up to date.")) install();
+  };
+  getJSON("/api/homr/install").then((st) => {
+    draw(st);
+    if (st.running) timer = setTimeout(poll, 2000);
+  }).catch((err) => { line.textContent = "homr: " + err.message; });
+  return box;
+}
+
 function newSongDialog() {
   const name = el("input", { placeholder: "Song name, e.g. Laulun aika" });
-  const per = el("input", { type: "checkbox" });
   // Which voices sing it. Asked here because nothing in the file can settle it:
   // a male-choir score is written in treble sounding an octave down and editions
   // routinely leave the 8 off the clef, so its tenor line reads as a soprano one.
@@ -116,19 +231,30 @@ function newSongDialog() {
       ? "Starts at Scan — mark the printed systems on the page, then read the score off them."
       : "A PDF alone starts at Scan; a score file starts at Clean and skips scanning.";
   };
-  pdf.onchange = sayRoute;
-  xml.onchange = sayRoute;
+  // A blank name falls back to the file's own name, the PDF first (#241). It is
+  // filled into the box so it can be read and edited; a typed name is never
+  // replaced. The server applies the same rule to a blank name.
+  const fileName = () => {
+    const f = pdf.files[0] || xml.files[0];
+    return f ? f.name.replace(/\.[^.]*$/, "").replace(/_/g, " ").replace(/\s+/g, " ").trim() : "";
+  };
+  let autoName = "";
+  const sayName = () => {
+    if (name.value.trim() && name.value !== autoName) return;
+    autoName = fileName();
+    name.value = autoName;
+  };
+  pdf.onchange = () => { sayRoute(); sayName(); };
+  xml.onchange = () => { sayRoute(); sayName(); };
   sayRoute();
   const create = el("button", { className: "primary", onclick: async () => {
-    if (!name.value.trim()) { status.textContent = "Name is required."; return; }
     if (!pdf.files[0] && !xml.files[0]) {
       status.textContent = "A score PDF or a score file is required — give at least one.";
       return;
     }
     if (!voicing.value) { status.textContent = "Choose who sings it — it decides the part names."; return; }
     const fd = new FormData();
-    fd.append("name", name.value.trim());
-    fd.append("per_system", per.checked);
+    fd.append("name", name.value.trim() || fileName());
     fd.append("voicing", voicing.value);
     if (xml.files[0]) fd.append("xml", xml.files[0]);
     if (pdf.files[0]) fd.append("pdf", pdf.files[0]);
@@ -148,7 +274,6 @@ function newSongDialog() {
     el("p", { className: "hint" }, "Optional — a score you already have. Hand one in and the page is not scanned."),
     routeHint,
     el("label", {}, "Who sings it"), voicing,
-    el("div", { className: "row" }, per, el("span", {}, "Staves change parts per system (per-system mode)")),
     el("div", { className: "row" }, create, el("button", { onclick: renderLibrary }, "Cancel")),
     status));
 }
@@ -194,25 +319,33 @@ async function renderWorkspace(slug) {
     onclick: () => setWide(!wsGrid.classList.contains("wide")) });
   wsGrid.append(wideBtn);
 
-  // On a phone the three panes cannot share the screen, so one is shown at a time and
-  // this bar switches between them. It is in the DOM at every width — the stylesheet
-  // hides it above the breakpoint, so the desktop layout is untouched and there is no
-  // width-sniffing in here to disagree with the media query.
+  // On a phone the panel and the viewer cannot share the screen, so one is shown at a
+  // time and this bar switches between them. The stage list is the same left-hand
+  // sidebar as on desktop, slid in over the page by the header's ☰ (#258). The bar and
+  // the backdrop are in the DOM at every width — the stylesheet hides them above the
+  // breakpoint, so the desktop layout is untouched and there is no width-sniffing in
+  // here to disagree with the media query.
   const paneBtns = {};
   let pane = "panel";
   const showPane = (p) => {
     if (p !== "viewer") viewerEl._pausePreview();
     pane = p;
-    for (const k of ["stages", "panel", "viewer"]) wsGrid.classList.toggle("m-" + k, k === p);
+    for (const k of ["panel", "viewer"]) wsGrid.classList.toggle("m-" + k, k === p);
     for (const k in paneBtns) paneBtns[k].className = "mtab" + (k === p ? " active" : "");
     // A pane that was hidden has no width, so its PDF could not render while it was
     // away; now that it is on screen, let it.
     if (p === "viewer") viewerEl._wake();
   };
   const mobilebar = el("div", { className: "mobilebar" },
-    [["stages", "Stages"], ["panel", "Panel"], ["viewer", "Score"]].map(([k, label]) =>
+    [["panel", "Panel"], ["viewer", "Score"]].map(([k, label]) =>
       (paneBtns[k] = el("button", { className: "mtab", onclick: () => showPane(k) }, label))));
-  wsGrid.append(mobilebar);
+  const backdrop = el("div", { className: "drawer-backdrop", onclick: closeDrawer });
+  wsGrid.append(mobilebar, backdrop);
+  // Assigned, not added: each song's render replaces the last one's handler.
+  stageMenu.onclick = () =>
+    wsGrid.classList.contains("drawer-open") ? closeDrawer() : openDrawer(wsGrid);
+  stageMenu.hidden = false;
+  stageMenu.setAttribute("aria-expanded", "false");
 
   app.replaceChildren(wsGrid);
   setWide(localStorage.getItem("wsWide") === "1");
@@ -257,6 +390,7 @@ async function renderWorkspace(slug) {
   }
 
   function selectStage(stage) {
+    closeDrawer();
     view = stage;
     if (view === "review" && song.lyrics) panes[0] = "cleaned";
     else if (view === "record") panes[0] = "preview";
@@ -362,28 +496,104 @@ function ensurePdfjs() {
   return pdfjsReady;
 }
 
-// Render `url` into `view` (a scrollable div), preserving its current scrollTop.
-async function renderPdf(view, url) {
+// The viewer's own zoom (#258). On a phone the page itself cannot be pinch-zoomed —
+// zooming the page is what carried the bottom bar off the screen — so the score is
+// zoomed here instead, by drawing it again at the new size rather than stretching
+// a picture. `MAX_PDF_PIXELS` caps a page's drawn width: at zoom 4 on a 3x screen a
+// page would otherwise be a canvas of ~28M pixels, and a score has several.
+const MIN_ZOOM = 1, MAX_ZOOM = 4, MAX_PDF_PIXELS = 2400;
+const clampZoom = (z) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+
+// Render `url` into `view` (a scrollable div) at `view._zoom`, preserving its current
+// scroll. `anchor` names a point on screen ({x, y} inside the view) that should stay
+// over the same spot of the music, which is what a zoom wants; without one the
+// scroll position is kept as it is (same zoom → same content height → exact).
+async function renderPdf(view, url, anchor) {
   const token = (view._tok = (view._tok || 0) + 1);
   const lib = await ensurePdfjs();
   const pdf = await lib.getDocument(url).promise;
   if (view._tok !== token) return; // superseded by a newer render
   const width = view.clientWidth || 600;
+  const zoom = view._zoom || 1;
+  const cssWidth = (width - 14) * zoom;
+  const ratio = Math.min(window.devicePixelRatio || 1, MAX_PDF_PIXELS / cssWidth);
   const canvases = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     if (view._tok !== token) return;
     const base = page.getViewport({ scale: 1 });
-    const vp = page.getViewport({ scale: (width - 14) / base.width });
+    const vp = page.getViewport({ scale: (cssWidth / base.width) * Math.max(ratio, 1 / zoom) });
     const c = el("canvas", { className: "pdfpage" });
     c.width = vp.width; c.height = vp.height;
+    c.style.width = `${cssWidth}px`;
+    if (zoom > 1) c.style.maxWidth = "none";
     await page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
     if (view._tok !== token) return;
     canvases.push(c);
   }
-  const top = view.scrollTop;          // same content height → restoring is exact
+  let fx, fy;
+  if (anchor) {
+    fx = (view.scrollLeft + anchor.x) / Math.max(1, view.scrollWidth);
+    fy = (view.scrollTop + anchor.y) / Math.max(1, view.scrollHeight);
+  }
+  const top = view.scrollTop, left = view.scrollLeft;
+  view.style.transform = "";           // a pinch in progress is now drawn for real
   view.replaceChildren(...canvases);
-  view.scrollTop = top;
+  if (anchor) {
+    view.scrollLeft = fx * view.scrollWidth - anchor.x;
+    view.scrollTop = fy * view.scrollHeight - anchor.y;
+  } else {
+    view.scrollTop = top;
+    view.scrollLeft = left;
+  }
+}
+
+// Draw `view` again at `zoom`, keeping `anchor` (a point inside the view; its centre
+// by default) over the same spot of the music.
+function zoomPdf(view, zoom, anchor) {
+  zoom = clampZoom(zoom);
+  if (!view._url || view._renderedUrl !== view._url) { view._zoom = zoom; return; }
+  if (zoom === (view._zoom || 1)) { view.style.transform = ""; return; }
+  view._zoom = zoom;
+  renderPdf(view, view._url,
+    anchor || { x: view.clientWidth / 2, y: view.clientHeight / 2 }).catch(() => {});
+}
+
+// Two fingers on the score zoom the score, not the page. While the fingers move the
+// view is only scaled, which is cheap; on release it is drawn again at that size.
+// Touch events rather than pointer events: with page panning still allowed, the
+// browser cancels a pointer as soon as it starts scrolling, and a pinch would die
+// half-way through.
+function pinchZoom(view) {
+  let start = null;
+  const spread = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  view.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 2 || !view._url) return;
+    e.preventDefault();
+    const r = view.getBoundingClientRect();
+    const t = e.touches;
+    start = {
+      d: spread(t), scale: 1,
+      x: (t[0].clientX + t[1].clientX) / 2 - r.left,
+      y: (t[0].clientY + t[1].clientY) / 2 - r.top,
+    };
+    view.style.transformOrigin = `${start.x + view.scrollLeft}px ${start.y + view.scrollTop}px`;
+  }, { passive: false });
+  view.addEventListener("touchmove", (e) => {
+    if (!start || e.touches.length !== 2) return;
+    e.preventDefault();
+    const zoom = view._zoom || 1;
+    start.scale = clampZoom(zoom * spread(e.touches) / start.d) / zoom;
+    view.style.transform = `scale(${start.scale})`;
+  }, { passive: false });
+  const end = () => {
+    if (!start) return;
+    const { scale, x, y } = start;
+    start = null;
+    zoomPdf(view, (view._zoom || 1) * scale, { x, y });
+  };
+  view.addEventListener("touchend", end);
+  view.addEventListener("touchcancel", end);
 }
 
 // Render with pdf.js; fall back to a native iframe if pdf.js can't load (offline).
@@ -624,18 +834,20 @@ async function systemsEditor(view, slug) {
 
   // Finding them is a proposal and nothing more: the bands land here unsaved and
   // dirty, exactly as if they had been dragged, so a wrong reading costs a drag
-  // rather than a scan of the wrong music.
-  const findBtn = el("button", {}, "Find systems");
+  // rather than a scan of the wrong music. "Find systems" reads the page itself
+  // in well under a second a page; "Ask homr" is the slower second opinion, offered
+  // only where homr is installed.
   const findNote = el("span", { className: "muted" });
-  findBtn.onclick = async () => {
+  const propose = async (method, btn, who, wait) => {
     if (bands.length && !confirm(
-      `Replace the ${bands.length} band(s) on this song with what homr finds?`)) return;
-    findBtn.disabled = true;
+      `Replace the ${bands.length} band(s) on this song with what ${who} finds?`)) return;
+    btn.disabled = true;
     findNote.className = "muted";
-    findNote.textContent = " Looking for the systems — seconds a page…";
+    findNote.textContent = ` Looking for the systems — ${wait}…`;
     try {
       const res = await fetch(`${P}/find-systems`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ method }),
       });
       if (!res.ok) throw new Error(await res.text());
       const out = await res.json();
@@ -648,9 +860,16 @@ async function systemsEditor(view, slug) {
       findNote.className = "warn";
       findNote.textContent = " Could not find the systems: " + e.message;
     } finally {
-      findBtn.disabled = false;
+      btn.disabled = false;
     }
   };
+  const findBtn = el("button", {}, "Find systems");
+  findBtn.onclick = () => propose("quick", findBtn, "the quick finder", "a moment");
+  const homrBtn = el("button", { hidden: true }, "Ask homr");
+  homrBtn.onclick = () => propose("homr", homrBtn, "homr", "seconds a page");
+  getJSON("/api/homr-engines").then(({ engines }) => {
+    homrBtn.hidden = !(engines && engines.length);
+  }).catch(() => {});
 
   const pagesWrap = el("div", { className: "syspages" });
   // Pages are built once and kept. Rebuilding them per redraw recreates the <img>,
@@ -741,6 +960,7 @@ async function systemsEditor(view, slug) {
     el("div", { className: "sysbar" },
       el("button", { className: "primary", onclick: save }, "Save boundaries"),
       findBtn,
+      homrBtn,
       status,
       el("span", { className: "muted" },
         " Drag an edge to adjust; click the page for a new system; × removes one."),
@@ -821,15 +1041,25 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
           v._sync = () => preview._syncPreview?.();
           v.append(preview);
         }
-        else v._url = docUrl(slug, doc, song.cleaned_fingerprint);
+        else { v._url = docUrl(slug, doc, song.cleaned_fingerprint); pinchZoom(v); }
       }
       for (const d in frames) frames[d].style.display = d === doc ? "" : "none";
       for (const k in btns) btns[k].className = k === doc ? "vtab active" : "vtab";
+      zoomBox.hidden = !frames[doc]._url;   // only a PDF zooms
       ensureRendered(doc); // now visible → has width
     };
     const tabRow = tabs.map(([k, label]) => (btns[k] = el("button", {
       className: "vtab", onclick: () => show(k),
     }, label)));
+    // Phone only (the stylesheet hides it above the breakpoint): page zoom is off
+    // there, so this and a pinch on the score are how it is read up close. Not
+    // `.vtab`: rendering_state.js remembers a `.vtab` click as the document to
+    // reopen, and would press Fit again after every redraw.
+    const zoomBy = (f) => () => { const v = frames[panes[i]]; if (v) zoomPdf(v, f ? (v._zoom || 1) * f : 1); };
+    const zoomBox = el("span", { className: "vzoom" },
+      el("button", { title: "Zoom out", "aria-label": "Zoom out", onclick: zoomBy(1 / 1.5) }, "−"),
+      el("button", { title: "Zoom in", "aria-label": "Zoom in", onclick: zoomBy(1.5) }, "+"),
+      el("button", { title: "Fit the width", onclick: zoomBy(0) }, "Fit"));
 
     if (keys.includes("system") || keys.includes("scanned")) {
       const onAsk = (ev) => {
@@ -863,7 +1093,7 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
       : el("button", { className: "vtab close", title: "Close this pane",
           onclick: () => { panes.splice(i, 1); rebuild(); } }, "✕");
 
-    const bar = el("div", { className: "viewtabs" }, ...tabRow, el("span", { className: "spacer" }), ctrl);
+    const bar = el("div", { className: "viewtabs" }, ...tabRow, el("span", { className: "spacer" }), zoomBox, ctrl);
     show(panes[i]);
     selectors.push(show);
     previewPausers.push(() => frames.preview?._pause?.());
@@ -948,6 +1178,7 @@ function verificationView(summary) {
     el("ul", {},
       row("Health", summary.health),
       row("Source notes", summary.notes),
+      row("Opens in MuseScore", summary.musescore),
       row("Lyrics", summary.lyrics),
       row("Rendered files", media),
       ...files),
@@ -1004,6 +1235,7 @@ function compactReview(summary) {
     parseVerdict(summary?.health),
     el("ul", {},
       compactCheck("Notes", summary?.notes),
+      compactCheck("MuseScore", summary?.musescore),
       compactCheck("Lyrics", summary?.lyrics),
       compactCheck("Health", summary?.health),
       compactCheck("Videos", summary?.media)));
@@ -1078,6 +1310,7 @@ function panelScan(panel, song, P, refresh, actions) {
     engine = sel.value;
     engineRow.append(el("label", { className: "hint" }, "Read with"), sel);
   }).catch(() => {});
+  panel.append(homrBox());
 
   const rerun = async (systems) => {
     appendLog(systems ? "Re-reading system(s) " + systems.join(", ") + "…"
@@ -1137,7 +1370,12 @@ function panelScan(panel, song, P, refresh, actions) {
         + "different discards that system's answers and lapses your OK; one that "
         + "comes out the same costs nothing."),
       el("div", { className: "row" }, ...done.map((i) =>
-        el("button", { disabled: running, onclick: () => rerun([i]) }, String(i)))));
+        el("button", { disabled: running, onclick: () => rerun([i]) }, String(i)))),
+      // The whole score through the same per-system path, so each system still
+      // only costs anything when its reading comes out different.
+      el("div", { className: "row" },
+        el("button", { disabled: running, onclick: () => rerun(done) },
+          "Read all systems again")));
   }
 
   if (st.read) panel.append(scanProvenance(st));
@@ -1928,6 +2166,12 @@ function panelRecord(panel, song, P, refresh, actions) {
     type: "number", value: rec.bottom_margin ?? DEFAULT_BOTTOM_MARGIN, min: -40, max: 100, step: 1,
     style: "width:100px", "data-video-margin": "bottom"
   });
+  // Parts that share a staff in the picture (#246): "S1+S2, A1+A2" draws four
+  // parts on two staves. The videos and their mixes stay one per part.
+  const staffGroups = el("input", {
+    type: "text", value: rec.staff_groups ?? "", placeholder: "e.g. S1+S2, A1+A2",
+    style: "width:220px", "data-staff-groups": ""
+  });
   const hardwareEncoding = el("input", {
     type: "checkbox", checked: rec.hardware_encoding !== false
   });
@@ -1952,6 +2196,7 @@ function panelRecord(panel, song, P, refresh, actions) {
       ? post({ quality: quality.value, hardware_encoding: hardwareEncoding.checked,
                top_margin: Number(topMargin.value) || 0,
                bottom_margin: Number(bottomMargin.value) || 0,
+               staff_groups: staffGroups.value.trim(),
                ...(song.needs_initial_bpm ? { bpm: Number(bpm.value) } : {}) },
              "Rendering the scrolling video…")
       : post({ audio_delay_ms: Number(delay.value) || 1300,
@@ -1976,6 +2221,11 @@ function panelRecord(panel, song, P, refresh, actions) {
     el("div", { className: "row" },
       el("span", {}, "Bottom margin"), bottomMargin, el("span", {}, "%")),
     el("p", { className: "hint" }, "0 = current layout; positive adds white space; negative crops that edge"),
+    el("label", {}, "Shared staves"),
+    el("div", { className: "row" }, staffGroups),
+    el("p", { className: "hint" },
+      "Two parts on one staff, upper part first; blank = one staff per part. Still one video per part."
+      + (parts.length ? ` Parts: ${parts.join(" ")}` : "")),
     el("div", { className: "row" }, hardwareEncoding,
       el("span", {}, "Use NVIDIA hardware encoding when available")));
   const screenAdvanced = el("div", {},
@@ -2001,9 +2251,10 @@ function panelRecord(panel, song, P, refresh, actions) {
     quality: quality.value,
     top_margin: Number(topMargin.value) || 0,
     bottom_margin: Number(bottomMargin.value) || 0,
+    staff_groups: staffGroups.value.trim(),
     ...(song.needs_initial_bpm ? { bpm: Number(bpm.value) } : {}),
   }));
-  for (const control of [quality, topMargin, bottomMargin, bpm]) {
+  for (const control of [quality, topMargin, bottomMargin, bpm, staffGroups]) {
     control.addEventListener("input", actions.previewInputsChanged);
   }
 
