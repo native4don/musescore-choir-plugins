@@ -16,6 +16,7 @@ import unicodedata
 from typing import Dict, List, Optional
 
 from . import health
+from src.media_root import media_dir
 
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SONGS_DIR = os.path.join(SCRIPT_DIR, "songs")
@@ -74,6 +75,10 @@ class Song:
 
     def path(self, *parts: str) -> str:
         return os.path.join(self.dir, *parts)
+
+    def media_path(self, *parts: str) -> str:
+        """A path in this song's media folder, which `MEDIA_ROOT` may put elsewhere."""
+        return os.path.join(media_dir(self.dir), *parts)
 
     def state_path(self) -> str:
         return self.path(STATE_FILE)
@@ -140,10 +145,17 @@ class Song:
             ),
             "lyric_warnings": len(self.data.get("lyrics", {}).get("warnings", [])),
             "recorded": bool(rec.get("outputs")),
-            "uploaded": bool(rec.get("uploads")),
+            # Every video has a YouTube id, not merely one: an upload that stopped
+            # half-way leaves some entries (#371).
+            "uploaded": _upload_complete(self) if rec.get("uploads") else False,
             "created_at": self.data.get("created_at") or self.data.get("updated_at") or 0,
             "updated_at": self.data.get("updated_at") or 0,
         }
+
+
+def _upload_complete(song: "Song") -> bool:
+    from . import free_videos  # it reads songs, so it imports this module
+    return free_videos.status(song)["complete"]
 
 
 _LOCKS: Dict[str, threading.RLock] = {}
@@ -184,37 +196,59 @@ def list_songs() -> List[Song]:
 PLAYLISTS_FILE = os.path.join(SCRIPT_DIR, ".playlists.json")
 
 
-def load_playlists() -> List[Dict]:
-    """Return [{id, title}] of previously-seen playlists, newest first."""
+# Every upload makes the song its own playlist, "<name> Stemmanauhat - <date>".
+# Those are not playlists anybody picks a song into, so they are never offered.
+_SONG_PLAYLIST = re.compile(r" Stemmanauhat - \d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+
+def is_song_playlist(title: Optional[str]) -> bool:
+    """True for the playlist an upload made for one song (#338)."""
+    return bool(title and _SONG_PLAYLIST.search(title))
+
+
+def _read_playlists() -> Dict[str, str]:
     if not os.path.exists(PLAYLISTS_FILE):
-        return []
+        return {}
     try:
         with open(PLAYLISTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            return json.load(f)
     except (OSError, ValueError):
-        return []
-    return [{"id": k, "title": v} for k, v in data.items()]
+        return {}
+
+
+def _write_playlists(data: Dict[str, str]) -> None:
+    try:
+        with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def load_playlists() -> List[Dict]:
+    """Return [{id, title}] of the playlists songs have been picked into.
+
+    Older uploads also wrote each song's own playlist here; those stay in the file
+    and are skipped (#338)."""
+    return [{"id": k, "title": v} for k, v in _read_playlists().items()
+            if not is_song_playlist(v)]
+
+
+def forget_playlist(playlist_id: str) -> None:
+    """Stop offering a playlist. Nothing happens to it on YouTube."""
+    data = _read_playlists()
+    if data.pop(playlist_id, None) is not None:
+        _write_playlists(data)
 
 
 def save_playlist(playlist_id: str, title: Optional[str] = None) -> None:
     """Remember a playlist id (with an optional human title) for later selection."""
     if not playlist_id:
         return
-    data = {}
-    if os.path.exists(PLAYLISTS_FILE):
-        try:
-            with open(PLAYLISTS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            data = {}
+    data = _read_playlists()
     # Keep the best label we have; don't overwrite a real title with the bare id.
     if playlist_id not in data or (title and data[playlist_id] == playlist_id):
         data[playlist_id] = title or data.get(playlist_id) or playlist_id
-    try:
-        with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except OSError:
-        pass
+        _write_playlists(data)
 
 
 def create(name: str, per_system: bool, voicing: str = "") -> Song:

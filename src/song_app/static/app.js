@@ -297,6 +297,7 @@ async function renderWorkspace(slug) {
     : song.has_pdf ? "pdf" : "original";
   const panes = [firstDoc]; // 1 or 2 docs shown side by side
   let viewFp = song.cleaned_fingerprint; // viewer is only rebuilt when this changes
+  resetSysVersions(slug, song.cleaned_fingerprint);
   let recordPreviewSettings = null;
 
   // Build the shell once. The viewer (and its rendered previews) is NOT recreated on
@@ -354,7 +355,7 @@ async function renderWorkspace(slug) {
   function drawStagebar() {
     const rec = song.record || {};
     const recorded = !!(rec.outputs && rec.outputs.length);
-    const uploaded = !!(rec.uploads && rec.uploads.length);
+    const uploaded = !!song.upload_status?.complete;
     const done = (st, i) =>
       i < song.stage_index || (st === "record" && recorded) || (st === "upload" && uploaded);
     stagebarEl.replaceChildren(...song.stages.map((st, i) => el("div", {
@@ -369,6 +370,8 @@ async function renderWorkspace(slug) {
 
   function drawPanel() {
     recordPreviewSettings = null;
+    panelEl._keepPlace = null;
+    panelEl._refreshInPlace = null;
     panelEl.replaceChildren();
     renderPanel(panelEl, view, song, slug, refresh, {
       // Use the same click path as the rail so rendering_state.js remembers an
@@ -379,7 +382,11 @@ async function renderWorkspace(slug) {
         if (target) target.click();
         else selectStage(stage);
       },
-      openPreview: () => { viewerEl._showFirst("preview"); showPane("viewer"); },
+      openPreview: ({ start } = {}) => {
+        viewerEl._showFirst("preview");
+        showPane("viewer");
+        if (start) viewerEl._startPreview();
+      },
       // The panel is a task screen and the score is a full-screen visual, so a
       // panel that says "look at this" has to be able to put it in front of you.
       openDoc: (doc) => { viewerEl._showFirst(doc); showPane("viewer"); },
@@ -422,7 +429,14 @@ async function renderWorkspace(slug) {
     const fresh = await getJSON(`/api/songs/${encodeURIComponent(slug)}`);
     Object.assign(song, fresh);
     drawStagebar();
-    drawPanel();
+    // A refresh redraws the panel the person is looking at, so a panel that loads
+    // its content later says where it was first (the Fix panel, #329).
+    panelEl._keepPlace?.();
+    // A panel that can bring itself up to date says so, and is left standing: the
+    // Lyrics panel, so an import does not throw away the box being typed in and
+    // the place in the list (#336). It answers false when what it shows is stale.
+    if (!panelEl._refreshInPlace?.()) drawPanel();
+    if (song.cleaned_fingerprint !== viewFp) cleanedScoreMoved(slug, song.cleaned_fingerprint);
     if (tabKeys() !== builtTabs) {
       // The tab set changed (a doc appeared or vanished) → structural rebuild.
       viewFp = song.cleaned_fingerprint;
@@ -596,15 +610,71 @@ function pinchZoom(view) {
   view.addEventListener("touchcancel", end);
 }
 
-// Render with pdf.js; fall back to a native iframe if pdf.js can't load (offline).
+// "Still working", with the seconds counting up. A MuseScore render can take a
+// minute, and a line that never changes reads as a page that has frozen (#303).
+// The counter stops by itself once the note has left the page.
+function busyNote(text, className = "busynote") {
+  const note = el("p", { className }, text);
+  const started = Date.now();
+  const timer = setInterval(() => {
+    if (!note.isConnected) { clearInterval(timer); return; }
+    note.textContent = `${text} ${Math.round((Date.now() - started) / 1000)} s`;
+  }, 1000);
+  return note;
+}
+
+// Fetch `url` once; a refusal throws with the server's own words. These URLs are
+// MuseScore runs, so the reason is read off the response that failed rather than
+// by asking again, which would run the same failing render a second time.
+async function fetchOrSay(url) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    throw new Error((await r.json().catch(() => ({}))).detail || r.statusText || "");
+  }
+  return r;
+}
+
+// Render with pdf.js; fall back to a native iframe only if pdf.js itself can't
+// load (offline). While it renders the pane says so: a first build shows a note
+// in place of the score, a rebuild keeps the old score up under an "Updating…"
+// badge, since blanking a score somebody is reading is worse than a few seconds
+// of the previous one. A render the server refused says why, rather than leaving
+// the pane empty, which looked the same as waiting forever.
 async function mountPdf(view, url) {
+  const mine = (view._mountTok = (view._mountTok || 0) + 1);
+  const latest = () => view._mountTok === mine;
+  const busy = view._busyText || "Loading…";
+  const shown = view.querySelector("canvas.pdfpage");
+  let badge = null;
+  if (shown) {
+    badge = view.querySelector(".vupdating")
+      || el("div", { className: "vupdating" }, "Updating…");
+    if (!badge.isConnected) view.prepend(badge);
+  } else if (!view.querySelector(".busynote")) {
+    view.replaceChildren(busyNote(busy));
+  }
   try {
-    await renderPdf(view, url);
-    view._renderedUrl = url;
+    await ensurePdfjs();
   } catch {
     view.replaceChildren(el("iframe", { className: "pdffallback",
       src: url + "#navpanes=0&view=FitH" }));
     view._renderedUrl = url;
+    return;
+  }
+  try {
+    // Fetched here and handed to pdf.js as bytes, so a refusal's reason is in hand.
+    const data = new Uint8Array(await (await fetchOrSay(url)).arrayBuffer());
+    if (!latest()) return;
+    await renderPdf(view, { data });
+    if (latest()) view._renderedUrl = url;
+  } catch (e) {
+    if (!latest()) return;
+    const why = e.message || "";
+    view.replaceChildren(el("p", { className: "warn pdferr" },
+      `${view._failText || "Could not load this document"}${why ? ": " + why : "."}`));
+    view._renderedUrl = url;               // no retry loop; a new score retries
+  } finally {
+    if (latest() && badge) badge.remove();
   }
 }
 
@@ -614,6 +684,180 @@ async function mountPdf(view, url) {
 const SYSTEM_EVENT = "song-system";
 const showSystem = (index) =>
   window.dispatchEvent(new CustomEvent(SYSTEM_EVENT, { detail: { index } }));
+// The system last asked for, so a viewer rebuilt underneath (a tab appearing after
+// the first import) comes back on it rather than on system 1.
+const shownSystem = {};
+
+// ---- the cleaned score, one system at a time, kept current (#336) -------------
+// Typing lyrics is checked by looking at them on the notes, and an import changes
+// a system or two. So each cleaned system's picture carries its own version in its
+// URL, and an import moves on only the versions of the systems it touched: those
+// are fetched again, every other picture stays exactly as it is. `seen` is the
+// score fingerprint the pictures already account for, so the refresh that follows
+// an import does not then reload everything for the same change; a fingerprint
+// nobody announced (a re-clean, an edit in MuseScore) moves on every system.
+const LYRICS_EVENT = "song-lyrics-imported";
+let sysVer = { slug: null, base: "", by: {}, seen: "" };
+// Set while an import is on its way: the import names what it changed when it
+// lands, so a refresh that sees the new fingerprint first must not call it "all".
+let lyricImporting = false;
+
+function resetSysVersions(slug, fp) {
+  sysVer = { slug, base: fp || "", by: {}, seen: fp || "" };
+}
+
+function cleanedSystemSrc(slug, n) {
+  const v = sysVer.slug === slug ? (sysVer.by[n] || sysVer.base) : "";
+  return `/api/songs/${encodeURIComponent(slug)}/cleaned-system/${n}?dpi=300`
+    + `&v=${encodeURIComponent(v)}`;
+}
+
+// `systems` is a list of printed system numbers, or "all".
+function cleanedSystemsChanged(slug, fp, systems) {
+  if (sysVer.slug !== slug) resetSysVersions(slug, sysVer.seen);
+  if (systems === "all") sysVer = { slug, base: fp || "", by: {}, seen: fp || "" };
+  else { for (const n of systems) sysVer.by[n] = fp || ""; sysVer.seen = fp || ""; }
+  window.dispatchEvent(new CustomEvent(LYRICS_EVENT, { detail: { slug, systems } }));
+}
+
+// The score moved; if nobody said which systems, all of them did.
+function cleanedScoreMoved(slug, fp) {
+  if (lyricImporting) return;
+  if (sysVer.slug === slug && sysVer.seen === fp) return;
+  cleanedSystemsChanged(slug, fp, "all");
+}
+
+// Two at a time, like the slow queue: each one can be a MuseScore run.
+const swapQueue = { running: 0, waiting: [] };
+function swapLimited(job) {
+  const pump = () => {
+    while (swapQueue.running < SLOW_AT_ONCE && swapQueue.waiting.length) {
+      const next = swapQueue.waiting.shift();
+      swapQueue.running++;
+      next().finally(() => { swapQueue.running--; pump(); });
+    }
+  };
+  swapQueue.waiting.push(job);
+  pump();
+}
+
+// Put the picture at `src` into `box`. A picture already there stays on screen,
+// under an "Updating…" note, until the new one has loaded — so nothing collapses
+// or jumps while MuseScore works — and a failure leaves it there with the reason.
+function swapSystemImage(box, src, n) {
+  if (box._src === src) return;
+  box._src = src;
+  box.querySelectorAll(".liveupd, .liveerr").forEach((e) => e.remove());
+  const old = box.querySelector("img");
+  const note = old ? el("div", { className: "liveupd" }, "Updating…")
+    : busyNote(`Engraving system ${n}…`, "busynote small");
+  if (old) box.append(note); else box.replaceChildren(note);
+  const current = () => box._src === src;
+  swapLimited(() => fetchOrSay(src).then((r) => r.blob()).then((blob) => {
+    if (!current()) return;
+    const img = el("img", { className: "cmpimg", alt: `cleaned system ${n}` });
+    const local = URL.createObjectURL(blob);
+    return new Promise((done) => {
+      img.onload = () => {
+        URL.revokeObjectURL(local);
+        if (current()) box.replaceChildren(img);
+        done();
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(local);
+        if (current()) { box._src = null; note.remove(); box.append(el("div", { className: "liveerr" }, "The picture could not be shown.")); }
+        done();
+      };
+      img.src = local;
+    });
+  }, (e) => {
+    if (!current()) return;
+    box._src = null; // a failed picture is asked for again the next time it is wanted
+    note.remove();
+    box.append(el("div", { className: "liveerr" },
+      `Could not engrave system ${n}${e.message ? ": " + e.message : "."}`));
+  }));
+}
+
+// ---- slow pictures: the engraved systems in Compare and Scan vs page -----------
+// Each one is a MuseScore run on the server. Asked for all at once they started a
+// MuseScore per system on a four-core host and arrived in whatever order those
+// finished, popping in at random under an empty row (#303). So each waits in a
+// placeholder that holds its place and says what it is waiting for, and they are
+// fetched in reading order, two at a time.
+//
+// The queue belongs to the view and outlives a redraw, and that is the point: a
+// scan redraws its view after every system it reads. A request already running is
+// not started again and not dropped either — when it lands it fills whichever
+// placeholder now stands for that picture. Stopping it instead would not stop the
+// MuseScore run behind it, which carries on on the server either way, so a fresh
+// pair per redraw would put four, then six, on the host.
+const SLOW_AT_ONCE = 2;
+
+function slowQueue(view) {
+  const queue = view._slowQueue || (view._slowQueue = makeSlowQueue());
+  queue.reset();
+  return queue;
+}
+
+function makeSlowQueue() {
+  let waiting = [];
+  let slots = new Map();                 // src -> the placeholder showing it now
+  const running = new Set();             // src of each request in flight
+  const pump = () => {
+    while (running.size < SLOW_AT_ONCE && waiting.length) {
+      const src = waiting.shift()._src;
+      if (running.has(src)) continue;
+      running.add(src);
+      fetchOrSay(src).then((r) => r.blob()).then(
+        (blob) => slots.get(src)?._show(blob),
+        (e) => slots.get(src)?._fail(e.message),
+      ).finally(() => { running.delete(src); pump(); });
+    }
+  };
+  return {
+    // A redraw: the placeholders waiting are the old view's, so they go; the
+    // requests running stay and land on the new placeholders.
+    reset() { waiting = []; slots = new Map(); },
+    push(slot) {
+      if (slot._ready) return;                   // already seen: shown at once
+      slots.set(slot._src, slot);
+      if (!running.has(slot._src)) { waiting.push(slot); pump(); }
+    },
+    // The system somebody asked to look at goes next.
+    front(slot) {
+      const i = waiting.indexOf(slot);
+      if (i > 0) { waiting.splice(i, 1); waiting.unshift(slot); }
+    },
+  };
+}
+
+// A picture already shown in this view is drawn straight away when the view is
+// redrawn; only new ones wait. Fetched rather than left to <img>, which cannot
+// read why a request failed.
+function slowImage(view, src, alt, n) {
+  const seen = (view._slowSeen = view._slowSeen || new Set());
+  if (seen.has(src)) {
+    const img = el("img", { className: "cmpimg", src, alt });
+    img._ready = true;
+    return img;
+  }
+  const slot = el("div", { className: "cmpslot" },
+    busyNote(`Engraving system ${n}…`, "busynote small"));
+  slot._src = src;
+  slot._fail = (why) => {
+    slot.className = "cmpslot err";
+    slot.replaceChildren(`Could not engrave system ${n}${why ? ": " + why : "."}`);
+  };
+  slot._show = (blob) => {
+    const img = el("img", { className: "cmpimg fresh", alt });
+    const local = URL.createObjectURL(blob);
+    img.onload = () => { URL.revokeObjectURL(local); seen.add(src); slot.replaceWith(img); };
+    img.onerror = () => { URL.revokeObjectURL(local); slot._fail("the picture could not be shown"); };
+    img.src = local;
+  };
+  return slot;
+}
 
 // ---- Compare: each printed system above the same system of the cleaned score ----
 // Reviewing means checking one against the other, and they cannot simply be laid
@@ -621,12 +865,17 @@ const showSystem = (index) =>
 // taller. Cut both into systems and pair them up and the comparison is per line.
 async function compareView(view, slug) {
   const P = `/api/songs/${encodeURIComponent(slug)}`;
-  view.replaceChildren(el("p", { className: "muted" }, "Pairing systems…"));
+  // Pairing renders the whole cleaned score first, which is the slow part.
+  view.replaceChildren(busyNote(
+    "Building the cleaned score with MuseScore to cut it into systems…"));
   let data;
   try {
-    data = await (await fetch(`${P}/compare`)).json();
-  } catch {
-    view.replaceChildren(el("p", { className: "warn" }, "Could not pair the systems."));
+    const res = await fetch(`${P}/compare`);
+    data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+  } catch (e) {
+    view.replaceChildren(el("p", { className: "warn" },
+      "Could not pair the systems" + (e.message ? ": " + e.message : ".")));
     return;
   }
   const rows = data.systems || [];
@@ -637,16 +886,37 @@ async function compareView(view, slug) {
     return;
   }
   const byIndex = {};
-  view.replaceChildren(...rows.map((r) => byIndex[r.index] = el("div", { className: "cmprow" },
-    el("div", { className: "cmphead" },
-      `System ${r.index} — measures ${r.measure_start}–${r.measure_end}`),
-    el("div", { className: "cmplabel" }, "scan"),
-    el("img", { className: "cmpimg", loading: "lazy",
-                src: `${P}/system/${r.index}?dpi=300`, alt: `printed system ${r.index}` }),
-    el("div", { className: "cmplabel" }, "cleaned"),
-    el("img", { className: "cmpimg", loading: "lazy",
-                src: `${P}/cleaned-system/${r.index}?dpi=300`, alt: `cleaned system ${r.index}` }),
-  )));
+  const queue = slowQueue(view);
+  view.replaceChildren(...rows.map((r) => {
+    const src = cleanedSystemSrc(slug, r.index);
+    const slow = slowImage(view, src, `cleaned system ${r.index}`, r.index);
+    // The cleaned picture sits in a box of its own, so an import can swap it for a
+    // newer one in place (#336) whether it has arrived yet or not.
+    const cleanedBox = el("div", { className: "cmpcleaned" }, slow);
+    cleanedBox._src = src;
+    const row = byIndex[r.index] = el("div", { className: "cmprow" },
+      el("div", { className: "cmphead" },
+        `System ${r.index} — measures ${r.measure_start}–${r.measure_end}`),
+      el("div", { className: "cmplabel" }, "scan"),
+      el("img", { className: "cmpimg", loading: "lazy",
+                  src: `${P}/system/${r.index}?dpi=300`, alt: `printed system ${r.index}` }),
+      el("div", { className: "cmplabel" }, "cleaned"),
+      cleanedBox,
+    );
+    row._slow = slow;
+    row._cleaned = cleanedBox;
+    return row;
+  }));
+  for (const r of rows) queue.push(byIndex[r.index]._slow);
+
+  // Only the systems an import touched are fetched again; the rest stay as drawn.
+  view._refreshSystems = (systems) => {
+    const which = systems === "all" ? Object.keys(byIndex).map(Number) : systems;
+    for (const n of which) {
+      const row = byIndex[n];
+      if (row) swapSystemImage(row._cleaned, cleanedSystemSrc(slug, n), n);
+    }
+  };
 
   // Typing lyrics for a system should put that system in front of you, scan and
   // result together — that is the pair you are checking the words against.
@@ -655,6 +925,12 @@ async function compareView(view, slug) {
     if (!row) return;
     for (const el_ of Object.values(byIndex)) el_.classList.remove("cmpon");
     row.classList.add("cmpon");
+    queue.front(row._slow);
+    // A cleaned picture that failed is asked for again when its system is wanted.
+    if (!row._cleaned._src || row._cleaned.querySelector(".cmpslot.err")) {
+      row._cleaned._src = null;
+      swapSystemImage(row._cleaned, cleanedSystemSrc(slug, n), n);
+    }
     row.scrollIntoView({ block: "start", behavior: "smooth" });
   };
 }
@@ -730,29 +1006,25 @@ function scannedView(view, song, slug) {
   const P = `/api/songs/${encodeURIComponent(slug)}`;
   const st = song.scan_status || {};
   const errors = st.errors || {};
-  const fresh = new Set(st.new_since_ok || []);
   const rows = [];
   const byIndex = {};
+  const queue = slowQueue(view);
   for (let i = 1; i <= (st.systems || 0); i++) {
     const bad = errors[String(i)];
-    const label = fresh.has(i) && st.ever_approved
-      ? el("span", { className: "newbadge" }, "new since your OK") : "";
+    const slow = bad ? null : slowImage(view, `${P}/scan-system/${i}?dpi=200`,
+      `scanned system ${i}`, i);
     rows.push(byIndex[i] = el("div", { className: "cmprow" },
-      el("div", { className: "cmphead" }, `System ${i}`, label),
+      el("div", { className: "cmphead" }, `System ${i}`),
       el("div", { className: "cmplabel" }, "page"),
       el("img", { className: "cmpimg", loading: "lazy",
                   src: `${P}/system/${i}?dpi=300`, alt: `printed system ${i}` }),
       el("div", { className: "cmplabel" }, "scan"),
       // A hole shows its reason where its music would be. Leaving the row out
       // instead is how a score quietly short of a system reads as complete.
-      bad ? el("div", { className: "cmperr" }, "Could not be read: " + bad)
-          : el("img", { className: "cmpimg", loading: "lazy",
-                        src: `${P}/scan-system/${i}?dpi=200`,
-                        alt: `scanned system ${i}` }),
+      bad ? el("div", { className: "cmperr" }, "Could not be read: " + bad) : slow,
       // Which homr read this one, where the reading is being judged. It says so
       // and does nothing about it.
-      // What the last clean made of this system, beside the picture of it. It is a
-      // count and not a verdict: one system is too little to judge a parse on.
+      // What the last clean made of this system, beside the picture of it.
       bad || !st.findings || !st.findings[String(i)] ? ""
         : el("div", { className: "hint scanfound" },
           `${st.findings[String(i)]} health finding(s) landed in this system`),
@@ -762,14 +1034,17 @@ function scannedView(view, song, slug) {
            ? " — not the homr installed now" : "")),
       rereadRow(slug, i, bad),
     ));
+    byIndex[i]._slow = slow;
   }
   view.replaceChildren(...(rows.length ? rows
     : [el("p", { className: "warn" }, "Nothing has been read yet.")]));
+  for (const row of rows) if (row._slow) queue.push(row._slow);
   view._focusSystem = (n) => {
     const row = byIndex[n];
     if (!row) return;
     for (const other of Object.values(byIndex)) other.classList.remove("cmpon");
     row.classList.add("cmpon");
+    if (row._slow) queue.front(row._slow);
     row.scrollIntoView({ block: "start", behavior: "smooth" });
   };
 }
@@ -786,8 +1061,8 @@ function rereadRow(slug, index, failed) {
       `Read system ${index} again`),
     el("span", { className: "muted" },
       failed ? "It has not been read yet."
-        : "A reading that comes out different discards this system's answers and "
-          + "lapses your OK; one that comes out the same costs nothing."));
+        : "A reading that comes out different discards this system's grid answers "
+          + "and lapses the Review approval; one that comes out the same costs nothing."));
 }
 
 // ---- Systems: the printed-system boundaries, drawn over the page and draggable ----
@@ -987,6 +1262,7 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
   const previewPausers = [];
   const previewDestroyers = [];
   const previewSyncers = [];
+  const previewStarters = [];
 
   const slot = (i) => {
     const frames = {};                  // doc -> scrollable pdfview div (kept alive)
@@ -1019,14 +1295,32 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
         else if (doc === "system") {
           v._systems = true;                       // draws itself, not a PDF
           v.className = "pdfview onesystem";
+          // The printed system, and under it the same system of the cleaned score
+          // once it has words on it: that is the pair a lyric is checked against.
           v._setSystem = (n) => {
-            v._n = n;
-            v.replaceChildren(
+            // Already there -- unless its cleaned picture failed, which is asked again.
+            if (n === v._n && v._shownLyrics === !!song.lyrics && (!v._box || v._box._src)) return;
+            v._n = shownSystem[slug] = n;
+            v._shownLyrics = !!song.lyrics;
+            v._box = null;
+            const parts = [
               el("div", { className: "muted" }, `Printed system ${n}`),
               el("img", { src: `/api/songs/${encodeURIComponent(slug)}/system/${n}?dpi=400` }),
-            );
+            ];
+            if (song.has_cleaned && song.lyrics) {
+              v._box = el("div", { className: "cmpcleaned" });
+              parts.push(el("div", { className: "muted" }, `Cleaned system ${n}, with lyrics`), v._box);
+              swapSystemImage(v._box, cleanedSystemSrc(slug, n), n);
+            }
+            v.replaceChildren(...parts);
           };
-          v._setSystem(v._n || 1);
+          v._refreshSystems = (systems) => {
+            if (!v._n) return;
+            if (!v._box || v._shownLyrics !== !!song.lyrics) { v._setSystem(v._n); return; }
+            if (systems === "all" || systems.includes(v._n))
+              swapSystemImage(v._box, cleanedSystemSrc(slug, v._n), v._n);
+          };
+          v._setSystem(shownSystem[slug] || 1);
         }
         else if (doc === "preview") {
           v._systems = true;
@@ -1039,9 +1333,17 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
           v._pause = () => preview._pausePreview?.();
           v._destroy = () => preview._stopPreview?.();
           v._sync = () => preview._syncPreview?.();
+          v._start = () => preview._startPreview?.();
           v.append(preview);
         }
-        else { v._url = docUrl(slug, doc, song.cleaned_fingerprint); pinchZoom(v); }
+        else {
+          v._url = docUrl(slug, doc, song.cleaned_fingerprint);
+          if (doc !== "pdf") {
+            v._busyText = "Building this score with MuseScore…";
+            v._failText = "MuseScore could not build this score";
+          }
+          pinchZoom(v);
+        }
       }
       for (const d in frames) frames[d].style.display = d === doc ? "" : "none";
       for (const k in btns) btns[k].className = k === doc ? "vtab active" : "vtab";
@@ -1086,6 +1388,15 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
       window.addEventListener(SYSTEM_EVENT, onAsk);
       body._cleanup = () => window.removeEventListener(SYSTEM_EVENT, onAsk);
     }
+    // An import (or any change to the cleaned score) names the systems it moved;
+    // only those pictures are fetched again (#336).
+    const onChanged = (ev) => {
+      if (!body.isConnected) { window.removeEventListener(LYRICS_EVENT, onChanged); return; }
+      if (ev.detail?.slug !== slug) return;
+      frames.system?._refreshSystems?.(ev.detail.systems);
+      frames.compare?._refreshSystems?.(ev.detail.systems);
+    };
+    window.addEventListener(LYRICS_EVENT, onChanged);
 
     const ctrl = panes.length === 1
       ? el("button", { className: "vtab split", title: "Split view",
@@ -1099,6 +1410,7 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
     previewPausers.push(() => frames.preview?._pause?.());
     previewDestroyers.push(() => frames.preview?._destroy?.());
     previewSyncers.push(() => frames.preview?._sync?.());
+    previewStarters.push(() => frames.preview?._start?.());
     wakers.push(() => ensureRendered(panes[i]));
     scanRefreshers.push(() => { if (frames.scanned) scannedView(frames.scanned, song, slug); });
     // Re-render only the cleaned previews; their scroll is preserved by renderPdf.
@@ -1116,9 +1428,9 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
   // A system read while the comparison is open must appear in it, and nothing
   // else must: redrawing reloads every crop, so it happens only when the scan
   // itself moved.
-  let builtScan = `${song.scan_status?.revision}:${song.scan_status?.approved}`;
+  let builtScan = `${song.scan_status?.revision}`;
   root._refreshScan = () => {
-    const now = `${song.scan_status?.revision}:${song.scan_status?.approved}`;
+    const now = `${song.scan_status?.revision}`;
     if (now === builtScan) return;
     builtScan = now;
     scanRefreshers.forEach((f) => f());
@@ -1128,6 +1440,9 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
   root._pausePreview = () => previewPausers.forEach((pause) => pause());
   root._destroyPreview = () => previewDestroyers.forEach((destroy) => destroy());
   root._syncPreview = () => previewSyncers.forEach((sync) => sync());
+  // Only the first pane: it is the one the panel's Preview button brings forward,
+  // and a split showing the preview twice should not prepare it twice.
+  root._startPreview = () => previewStarters[0]?.();
   root._showFirst = (doc) => {
     if (keys.includes(doc) && selectors[0]) selectors[0](doc);
   };
@@ -1171,7 +1486,6 @@ function verificationView(summary) {
       `${icon[result.status] || "—"} ${part}: ${result.detail}`));
   return el("div", { className: "verify" },
     el("h3", {}, "Verification"),
-    parseVerdict(summary.health),
     el("p", { className: "hint" },
       `Expected parts: ${(summary.expected_parts || []).join(", ") || "not available"}; `
       + `printed systems: ${summary.systems || "not available"}.`),
@@ -1183,22 +1497,6 @@ function verificationView(summary) {
       row("Rendered files", media),
       ...files),
     summary.render_error ? el("div", { className: "banner err" }, "Render error: " + summary.render_error) : "");
-}
-
-// A parse rough enough is not a repair list, and a count never said so: the walk's
-// song read "60 open issue(s)" here with an approve button on the next line. This is
-// the sentence instead of the number — and it is deliberately not a gate. The
-// operator's own condition was that he would have to see it with his own eyes, so
-// refusing to go on would take a call he has reserved for himself.
-function parseVerdict(health) {
-  const v = health?.verdict;
-  if (!v || v.level !== "unusable") return "";
-  return el("div", { className: "banner warn verdict" },
-    el("strong", {}, "This reading is probably not worth repairing."),
-    el("div", {}, v.message),
-    el("div", { className: "hint" },
-      "Read it against the page in the Scan stage — a system read again there costs "
-      + "one button. Nothing is blocked: you can carry on if you disagree."));
 }
 
 const CHECK_ICON = { passed: "✓", warning: "⚠", stale: "⚠", not_checked: "—" };
@@ -1215,9 +1513,6 @@ function reviewReadiness(summary) {
   if (!summary) return { tone: "attention", title: "Needs attention" };
   const core = [summary.notes, summary.lyrics, summary.health];
   const media = summary.media;
-  if (summary.health?.verdict?.level === "unusable") {
-    return { tone: "attention", title: "Read this against the page" };
-  }
   if (core.some((result) => ["stale", "not_checked"].includes(result?.status))) {
     return { tone: "attention", title: "Needs attention" };
   }
@@ -1232,7 +1527,6 @@ function compactReview(summary) {
   const readiness = reviewReadiness(summary);
   return el("section", { className: `compact-review ${readiness.tone}` },
     el("div", { className: "review-state" }, readiness.title),
-    parseVerdict(summary?.health),
     el("ul", {},
       compactCheck("Notes", summary?.notes),
       compactCheck("MuseScore", summary?.musescore),
@@ -1289,9 +1583,9 @@ function panelScan(panel, song, P, refresh, actions) {
   if (st.systems)
     panel.append(el("p", {}, `${st.read} of ${st.systems} system(s) read.`
       + (st.holes?.length ? ` Still to read: ${st.holes.join(", ")}.` : "")));
-  for (const gone of song.scan_discarded || [])
-    panel.append(el("div", { className: "banner" },
-      `Discarded ${gone}: what it was made from has changed.`));
+  // Already sentences: the server words them (`scan.said`).
+  for (const line of song.scan_discarded || [])
+    panel.append(el("div", { className: "banner" }, line));
 
   // Which homr reads the page. Only offered when this host has more than one
   // installed (HOMR_BRANCH=... scripts/install-homr.sh) — a picker with a single
@@ -1367,8 +1661,8 @@ function panelScan(panel, song, P, refresh, actions) {
       el("p", { className: "hint" },
         "Forces a re-read even though the band has not moved — for trying another "
         + "engine, or a system that came back wrong. A reading that comes out "
-        + "different discards that system's answers and lapses your OK; one that "
-        + "comes out the same costs nothing."),
+        + "different discards that system's grid answers and lapses the Review "
+        + "approval; one that comes out the same costs nothing."),
       el("div", { className: "row" }, ...done.map((i) =>
         el("button", { disabled: running, onclick: () => rerun([i]) }, String(i)))),
       // The whole score through the same per-system path, so each system still
@@ -1386,11 +1680,9 @@ function panelScan(panel, song, P, refresh, actions) {
   else if (job?.status === "failed")
     panel.append(el("div", { className: "banner err" }, "Last scan failed: " + job.error));
 
-  // The gate. One OK for the whole song, and only when there is a whole score to
-  // approve — per-system ticking was rejected as friction that produces false
-  // diligence rather than more looking.
-  if (st.complete && !running)
-    panel.append(scanApproval(st, song, P, refresh, actions, openScanned));
+  // No gate (#281): a whole score moves the song on by itself, and the bar-by-bar
+  // checking happens where it can be done — the ⚠ marks, Fix and Review.
+  if (st.complete && !running) panel.append(scanDone(st, actions));
 
   panel.append(makeLog(job));
 }
@@ -1420,9 +1712,8 @@ function scanProvenance(st) {
 }
 
 // Where the last clean's findings fell, said on the screen that can re-read a
-// system. The verdict itself cannot be made here — it comes off the cleaned score —
-// but once a clean has happened the damage has system numbers, and this is the one
-// place where acting on them costs a single button.
+// system. Once a clean has happened the damage has system numbers, and this is the
+// one place where acting on them costs a single button.
 function scanFindingsHint(st) {
   const byIndex = st.findings;
   if (!byIndex) return "";
@@ -1436,43 +1727,13 @@ function scanFindingsHint(st) {
     + `in system(s) ${named} — read those against the page first.`);
 }
 
-function scanApproval(st, song, P, refresh, actions, openScanned) {
-  if (st.approved) {
-    const { stale, unknown } = homrDrift(st);
-    return el("div", { className: "banner good" },
-      "You have said this reading of the page is right. The song is on Clean.",
-      // An OK is about the printed page, and the page has not changed — so an
-      // upgrade says this and does not take the OK away.
-      stale || unknown ? el("div", { className: "hint" },
-        "Some of what you approved was read by "
-        + (stale ? "an older homr" : "a homr nobody recorded")
-        + ". Your OK stands; re-read a system if you want to look again.") : "");
-  }
-  const fresh = st.new_since_ok || [];
-  const okBtn = el("button", { className: "primary", onclick: async () => {
-    okBtn.disabled = true;
-    try {
-      Object.assign(song, await postJSON(`${P}/approve-scan`, { revision: st.revision }));
-      // Saying it is right is also saying "get on with it", so the panel follows
-      // the song to the stage it just unlocked rather than sitting on a done one.
-      if (actions?.selectStage) actions.selectStage("clean");
-      else refresh();
-    } catch (e) { okBtn.disabled = false; appendLog(e.message, true); }
-  }}, "This reading is right — continue to Clean");
-  return el("section", { className: "scanok" },
-    el("h3", {}, "Say it is right"),
-    el("p", { className: "hint" },
-      "Nothing checks this for you. The parse that hurts is the tidy-looking one, "
-      + "so compare each system against the page before you press it."),
-    // Re-reading a system lapses the OK, and the systems that changed are where
-    // to look. A hint, not per-system bookkeeping.
-    st.ever_approved
-      ? el("p", { className: "warn" }, fresh.length
-        ? `Your OK lapsed. Changed since it: system(s) ${fresh.join(", ")}.`
-        : "Your OK lapsed because the scan changed.")
-      : "",
-    el("div", { className: "row" }, okBtn,
-      el("button", { onclick: openScanned }, "Compare with the page")));
+function scanDone(st, actions) {
+  return el("div", { className: "banner good scandone" },
+    el("div", {}, `All ${st.systems} systems read — the song is on Clean. Bars homr `
+      + "was unsure of are marked ⚠ and listed in Fix."),
+    actions?.selectStage ? el("div", { className: "row" },
+      el("button", { className: "primary", onclick: () => actions.selectStage("clean") },
+        "Go to Clean")) : "");
 }
 
 function panelRegister(panel, song, P, refresh) {
@@ -1532,7 +1793,10 @@ async function panelClean(panel, song, slug, P, refresh) {
     panel.append(holder);
     try {
       const { grid } = await getJSON(`${P}/systems`);
-      holder.replaceChildren(...grid.map((sys) => sysBlock(sys)));
+      holder.replaceChildren(
+        el("p", { className: "hint fallbackhint" },
+          "S1b sings S1's notes wherever it has none of its own; the same goes for any part name plus one small letter."),
+        ...grid.map((sys) => sysBlock(sys)));
 
       // Roll a staff's answer forward: an empty field shows the previous system's
       // answer for the same staff as a faint placeholder (and inherits it at clean).
@@ -1546,6 +1810,17 @@ async function panelClean(panel, song, slug, P, refresh) {
         for (const sid in m) m[sid].sort((a, b) => a.dataset.sys - b.dataset.sys);
         return m;
       };
+      // Lines with no answer: a slot holding a name or "-" (silent on purpose) answers
+      // its line, an empty one ("A1,") does not — the same count the server reports
+      // by (per_system.dropped_voices). A staff with no name at all is "unset" instead.
+      const underNamed = (inp, carry) => {
+        if (!carry) return 0;
+        const slots = carry.split(",").map((n) => n.trim());
+        if (!slots.some((n) => n && n !== CLEARED)) return 0;
+        let answered = 0;
+        for (let i = 0; i < +inp.dataset.lines; i++) if (slots[i]) answered++;
+        return +inp.dataset.lines - answered;
+      };
       const cascade = () => {
         for (const list of Object.values(byStaff())) {
           let carry = "";
@@ -1556,6 +1831,16 @@ async function panelClean(panel, song, slug, P, refresh) {
             else inp.placeholder = carry || inp.dataset.hint;
             // flag staves that will be dropped (cleared, or no value and nothing to inherit)
             inp.classList.toggle("unset", (!v || v === CLEARED) && !carry);
+            // ...and staves named with fewer parts than the lines they carry here: the
+            // rebuild takes one name per line, top first, so the rest are dropped (#330).
+            // Usually an answer carried over from a system where the staff had one line.
+            const lost = underNamed(inp, carry);
+            inp.classList.toggle("undernamed", lost > 0);
+            const note = inp.parentElement.querySelector(".undernote");
+            if (note) note.textContent = lost > 0
+              ? `${inp.dataset.lines} voices here, ${inp.dataset.lines - lost} answered — `
+                + (lost === 1 ? "one is" : `${lost} are`) + " dropped"
+              : "";
           }
         }
       };
@@ -1596,6 +1881,9 @@ async function panelClean(panel, song, slug, P, refresh) {
         }
         return out;
       };
+      const dropping = () => inputs.filter((inp) => inp.classList.contains("undernamed"))
+        .map((inp) => `staff ${inp.dataset.staff} · system ${+inp.dataset.sys + 1}`
+          + ` — ${inp.parentElement.querySelector(".undernote").textContent}`);
       inputs.forEach((inp) => (inp.oninput = cascade));
       cascade();
 
@@ -1623,6 +1911,11 @@ async function panelClean(panel, song, slug, P, refresh) {
             `${miss.length} staff slot(s) have no voice names and will be DROPPED from the result:\n\n`
             + miss.slice(0, 12).join("\n") + (miss.length > 12 ? `\n…and ${miss.length - 12} more` : "")
             + "\n\nClean anyway?")) return;
+        const lost = dropping();
+        if (lost.length && !confirm(
+            `${lost.length} staff slot(s) have more voices than names, and the unnamed voices will be DROPPED (a chord's extra notes are kept in the lowest named part's chord):\n\n`
+            + lost.slice(0, 12).join("\n") + (lost.length > 12 ? `\n…and ${lost.length - 12} more` : "")
+            + "\n\nName each line (e.g. A1, A1b) to give it a part. Clean anyway?")) return;
         runBtn.disabled = true;
         appendLog("Saving assignments and cleaning…");
         try { await save(); await postJSON(`${P}/clean`, {}); }
@@ -1656,9 +1949,10 @@ function sysBlock(sys) {
       el("td", { className: "stsum" }, st.summary),
       el("td", {}, el("input", {
         value: st.answer || "", placeholder: st.voices > 1 ? "e.g. T1, T2 (- = silent)" : "e.g. T1 (- = silent)",
-        "data-sys": sys.system, "data-staff": st.staff_id,
+        "data-sys": sys.system, "data-staff": st.staff_id, "data-voices": st.voices,
+        "data-lines": st.lines ?? st.voices,
         "data-hint": st.voices > 1 ? "e.g. T1, T2 (- = silent)" : "e.g. T1 (- = silent)",
-      }))));
+      }), el("div", { className: "undernote" }))));
   const reuse = sys.can_reuse_previous
     ? el("button", { "data-reuse": sys.system }, "Reuse previous assignments through matching systems")
     : "";
@@ -1672,32 +1966,256 @@ function sysBlock(sys) {
 
 function panelFix(panel, song, P, refresh) {
   panel.append(el("h2", {}, "Fix"),
-    el("p", { className: "sub" }, "OCR damage the auto-fixers couldn't repair. Fix in MuseScore, save, and it re-checks automatically."),
-    // Said here too, because this is the panel that offers the rows one at a time.
-    // Sixty Dismiss buttons is what a verdict looks like when nobody makes it.
-    parseVerdict(song.verification_summary?.health));
-  const pending = song.pending_fixes || [];
-  if (pending.length) {
-    panel.append(el("div", { className: "issue" },
-      el("div", { className: "top" }, el("span", {}, el("span", { className: "kind" }, "fixes.json — not applied automatically"))),
-      ...pending.map((t) => el("div", { className: "detail" }, t))));
-  }
-  const issues = song.open_issues || [];
-  if (!issues.length) {
-    panel.append(el("p", { className: "empty" }, "✓ No issues. Ready for lyrics."));
-  } else {
-    panel.append(...issues.map((i) =>
-      el("div", { className: "issue" },
-        el("div", { className: "top" },
-          el("span", {}, el("span", { className: "m" }, `m${i.measure}`), "  ", el("span", { className: "kind" }, i.kind)),
-          el("button", { onclick: async () => { await postJSON(`${P}/issues/${i.id}/dismiss`); refresh(); } }, "Dismiss")),
-        el("div", { className: "detail" }, `${i.staff}: ${i.detail}`))));
-  }
+    el("p", { className: "sub" }, "OCR damage the auto-fixers couldn't repair. Fix in MuseScore, save, and it re-checks automatically."));
+  problemList(panel, song, P, refresh);
   panel.append(el("div", { className: "row" },
     el("button", { className: "primary", onclick: () => postJSON(`${P}/open-score`) }, "Open in MuseScore"),
     el("button", { onclick: async () => { await postJSON(`${P}/rescan`); refresh(); } }, "Re-check now")));
   panel.append(scoreFileTransfer(song, P, refresh));
   slurRecorder(panel, song, P, refresh);
+}
+
+// Every problem the score has, one row per bar and part, with whatever there is to
+// choose between beside the page (#290). The server builds the rows — red marks read
+// live off the score, health findings, sentences in fixes.json, homr's other readings
+// of a bar as whole bars (lengths and pitches together, and its second reading), and
+// a slur the scan ran between two singers — so the panel decides nothing about the
+// music. A tap applies the answer to the score and records it in fixes.json, so a
+// re-clean keeps it.
+const NOTE_KIND = { mark: "red mark", "fixes.json": "fixes.json — not applied automatically",
+  "musescore-check": "fixes.json — not applied automatically", scan: "fixes.json — not applied automatically" };
+
+// Which staff of the cropped system a row's part was printed on, and which voice of
+// that staff, counted from the top (#310): "staff 1 of 4, lower voice".
+function staffPlace(row) {
+  if (!row.staff_in_system) return "";
+  const voices = row.voices_on_staff;
+  const voice = voices === 1 ? "only voice"
+    : voices === 2 ? (row.voice_on_staff === 1 ? "upper voice" : "lower voice")
+    : `voice ${row.voice_on_staff} of ${voices} from the top`;
+  return `staff ${row.staff_in_system} of ${row.staves_in_system}, ${voice}`;
+}
+
+// Where the Fix panel was when a tap redrew it (#329). A pick or a Dismiss redraws the
+// whole panel, and while the rows are fetched again the panel is short, so the
+// browser clamps its scroll to the bottom of what is left and keeps it there when the
+// cards arrive above. So the card tapped is remembered with the cards after it, and
+// once the rows are back the first of them still open is put where the tapped one
+// stood — the next card slides into its place.
+// A tap is not the only redraw: the score changing on disk sends a `state` ping, and
+// after a pick the file watcher can send one too, a moment after the tap's own
+// redraw. Every refresh therefore asks the panel to remember the card at the top of
+// what it shows (`panel._keepPlace`) unless a tap already said where to land.
+let fixPlace = null;   // {slug, rows: [row ids], offset, scrollTop}
+
+function problemList(panel, song, P, refresh) {
+  const box = el("div", { className: "problems" });
+  const scroller = () => box.closest(".panel") || panel;
+  const remember = (rowId) => {
+    const sc = scroller();
+    const cards = [...box.querySelectorAll(".issue.problem")];
+    const at = cards.findIndex((c) => c.dataset.row === rowId);
+    const card = cards[at];
+    fixPlace = { slug: song.slug, scrollTop: sc.scrollTop,
+      rows: at < 0 ? [] : cards.slice(at).map((c) => c.dataset.row),
+      offset: card ? card.getBoundingClientRect().top - sc.getBoundingClientRect().top : 0 };
+  };
+  // The card at the top of what is on screen, for a redraw nobody tapped for.
+  panel._keepPlace = () => {
+    if (fixPlace?.slug === song.slug || !box.isConnected) return;
+    const sc = scroller();
+    const top = sc.getBoundingClientRect().top;
+    const cards = [...box.querySelectorAll(".issue.problem")];
+    const at = cards.findIndex((c) => c.getBoundingClientRect().bottom > top);
+    // `untapped`: with no card in view (the reader is below the list, at the slur
+    // recorder say), the scroll position itself is put back — the "decided" summary
+    // standing in for the card is only right after a tap.
+    fixPlace = { slug: song.slug, scrollTop: sc.scrollTop, untapped: true,
+      rows: at < 0 ? [] : cards.slice(at).map((c) => c.dataset.row),
+      offset: at < 0 ? 0 : cards[at].getBoundingClientRect().top - top };
+  };
+  const restore = () => {
+    const place = fixPlace;
+    fixPlace = null;
+    if (!place || place.slug !== song.slug) return;
+    const sc = scroller();
+    const cards = new Map([...box.querySelectorAll(".issue.problem")].map((c) => [c.dataset.row, c]));
+    const target = place.rows.map((id) => cards.get(id)).find(Boolean)
+      || (place.untapped ? null : box.querySelector(".readdone"));
+    const place_it = () => {
+      if (!target.isConnected) return;
+      sc.scrollTop += target.getBoundingClientRect().top - sc.getBoundingClientRect().top - place.offset;
+    };
+    if (!target) {
+      sc.scrollTop = Math.min(place.scrollTop, sc.scrollHeight - sc.clientHeight);
+      return;
+    }
+    place_it();
+    // The page crops and engraved options load after the cards, and one above the
+    // card grows the list under it. Not every browser holds the view still for that
+    // (Safari does not), so put the card back as each picture lands — until the
+    // person scrolls or taps, after which where they are is theirs.
+    const stop = () => {
+      box.querySelectorAll("img").forEach((i) => i.removeEventListener("load", place_it));
+      ["wheel", "touchstart", "pointerdown", "keydown"].forEach((t) => sc.removeEventListener(t, stop));
+    };
+    box.querySelectorAll("img").forEach((i) => { if (!i.complete) i.addEventListener("load", place_it); });
+    ["wheel", "touchstart", "pointerdown", "keydown"].forEach((t) => sc.addEventListener(t, stop, { passive: true }));
+    setTimeout(stop, 5000);
+  };
+  panel.append(box);
+  if (!song.has_cleaned) {
+    box.append(el("p", { className: "empty" }, "Clean the score first."));
+    box.dataset.loaded = "1";
+    return;
+  }
+  box.append(el("p", { className: "hint" }, "Reading the score…"));
+  const problem = el("p", { className: "lyerr readerr" });
+  const pick = async (row, choice, letter, buttons) => {
+    problem.textContent = "";
+    buttons.forEach((b) => { b.disabled = true; });
+    try {
+      const fresh = await postJSON(`${P}/problems/pick`, { choice: choice.id, kind: choice.kind, letter });
+      Object.assign(song, fresh);
+      remember(row.id);
+      refresh();
+    } catch (e) {
+      fixPlace = null;
+      problem.textContent = e.message;
+      buttons.forEach((b) => { b.disabled = false; });
+    }
+  };
+  const where = (row) => row.measure ? `Bar ${row.measure}${row.part ? ", " + row.part : ""}` : "Note";
+  const decidedText = (row, c) => {
+    const d = c.decision;
+    if (d.none) return `${where(row)}: none of these — fix it in MuseScore`;
+    // A bar a recorded fix already wrote is not asked about again (#368).
+    if (d.answered) return `${where(row)}: answered by fixes.json (${d.answered.kind})`
+      + (d.answered.why ? ` — ${d.answered.why}` : "");
+    const word = { slur: "slur answer", repeat: "repeat answer", volta: "bracket answer" }[c.kind] || "reading";
+    if (d.picked === "earlier") return `${where(row)}: picked before whole bars were offered`;
+    const opt = c.options.find((o) => o.letter === d.picked);
+    return `${where(row)}: ${word} ${d.picked}` + (opt && opt.label ? ` (${opt.label})` : "");
+  };
+  const choiceBlock = (row, c) => {
+    const buttons = [];
+    const options = c.options.map((o) => {
+      const b = el("button", { className: "readopt" + (o.svg ? "" : " readtext"),
+        onclick: () => pick(row, c, o.letter, buttons) },
+        el("span", { className: "readletter" }, o.letter),
+        o.label ? el("span", { className: "readlabel" + (o.line_of ? " readswap" : "") }, " " + o.label) : "",
+        o.current ? el("span", { className: "hint" }, " as read now") : "",
+        o.svg ? el("img", { className: "readsvg", loading: "lazy", alt: `option ${o.letter}`,
+          src: `${P}/${o.svg.split("/").map(encodeURIComponent).join("/")}` }) : "");
+      buttons.push(b);
+      return b;
+    });
+    // A whole-bar choice can offer many bars; the likeliest few show first and the
+    // rest wait behind "More", so a card stays short on a phone.
+    const opts = el("div", { className: "readopts" }, ...options);
+    const block = el("div", { className: "readpick", "data-offer": c.id },
+      el("div", { className: "readtitle" }, c.title));
+    // What fixes.json already says about this bar: a pick can undo a slur or tie
+    // here, or give this part the line a fix put on the part beside it (#368).
+    if (c.fixes && c.fixes.length) {
+      block.append(el("div", { className: "readwarn" },
+        el("strong", {}, `fixes.json already changes bar ${c.measure}:`),
+        el("ul", {}, ...c.fixes.map((f) => el("li", {},
+          `${f.part} (${f.kind})${f.why ? ": " + f.why : ""}`))),
+        "Picking here may undo or contradict it."));
+    }
+    block.append(opts);
+    if (c.shown && options.length > c.shown) {
+      const hidden = options.slice(c.shown);
+      hidden.forEach((b) => { b.hidden = true; });
+      const more = el("button", { className: "readmore", onclick: () => {
+        hidden.forEach((b) => { b.hidden = false; });
+        more.remove();
+      } }, `More (${hidden.length})`);
+      block.append(el("div", { className: "row" }, more));
+    }
+    if (c.can_decline) {
+      const none = el("button", { className: "readnone", onclick: () => pick(row, c, "none", buttons) },
+        "None of these");
+      buttons.push(none);
+      block.append(el("div", { className: "row" }, none,
+        el("span", { className: "hint" }, "keeps it as read and the red mark; fix the bar in MuseScore")));
+    }
+    return block;
+  };
+  // The printed system with the bar and staff the row is about boxed (#368): the
+  // crop shows every staff and bar of the line. The box comes from the page itself
+  // and is drawn only as far as it can be found — the staff alone when the bar's
+  // barlines cannot all be told from stems, nothing when the staves cannot.
+  const cropWithMark = (row) => {
+    const wrap = el("div", { className: "cropwrap" },
+      el("img", { className: "readcrop", loading: "lazy", alt: `printed system ${row.system}`,
+        src: `${P}/system/${row.system}?dpi=200` }));
+    if (!row.staff_in_system) return wrap;
+    const q = new URLSearchParams({ staff: row.staff_in_system, staves: row.staves_in_system, dpi: 200 });
+    if (row.bar_in_system) { q.set("bar", row.bar_in_system); q.set("bars", row.bars_in_system); }
+    getJSON(`${P}/system/${row.system}/where?${q}`).then(({ box }) => {
+      if (!box || !wrap.isConnected) return;
+      const pct = (v) => `${(v * 100).toFixed(2)}%`;
+      wrap.append(el("div", { className: "cropmark" + (box.bar ? "" : " staffonly"),
+        title: box.bar ? `bar ${row.bar_in_system}, ${row.part}` : `${row.part}'s staff`,
+        style: `top:${pct(box.top)};height:${pct(box.bottom - box.top)};`
+          + `left:${pct(box.left)};width:${pct(box.right - box.left)}` }));
+    }).catch(() => {});
+    return wrap;
+  };
+  // Said once the rows are in, so whoever reads the panel (a test, say) can tell an
+  // empty list from one still on its way.
+  const loaded = () => { box.dataset.loaded = "1"; };
+  getJSON(`${P}/problems`).then(({ rows }) => {
+    // Redrawn again while this was on its way: the newer list owns the place.
+    if (!box.isConnected) return;
+    box.replaceChildren();
+    loaded();
+    const open = rows.filter((r) => r.notes.length || r.choices.some((c) => !c.decision));
+    const decided = rows.flatMap((r) => r.choices.filter((c) => c.decision).map((c) => decidedText(r, c)));
+    if (!open.length) box.append(el("p", { className: "empty" }, "✓ No issues. Ready for lyrics."));
+    else box.append(el("p", { className: "sub problemcount" },
+      `${open.length} place(s) to check against the page. Tap the letter the page prints; it is applied to the score and kept in fixes.json, so a re-clean keeps it.`));
+    for (const row of open) {
+      // The crop is the whole printed system, so say which of its bars is meant (#310).
+      const barOf = row.bar_in_system ? `${row.bar_in_system}/${row.bars_in_system}` : "";
+      const card = el("div", { className: "issue problem", "data-row": row.id },
+        el("div", { className: "top" },
+          el("span", {}, row.measure ? el("span", { className: "m" }, `m${row.measure}`) : "",
+            row.measure ? "  " : "", row.part || (row.measure ? "" : "Note")),
+          row.system != null ? el("span", { className: "hint" }, `system ${row.system}${barOf ? ` · bar ${barOf}` : ""}`) : ""));
+      for (const n of row.notes) {
+        const line = el("div", { className: "detail" },
+          el("span", { className: "kind" }, NOTE_KIND[n.kind] || n.kind), " ", n.text);
+        if (n.dismiss) line.append(" ", el("button", { className: "dismiss", onclick: async () => {
+          await postJSON(`${P}/issues/${n.dismiss}/dismiss`); remember(row.id); refresh(); } }, "Dismiss"));
+        card.append(line);
+      }
+      const undecided = row.choices.filter((c) => !c.decision);
+      if (undecided.length && row.system != null && song.has_pdf) {
+        const where = [barOf && `Bar ${row.bar_in_system} of ${row.bars_in_system}`, staffPlace(row)]
+          .filter(Boolean).join(" · ");
+        if (where) card.append(el("p", { className: "sub barpos" },
+          row.part && row.staff_in_system ? `${row.part}: ${where}` : where));
+        card.append(cropWithMark(row));
+      }
+      for (const c of undecided) card.append(choiceBlock(row, c));
+      box.append(card);
+    }
+    if (decided.length) {
+      box.append(el("div", { className: "issue readdone" },
+        el("div", { className: "top" }, el("span", {}, el("span", { className: "kind" }, `${decided.length} decided`))),
+        ...decided.map((t) => el("div", { className: "detail" }, t))));
+    }
+    box.append(problem);
+    restore();
+  }).catch((e) => {
+    if (!box.isConnected) return;
+    fixPlace = null;
+    box.replaceChildren(el("p", { className: "lyerr readerr" }, `Could not list the problems: ${e.message}`));
+    loaded();
+  });
 }
 
 // Taking the score away and bringing it back. "Open in MuseScore" only opens it on
@@ -1914,7 +2432,12 @@ function slurRecorder(panel, song, P, refresh) {
 
 async function panelLyrics(panel, song, P, refresh) {
   const mode = localStorage.getItem("lyricMode") === "manual" ? "manual" : "paste";
-  const swap = (m) => { localStorage.setItem("lyricMode", m); panel.replaceChildren(); panelLyrics(panel, song, P, refresh); };
+  const swap = (m) => {
+    localStorage.setItem("lyricMode", m);
+    panel._refreshInPlace = null;
+    panel.replaceChildren();
+    panelLyrics(panel, song, P, refresh);
+  };
   panel.append(
     el("h2", {}, "Lyrics"),
     el("div", { className: "row" },
@@ -1948,12 +2471,33 @@ function autoGrow(ta) {
   ta.style.height = ta.scrollHeight + "px";
 }
 
+// An import brings the panel up to date where it stands rather than redrawing it,
+// so the place in the list and the box being typed in survive (#336). A refresh
+// that arrives while the import is still running is ignored -- the import's own
+// answer is the one to show -- and one about a score that changed some other way
+// (a re-clean) is refused, so the panel is drawn afresh from the new score.
+function lyricsInPlace(panel, song, update) {
+  const live = { fp: song.cleaned_fingerprint, busy: false };
+  panel._refreshInPlace = () => {
+    if (live.busy) return true;
+    if (song.cleaned_fingerprint !== live.fp) return false;
+    update();
+    return true;
+  };
+  return live;
+}
+
 async function lyricsPaste(panel, song, P, refresh) {
-  const warns = lyricMismatches(song);
-  if (warns.length) {
-    panel.append(el("p", { className: "sub" }, "Mismatches (often a note problem — check the measure in MuseScore):"),
-      el("ul", { className: "warnlist" }, warns.map((w) => el("li", {}, w.message))));
-  }
+  const warnBox = el("div", {});
+  const drawWarns = () => {
+    const warns = lyricMismatches(song);
+    warnBox.replaceChildren(...(warns.length ? [
+      el("p", { className: "sub" }, "Mismatches (often a note problem — check the measure in MuseScore):"),
+      el("ul", { className: "warnlist" }, warns.map((w) => el("li", {}, w.message)))] : []));
+  };
+  drawWarns();
+  panel.append(warnBox);
+  const live = lyricsInPlace(panel, song, drawWarns);
   panel.append(el("p", { className: "sub" }, "No API key needed — your AI does the reading, this catches the result."));
   const ta = el("textarea", { rows: 12, placeholder: "Paste the lyric JSON from your AI chat here…" });
   if (song.lyrics?.json) {
@@ -1975,16 +2519,25 @@ async function lyricsPaste(panel, song, P, refresh) {
     el("div", { className: "row" }, el("span", { className: "hint" }, "Open your AI:"), ...aiLinks),
     el("label", {}, "2. Paste the returned JSON"), ta,
     el("div", { className: "row" },
-      el("button", { className: "primary", onclick: async () => {
+      el("button", { className: "primary", onclick: async (ev) => {
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        live.busy = lyricImporting = true;
         appendLog("Importing lyrics…");
         try {
           const fresh = await postJSON(`${P}/lyrics`, { json: ta.value });
           Object.assign(song, fresh);
+          live.fp = song.cleaned_fingerprint;
+          drawWarns();
           const w = song.lyrics?.warnings || [];
           if (w.length) appendLog(`Imported with ${w.length} warning(s).`);
           else appendLog("Imported cleanly. Ready for review.");
-          refresh();
+          // Pasted JSON can touch any system, so every one is fetched again.
+          cleanedSystemsChanged(song.slug, song.cleaned_fingerprint, "all");
         } catch (e) { appendLog(e.message, true); }
+        live.busy = lyricImporting = false;
+        btn.disabled = false;
+        refresh();
       }}, "3. Import lyrics")));
   panel.append(makeLog());
 }
@@ -1996,6 +2549,7 @@ async function lyricsManual(panel, song, P, refresh) {
     showScore = !showScore;
     localStorage.setItem("lyricScore", showScore ? "1" : "0");
     lyricScroll = panel.scrollTop;
+    panel._refreshInPlace = null; // this one does want the panel drawn again
     refresh();
   };
   panel.append(toggle);
@@ -2020,11 +2574,16 @@ async function lyricsManual(panel, song, P, refresh) {
   let showScore = localStorage.getItem("lyricScore") === "1";
   const { parts, systems, cells, capacities } = grid;
   const cellText = (si, name) => (cells?.[si]?.[name]) || "";
-  const warns = lyricMismatches(song);
   // Attach a mismatch to the system where its line STARTS (a line can span several
   // systems if the part is blank in later ones); show the full measure range.
-  const cellWarns = (sys, p) => warns.filter((w) =>
+  const cellWarns = (sys, p) => lyricMismatches(song).filter((w) =>
     (w.staff_ids || []).includes(p.id) && w.measure_start >= sys.start && w.measure_start <= sys.end);
+  const warnLines = (sys, p) => cellWarns(sys, p).map((w) => el("div", { className: "lyerr" },
+    `⚠ m${w.measure_start}–${w.measure_end}`
+    + `${w.measure_end > sys.end ? " (spans later systems)" : ""}: `
+    + `${w.message.split("): ").pop()}`));
+  const warnBoxes = [];
+  let typingIn = null; // the box last typed in, given back its focus after an import
 
   const scoreFor = (sys) => {
     const idx = byStart[sys.start];
@@ -2044,39 +2603,103 @@ async function lyricsManual(panel, song, P, refresh) {
           "data-sys": sys.index, "data-part": p.name });
         ta.oninput = () => autoGrow(ta);
         const shown = byStart[sys.start];
-        if (shown) ta.onfocus = () => showSystem(shown);
+        ta.onfocus = () => { typingIn = ta; if (shown) showSystem(shown); };
+        const errs = el("div", { className: "lyerrs" }, ...warnLines(sys, p));
+        warnBoxes.push([errs, sys, p]);
         return el("div", { className: "lyrow" },
-          el("label", {}, `${p.name} · ${capacities?.[sys.index]?.[p.name] ?? 0} lyric slots`), ta,
-          ...cellWarns(sys, p).map((w) => el("div", { className: "lyerr" },
-            `⚠ m${w.measure_start}–${w.measure_end}`
-            + `${w.measure_end > sys.end ? " (spans later systems)" : ""}: `
-            + `${w.message.split("): ").pop()}`)));
+          el("label", {}, `${p.name} · ${capacities?.[sys.index]?.[p.name] ?? 0} lyric slots`), ta, errs);
       }))));
   toggle.textContent = Object.keys(byStart).length
     ? (showScore ? "Hide the score" : "Show the score")
     : "";
   toggle.style.display = Object.keys(byStart).length ? "" : "none";
   holder.querySelectorAll("textarea").forEach(autoGrow); // size to content (no scroll)
-  if (lyricScroll != null) { panel.scrollTop = lyricScroll; lyricScroll = null; } // restore after re-import
+  if (lyricScroll != null) { panel.scrollTop = lyricScroll; lyricScroll = null; } // restore after "Show the score"
 
-  const doImport = async (btn) => {
+  // The warnings are the only thing an import changes in this panel, so they are
+  // the only thing redrawn: the boxes, the one being typed in and the scroll stay.
+  const drawWarns = () => {
+    for (const [errs, sys, p] of warnBoxes) errs.replaceChildren(...warnLines(sys, p));
+  };
+  const live = lyricsInPlace(panel, song, drawWarns);
+  const readCells = () => {
     const map = {};
     panel.querySelectorAll("textarea[data-sys]").forEach((t) => {
       (map[t.dataset.sys] ||= {})[t.dataset.part] = t.value.trim();
     });
+    return map;
+  };
+  let imported = readCells(); // what the score holds now, to tell what an import changes
+
+  // After an import each box shows what actually landed -- the words, and a `_` for
+  // every slot left without one -- written into the boxes already there. The box
+  // being typed in keeps its caret, and whatever is in view stays where it is on
+  // screen even when a box above it grows.
+  const showLanded = async () => {
+    let fresh;
+    try { fresh = await getJSON(`${P}/lyric-grid`); } catch { return; }
+    const boxes = [...panel.querySelectorAll("textarea[data-sys]")];
+    const anchor = (typingIn?.isConnected && typingIn)
+      || boxes.find((t) => t.getBoundingClientRect().bottom > panel.getBoundingClientRect().top);
+    const y = anchor?.getBoundingClientRect().top;
+    for (const t of boxes) {
+      const text = fresh.cells?.[t.dataset.sys]?.[t.dataset.part] || "";
+      if (t.value === text) continue;
+      const caret = t === typingIn ? t.selectionStart : null;
+      t.value = text;
+      autoGrow(t);
+      if (caret != null) t.setSelectionRange(caret, caret);
+    }
+    if (anchor) panel.scrollTop += anchor.getBoundingClientRect().top - y;
+    imported = readCells();
+  };
+
+  // The printed systems an import touches: each one where a part's text differs
+  // from what was imported last, and the systems after it where that part is left
+  // blank, because a blank box carries the line on and the words spill into them.
+  const changedSystems = (now) => {
+    const touched = new Set();
+    for (const p of parts) {
+      let carrying = false;
+      for (const sys of systems) {
+        const text = now[sys.index]?.[p.name] || "";
+        const before = imported[sys.index]?.[p.name] || "";
+        if (text !== before) { touched.add(sys); carrying = true; }
+        else if (text) carrying = false;
+        else if (carrying) touched.add(sys);
+      }
+    }
+    const printed = [...touched].map((sys) => byStart[sys.start]);
+    return printed.every(Boolean) ? printed.sort((a, b) => a - b) : "all";
+  };
+
+  const doImport = async (btn) => {
+    const map = readCells();
     if (!Object.values(map).some((row) => Object.values(row).some((t) => t))) {
       appendLog("Nothing typed yet.", true); return;
     }
     btn.disabled = true;
-    lyricScroll = panel.scrollTop; // preserve scroll across the re-render
+    live.busy = lyricImporting = true;
     appendLog("Importing lyrics…");
     try {
       const fresh = await postJSON(`${P}/lyrics`, { cells: map });
       Object.assign(song, fresh);
+      live.fp = song.cleaned_fingerprint;
+      drawWarns();
       const w = song.lyrics?.warnings || [];
       appendLog(w.length ? `Imported with ${w.length} warning(s).` : "Imported cleanly. Ready for review.");
-      refresh(); // re-renders with updated inline errors
-    } catch (e) { btn.disabled = false; appendLog(e.message, true); }
+      cleanedSystemsChanged(song.slug, song.cleaned_fingerprint, changedSystems(map));
+      imported = map;
+      await showLanded();
+    } catch (e) { appendLog(e.message, true); }
+    live.busy = lyricImporting = false;
+    btn.disabled = false;
+    // Pressing the button took the focus (and disabling it dropped it on the page);
+    // give it back to the box being typed in, without scrolling to it.
+    const away = document.activeElement;
+    if (typingIn?.isConnected && (away === btn || away === document.body || !away))
+      typingIn.focus({ preventScroll: true });
+    refresh(); // the stage rail and the viewer; this panel only updates its warnings
   };
   const importBtn = el("button", { className: "primary", onclick: () => doImport(importBtn) }, "Import lyrics");
   panel.append(el("div", { className: "floatbar" }, importBtn));
@@ -2173,7 +2796,7 @@ function panelRecord(panel, song, P, refresh, actions) {
     style: "width:220px", "data-staff-groups": ""
   });
   const hardwareEncoding = el("input", {
-    type: "checkbox", checked: rec.hardware_encoding !== false
+    type: "checkbox", checked: rec.hardware_encoding !== false, "data-hardware-encoding": ""
   });
   const bpm = el("input", {
     type: "number", value: rec.bpm ?? 80, min: 20, max: 300, step: 1,
@@ -2245,17 +2868,47 @@ function panelRecord(panel, song, P, refresh, actions) {
   const advanced = el("details", { className: "record-advanced" },
     el("summary", {}, "Framing & advanced settings"),
     scrollAdvanced, screenAdvanced);
-  const previewBtn = el("button", { className: "preview-action", onclick: actions.openPreview }, "Preview");
-
-  actions.setPreviewSettings(() => ({
+  const previewSettings = () => ({
     quality: quality.value,
     top_margin: Number(topMargin.value) || 0,
     bottom_margin: Number(bottomMargin.value) || 0,
     staff_groups: staffGroups.value.trim(),
     ...(song.needs_initial_bpm ? { bpm: Number(bpm.value) } : {}),
-  }));
+  });
+  // Saved on Preview and on Save settings (#301), not only once a preview or a
+  // render has come out: opening the preview is when the choice is made, and a
+  // preview nobody pressed "Preview scroll" for used to keep nothing.
+  const saveNote = el("span", { className: "hint save-note", "data-save-note": "" }, "");
+  const saveSettings = async () => {
+    try {
+      const saved = await postJSON(`${P}/record-settings`,
+        { ...previewSettings(), hardware_encoding: hardwareEncoding.checked });
+      Object.assign(rec, saved.record || {});
+      song.record = rec;
+      saveNote.className = "hint save-note";
+      saveNote.textContent = "Saved";
+      return true;
+    } catch (e) {
+      // Said beside the button that was pressed: the log is below the fold.
+      saveNote.className = "hint save-note err";
+      saveNote.textContent = e.message;
+      return false;
+    }
+  };
+  const saveBtn = el("button", { onclick: saveSettings }, "Save settings");
+  const previewBtn = el("button", { className: "preview-action", onclick: async () => {
+    if (await saveSettings()) actions.openPreview({ start: true });
+  } }, "Preview");
+
+  actions.setPreviewSettings(previewSettings);
   for (const control of [quality, topMargin, bottomMargin, bpm, staffGroups]) {
     control.addEventListener("input", actions.previewInputsChanged);
+  }
+  for (const control of [quality, topMargin, bottomMargin, bpm, staffGroups, hardwareEncoding]) {
+    control.addEventListener("input", () => {
+      saveNote.className = "hint save-note";
+      saveNote.textContent = "Unsaved changes";
+    });
   }
 
   const applyRenderer = () => {
@@ -2267,6 +2920,8 @@ function panelRecord(panel, song, P, refresh, actions) {
     scrollAdvanced.style.display = renderer === "scroll" ? "" : "none";
     screenAdvanced.style.display = renderer === "screen" ? "" : "none";
     previewBtn.style.display = renderer === "scroll" ? "" : "none";
+    saveBtn.style.display = renderer === "scroll" ? "" : "none";
+    saveNote.style.display = renderer === "scroll" ? "" : "none";
     if (renderer === "screen") actions.pausePreview();
     previewBtn.parentElement?.classList.toggle("screen", renderer === "screen");
     const count = parts.length ? ` all ${parts.length} parts` : " videos";
@@ -2282,7 +2937,8 @@ function panelRecord(panel, song, P, refresh, actions) {
     el("div", { className: "renderer-choices" }, scrollCard, screenCard),
     scrollCommon,
     advanced,
-    el("div", { className: "record-actions" }, previewBtn, runBtn),
+    el("div", { className: "record-actions" }, saveBtn, previewBtn, runBtn),
+    saveNote,
     makeLog(song.jobs?.render));
 
   scrollRadio.onclick = () => choose("scroll");
@@ -2313,11 +2969,15 @@ function panelUpload(panel, song, P, refresh) {
   const recording = song.recording;
   const recorded = !!(rec.outputs && rec.outputs.length);
   const uploads = rec.uploads || [];
+  const ups = song.upload_status || { videos: [], local_count: 0 };
+  const onDisk = ups.local_count > 0;
 
   if (recording) {
     panel.append(el("div", { className: "banner" }, "● Working… leave this running."));
-  } else if (uploads.length) {
+  } else if (ups.complete) {
     panel.append(el("div", { className: "banner good" }, "✓ Uploaded to YouTube."));
+  } else if (uploads.length) {
+    panel.append(el("div", { className: "banner" }, "Only some of the videos are on YouTube."));
   }
   if (rec.error) {
     panel.append(el("div", { className: "banner err" }, "Last run failed: " + rec.error));
@@ -2327,6 +2987,10 @@ function panelUpload(panel, song, P, refresh) {
   }
   if (!recorded) {
     panel.append(el("p", { className: "hint" }, "Nothing to upload yet — record the videos first."));
+  } else if (!onDisk) {
+    panel.append(el("p", { className: "hint" }, rec.freed
+      ? "The local videos were freed after the upload. Record again to make them."
+      : "The videos are not on disk. Record again to make them."));
   }
 
   // playlist picker
@@ -2342,7 +3006,7 @@ function panelUpload(panel, song, P, refresh) {
     };
   }).catch(() => {});
 
-  const uploadBtn = el("button", { className: "primary", disabled: recording || !recorded,
+  const uploadBtn = el("button", { className: "primary", disabled: recording || !recorded || !onDisk,
     onclick: async () => {
       appendLog("Uploading to YouTube…");
       try {
@@ -2365,12 +3029,129 @@ function panelUpload(panel, song, P, refresh) {
       el("h3", {}, "Uploaded videos"),
       el("ul", { className: "uploads" }, uploads.map((u) =>
         el("li", {}, el("a", { href: u.url, target: "_blank", rel: "noopener" }, u.title || u.url)))),
+      freeSpaceSection(P, song, ups, recording, refresh),
       el("div", { className: "row" },
         el("button", { disabled: recording, onclick: async () => {
           if (!confirm("Delete these videos from YouTube? You can then re-upload.")) return;
           appendLog("Deleting from YouTube…");
           try { await postJSON(`${P}/youtube-delete`); appendLog("Deleted."); refresh(); }
           catch (e) { appendLog(e.message, true); }
-        }}, "Delete from YouTube")));
+        }}, "Delete from YouTube")),
+      playlistSection(P, recording));
   }
+}
+
+// The local videos are a cache once YouTube has them (#371): 4K, ~150 MB a
+// voice. Freeing asks YouTube first and deletes nothing unless every video is
+// there; the server says which one is missing when it refuses.
+const VIDEO_STATE = { uploaded: "on YouTube", changed: "rendered again since the upload",
+  not_uploaded: "not uploaded" };
+
+function freeSpaceSection(P, song, ups, recording, refresh) {
+  const gb = (bytes) => (bytes / 2 ** 30).toFixed(2) + " GB";
+  const rows = el("ul", { className: "videostate" }, ups.videos.map((v) =>
+    el("li", { className: v.state },
+      el("b", {}, v.part), " — ", VIDEO_STATE[v.state] || v.state,
+      v.local ? ` · on disk (${(v.size / 2 ** 20).toFixed(0)} MB)` : " · not on disk")));
+  const note = el("p", { className: "hint free-note" });
+  const freed = song.record?.freed;
+  if (freed && !ups.local_count) {
+    note.textContent = `Freed ${gb(freed.bytes)} on ${new Date(freed.at * 1000).toLocaleDateString()}. `
+      + "Recording again renders the videos afresh.";
+  } else if (ups.local_count && !ups.complete) {
+    note.textContent = "Every video has to be on YouTube before the local copies can go.";
+  }
+  const btn = el("button", { className: "free-videos", disabled: recording || !ups.can_free,
+    onclick: async () => {
+      if (!confirm(`Delete the ${ups.local_count} local video(s), ${gb(ups.local_bytes)}? `
+        + "YouTube is checked first; recording again makes them back.")) return;
+      btn.disabled = true;
+      note.className = "hint free-note";
+      note.textContent = "Checking YouTube…";
+      try { await postJSON(`${P}/free-videos`); refresh(); }
+      catch (e) {
+        note.className = "hint free-note err";
+        note.textContent = e.message;
+        btn.disabled = false;
+      }
+    } }, ups.local_count ? `Free space (${gb(ups.local_bytes)})` : "Free space");
+  return el("div", { className: "free-section" },
+    el("h3", {}, "Local videos"), rows, el("div", { className: "row" }, btn), note);
+}
+
+// Which of the choir's playlists hold this song (#338). Read from YouTube each
+// time the panel opens: the app keeps no record of it, and a playlist can be
+// edited in YouTube's own app. A tick means every video of the song is in it.
+function playlistSection(P, recording) {
+  const box = el("div", { className: "playlists" });
+  const section = el("div", { className: "playlist-section" },
+    el("h3", {}, "Playlists"),
+    el("p", { className: "hint" }, "Tick a playlist to put this song's videos in it; untick to take them out."),
+    box);
+
+  const load = async () => {
+    box.replaceChildren(el("p", { className: "hint" }, "Reading playlists from YouTube…"));
+    let data;
+    try { data = await getJSON(`${P}/playlists`); }
+    catch (e) { box.replaceChildren(el("p", { className: "banner err" }, e.message)); return; }
+    box.replaceChildren(...data.playlists.map(row), addAnother(data.playlists));
+  };
+
+  const row = (p) => {
+    const tick = el("input", { type: "checkbox", disabled: recording || !!p.error });
+    tick.checked = p.total > 0 && p.count >= p.total;
+    tick.indeterminate = p.count > 0 && p.count < p.total;
+    const note = el("span", { className: "plnote" },
+      p.error || (tick.indeterminate ? `${p.count} of ${p.total}` : ""));
+    const line = el("div", { className: "plrow", "data-playlist": p.id },
+      el("label", {}, tick, " ", p.title || p.id, " ", note),
+      el("button", { className: "plhide", title: "Stop offering this playlist (nothing changes on YouTube)",
+        onclick: async () => {
+          try { await api(`/api/playlists/${encodeURIComponent(p.id)}`, { method: "DELETE" }); load(); }
+          catch (e) { appendLog(e.message, true); }
+        } }, "Hide"));
+    tick.onchange = async () => {
+      const member = tick.checked;
+      tick.disabled = true;
+      note.textContent = member ? "Adding…" : "Removing…";
+      try {
+        const now = await postJSON(`${P}/playlists`, { playlist_id: p.id, member, title: p.title });
+        line.replaceWith(row(now));
+      } catch (e) {
+        appendLog(e.message, true);
+        note.textContent = e.message;
+        tick.checked = !member;
+        tick.disabled = false;
+      }
+    };
+    return line;
+  };
+
+  const addAnother = (shown) => {
+    const pick = el("select", {}, el("option", { value: "" }, "Add another playlist…"));
+    let loaded = false;
+    const fill = async () => {
+      if (loaded) return;
+      loaded = true;
+      try {
+        const all = await getJSON("/api/youtube-playlists");
+        const have = new Set(shown.map((p) => p.id));
+        for (const p of all) if (!have.has(p.id)) pick.append(el("option", { value: p.id }, p.title));
+      } catch (e) { appendLog(e.message, true); loaded = false; }
+    };
+    pick.onfocus = fill;
+    pick.onpointerdown = fill;
+    pick.onchange = async () => {
+      if (!pick.value) return;
+      try {
+        await postJSON("/api/playlists", { playlist_id: pick.value,
+          title: pick.options[pick.selectedIndex].textContent });
+        load();
+      } catch (e) { appendLog(e.message, true); }
+    };
+    return el("div", { className: "row" }, pick);
+  };
+
+  load();
+  return section;
 }

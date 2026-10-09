@@ -5,8 +5,220 @@ grouped by the day they were merged, and each line names its pull request
 (`#123`) on GitHub. Changes that only touch tests, measurements or the notes for
 developers are listed under *Behind the scenes*.
 
+## Unreleased
+
+- Practice videos: a fermata now holds about one beat longer than written instead
+  of three times its length, which kept a held dotted half going for six seconds
+  (Jumalan kunnia luonnossa). Render a song again to get it; no re-clean needed. (#380)
+- Fix: a volta bracket or repeat sign the scan invented can now be taken out from
+  `fixes.json` (`unvolta`, `unrepeat`), a "2." ending can span more than one bar,
+  and a silent bar can be given its printed length (`barlen`). Suomalainen rukous,
+  whose scan copied the organ's 1st ending onto an extra bar, renders again. (#378)
+- Practice videos no longer race through the opening of a song that starts on a
+  short pickup. The pickup bar also holds the clef, key and time signature, so the
+  even-spacing step read it as far too wide and stretched the next bars to match:
+  Kesäaamu's first ten bars came out up to nine times their width. Bars are now
+  measured by the distance the scroll actually covers, and a bar shorter than a
+  beat is compared as if it lasted a beat. Other songs' second and third bars stop being
+  widened a little for the same reason. (#376)
+- Record: a song whose scan left the "2." ending as an open bracket renders
+  again. The scrolling video refused it as out of sync (Kristallen den fina,
+  Kun poijat ne raitilla); it now follows the repeat and skips the "1." ending
+  the way MuseScore plays it. (#375)
+- The Upload stage lists which of a song's videos are on YouTube, and a **Free
+  space** button deletes the local copies (about 150 MB a voice) once YouTube
+  confirms it has every one. The links stay; recording again makes the videos
+  back. A song counts as uploaded only when every video is. (#371)
+- Song videos and their audio can live on another disk: `MEDIA_ROOT` in `.env`
+  puts each song's media in `$MEDIA_ROOT/<song>/` instead of `songs/<song>/media/`,
+  and `scripts/move_media.py` moves what is already there, checking every copied
+  file before deleting the old one and leaving a song alone while it records or
+  uploads. Unset, nothing changes. (#370)
+- Fix panel: a bar a recorded fix in `fixes.json` already wrote is no longer offered
+  as an a/b/c reading; it shows as "answered by fixes.json" with the reason. The
+  remaining choices name the bar and part, box that bar on the page picture, say when
+  an option is the line another part has now, and warn when `fixes.json` already
+  changes that bar. (#368)
+- `fixes.json`'s `delete` can now take an arpeggio sign off a chord, for a
+  printed sharp the scan read as one (Trinklied B1 bar 25). (#366)
+- The cleaned score is drawn the way the page prints it: rests the scan hid
+  because two voices shared them now show on each part's own staff, a double or
+  final barline reaches every staff, a bar's last rest no longer looks like a bar of
+  its own, and after a `delbar` the system pictures start on the right bar again.
+  Already-cleaned songs are drawn right without cleaning again. (#354)
+- `fixes.json` can now take one note off a chord or put one on (`dropnote`,
+  `addnote`). A note the page prints in brackets as optional was read as a real
+  chord note, so the practice track sang both; the track now sings the main note.
+  Kauan, Love Me Tender and Minä laulan sun iltasi tähtihin have their bracketed bass
+  notes taken off this way. (#358)
+- Writing fixes is harder to get wrong: the bar reader now shows ties, where each
+  chord sits among the rests, and the bar as a fix meets it when MuseScore reset it;
+  added notes are spelt with flats in a flat key; and two songs cleaning at once no
+  longer fail with the bare error "3". (#357)
+- `fixes.json` can now take a mark the scan invented off a chord (`delete`): a
+  fermata, an articulation, a breath mark, a staff text, a tempo or a rehearsal
+  mark. Mieslaulu bar 13's fermatas, where the page prints staccato dots, can now
+  be recorded away. The Fix panel's bar reading lists each chord's marks. (#352)
+- The "This parse looks unusable" warning is gone from Review, Fix and the clean's
+  log. On scanned songs it was set off mostly by homr's `⚠` questions, so it called
+  scores whose notes were right unusable; the issue count and the Fix rows stay. (#356)
+- `fixes.json` can now take off a time signature the scan invented, or write
+  another of the same bar length in its place (`timesig`), on every staff. Kesäaamu's
+  stray 3/4 at bar 22 is recorded this way. Health also stops flagging a song's last
+  bar when it completes the opening pickup. (#353)
+- A `bar` fix can now give a voice the scan made too long a bar that fills the
+  time signature. False triplets had left Lasinkuultava laulu's T1 bar 9 7/6 long
+  in 4/4, a length no writable bar adds up to, so MuseScore reset it to a rest and
+  no recorded fix could put it back. (#350)
+- `fixes.json` can now take out a bar the scan invented, on every staff (`delbar`):
+  a volta or slur across it is shortened to match, and fixes after it in the file
+  count bars without it. `insbar` puts in an empty bar where the scan lost a
+  barline, for `bar` fixes to fill. (#346)
+- A bar a recorded fix has answered stops showing red. An `unmark` or a pick now
+  finds the bar's red mark on either part of a shared staff (the mark sits on the
+  first part, the red notes on both), a `tie`/`untie`, `slur`/`unslur` or `duration`
+  answers the mark's `tie?`, `slur?` or `rhythm?`, and once no mark is left on the
+  bar its red notes turn black. Cleaning no longer copies each red mark into
+  `fixes.json`, and the next clean removes the copies already there. (#347)
+- A `duration` fix that gives a bar its time signature back now also takes out the
+  back-step cleaning had squeezed the other voices into the short bar with, so those
+  voices are no longer reset to rests by the MuseScore check. Gute Nacht bar 6 and
+  Annin laulu bars 9, 10 and 21 now come out right from `fixes.json` alone. A `bar`
+  fix also writes over a gap cleaning left in a voice instead of refusing it, so
+  Integer vitae T2 bar 9 and Jouluyö's last bar can be recorded too. (#344)
+- `fixes.json` can now take out a tie (`untie`), for the dashed ties a strophic song
+  prints for a later verse only, which the scan reads as real ties. (#343)
+- `fixes.json` can now take out a slur (`unslur`), tie two notes (`tie`) and give
+  a note another length, double dots included (`duration`); a length change that
+  makes the bar fit its time signature again gives the bar that length on every
+  staff. A bar rewrite now also cuts a slur whose other half is in another bar. The
+  Fix stage's bar reply now carries the bar's `from` tokens with its rests, and the
+  lyric import's reply lists its mismatches. (#340)
+- The Upload stage lists the choir's playlists with a tick box each, read from
+  YouTube: ticking puts every video of the song into that playlist and unticking
+  takes them out, so a song no longer has to be re-uploaded to change its
+  playlists. "Add another playlist…" offers the account's other playlists, and the
+  playlist menus no longer list every song's own playlist. (#338)
+- Importing lyrics no longer throws the Lyrics panel back to the top: the list
+  stays where it was, the box being typed in keeps its focus, and the warnings
+  change in place. The One system view shows the cleaned system with its words
+  under the printed one, and after an import only the systems whose words changed
+  are drawn again, the old picture staying until the new one is ready. Compare
+  does the same. (#337)
+- In per-system cleaning, a chord with more notes than part names no longer loses
+  the extra notes: the lowest named part keeps them as its chord, and the Clean grid
+  and the Fix stage no longer warn about it. (#330)
+- In per-system cleaning, a staff carrying two lines with only one part name
+  (usually a name carried over from an earlier system) no longer loses its lower
+  line in silence: the Clean grid marks the cell and asks before cleaning, and the
+  Fix stage lists every line left without a part of its own until it is named.
+  (#332)
+- Answering a problem in the Fix stage no longer throws the list to its bottom:
+  the next card moves up into the place of the one answered. (#331)
+- It also stays put when the panel refreshes again a moment after the tap, which
+  it does about half the time, and as the page crops above it finish loading.
+  (#329)
+- A problem card in the Fix stage also says which staff of the printed system the
+  part is on, and which voice of that staff ("Bar 3 of 7 · staff 2 of 4, only
+  voice"). A per-system song shows it after its next clean. (#310)
+- homr's other readings of an unsure bar are offered only on a part printed on
+  the staff homr read, so the same notes an octave away on another singer's staff
+  no longer pick up the choices. (#310)
+- When a repeat ends, the Fix stage asks whether the page prints "1." and "2."
+  brackets there and how many bars the "1." covers, with one tap per length. homr
+  does not read the brackets, and without them the practice track played the "1."
+  bars on both passes. (#319)
+- Each part video uploaded to YouTube says in its description which staff the part
+  is sung from (`stemmanauha-staff: 2/5`), so the practice site can zoom a phone to
+  the right staff even when two parts share one. `backfill_staff_lines.py` adds the
+  line to videos uploaded before this. (#323)
+- After a YouTube upload, or deleting the uploaded videos, the app asks the
+  stemmanauhat site to refresh its video list straight away, so a new song shows
+  there within minutes instead of hours. Needs `STEMMANAUHAT_DISPATCH_TOKEN` in
+  `.env`. (#321)
+- Scrolling videos follow D.C. and D.S. jumps (al Fine, al Coda) instead of refusing
+  the score: the bars play in MuseScore's order and the scroll jumps back to the
+  segno or the start and forward to the coda. (#314)
+- A slur or tie that runs over a line break is kept when the scan joins the
+  systems, instead of being lost. When only one half of a slur was read, or the
+  next line prints a different number of staves, the note is marked `⚠ slur?` to
+  check against the page. Needs a homr that keeps slur ends at the system edge.
+  (#318)
+- A scrolling video whose repeat jumps back across a time-signature change
+  (a 7/4 bar repeating to a 4/4 one where a part rests) renders in time instead
+  of being refused as out of sync. (#313)
+- A start-repeat sign homr read on only some staves of a printed system is now kept:
+  it used to vanish from the score, so the practice track repeated the wrong bars.
+  When a repeat ends and the scan found no start for it, the Fix stage asks where
+  the page prints the start, with one tap per printed system. (#316)
+- A problem card in the Fix stage says which bar of the printed line it is
+  about ("Bar 2 of 4 in this line"), so the bar no longer has to be counted off
+  the picture. (#311)
+- When a lyric line has more syllables than notes, every note still gets its own
+  syllable and only the extra ones go on the last note; extra `_` are dropped. It
+  used to pile the whole bar onto its first note. (#308)
+- The Fix stage lists every problem once, one card per bar and part, with its
+  choices beside the page: homr's other lengths for an unsure bar, homr's other
+  pitches for an unsure note, and for a slur the scan ran between two singers, the
+  slur in either, both or neither. One tap applies the answer and keeps it for the
+  next clean. (#290)
+- An unsure bar's choices are now whole bars, lengths and pitches already put
+  together, so picking one never undoes another. homr's second reading of the bar
+  (the one behind a `notes?` mark) is always one of them, labelled "second
+  reading". Six show first and the rest are behind "More". (#295)
+
+## 2026-10-07
+
+- The score viewer says when it is waiting: a score being built shows a running
+  count, a rebuilt one keeps the old picture under "Updating…", and a failed build
+  says why. In Compare and Scan vs page the engraved systems wait in their place
+  and arrive top to bottom instead of popping in at random. (#303)
+- The Record panel's Preview button now saves every setting (tempo, quality,
+  margins, shared staves, NVIDIA encoding) and starts drawing the preview at once,
+  with a progress bar and a seconds counter. A new Save settings button saves them
+  without previewing. (#302)
+- Re-cleaning no longer fails after the per-system grid is answered again. A
+  reading picked in the Fix panel now follows its notes to whichever part they
+  land in, and is dropped (with a line in the log) if no part sings them any
+  more. (#292)
+- In the per-system grid, a part named like `S1b` now sings `S1`'s notes (and
+  words) in every bar where it has none of its own, instead of resting. (#293)
+- A bar a part rests through shows its rest in the middle of the bar after cleaning,
+  as MuseScore draws a bar rest, instead of at the start of the bar. (#298)
+
+## 2026-10-06
+
+- A scanned song moves on to Clean as soon as every system is read; there is no
+  longer a "This reading is right" button to press. Reading a system again no
+  longer sends a song that is further along back to Scan. (#282)
+- Cleaning no longer ties notes the page prints separately. A tie was copied from
+  another voice whenever it held the same pitch on the same beats; now that voice
+  must also sing the same rhythm, so a repeated figure under a held note keeps its
+  notes (and its syllables). (#284)
+- The health check no longer counts a grace note's length into its bar, so a bar
+  with grace notes is not reported as overfull. (#283)
+- A warning on a scanned bar is one short word ("⚠ accidental?"), and the note it is
+  about is red, so the spot is easy to find in MuseScore. A red note left behind is
+  played black in the practice video. (#280)
+- A scanned song marks the first bar of a system for checking when a note the
+  previous system ended with a printed accidental starts it again without one: a
+  note tied over the line break keeps its accidental, and the scan cannot tell.
+  (#279)
+- A scanned song no longer shows a meter change at every system break when the
+  page prints its meter once and carries it (2/2 read back as 4/4). (#277)
+- A meter change printed at the start of a system is kept even when the new bars
+  are the same length as the old ones (2/2 to 4/4). (#278)
+
 ## 2026-10-05
 
+- Scanning a PDF whose pages are stored sideways and turned upright now reads each
+  printed system instead of the bottom of one and the top of the next. (#273)
+- When homr is unsure how long a bar's notes are, the Fix stage shows its likeliest
+  readings drawn under the page; tap the one the page prints and it goes onto the
+  score and survives a re-clean. Needs an updated homr (Install / Update homr).
+  (#271)
+- Scanning marks in red every bar homr is probably wrong about, so it gets checked
+  against the page; a scan takes twice as long for it. (#270)
 - Per-system cleaning no longer leaves tenors read off a plain treble staff an
   octave too high, and scanned songs no longer share one set of grid answers. (#266)
 

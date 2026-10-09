@@ -18,7 +18,8 @@ why a note lost its dot.
       "why": "..."}]
 
 `staff` and `measure` are 1-based and refer to the **cleaned** score, where each
-staff carries one voice. `index` counts chords in that measure from 0. Applying is
+staff carries one voice. `index` counts chords in that measure from 0 — chords only,
+not the rests `from` lists (`bar_items` pairs each token with its index). Applying is
 strict: an entry that does not match raises, because a silently skipped fix would
 leave the score looking repaired when it is not.
 
@@ -34,14 +35,204 @@ Tokens are `duration[.]:pitch` (`eighth:50`, `quarter.:60` for a dotted quarter)
 `tuplet]` mark a triplet bracket: they appear in `from` and cannot be written. A
 whole-bar rest reads as `measure:R` and cannot be written either — it needs the bar's
 own length, which a fix has no way to know, so write the rests out instead. The
-note's **spelling** (MuseScore's tpc) is derived from the pitch and is deliberately
-not part of the token: the first fixes to carry one by hand got three of four wrong,
-which puts a note on the wrong line while it still sounds right.
+note's **spelling** (MuseScore's tpc) is derived from the pitch and the key in force
+on that staff — flats for the black keys in a flat key, sharps otherwise (#357) — and
+is deliberately not part of the token: the first fixes to carry one by hand got three
+of four wrong, which puts a note on the wrong line while it still sounds right.
 
-Most edits are none of those three kinds, and the shapes that are missing are not
-exotic — taking one notehead off a chord, or turning a bar-length rest into a
-whole-bar rest, both came up on one song in one sitting. So a fix can also just be
-a **sentence**:
+A fifth kind, `rhythm`, gives every note and rest of a bar a new length and leaves
+the notes themselves alone. It is how a person's pick among the readings homr weighed
+for an unsure bar is recorded (#269), so its lengths are homr's own spelling, one per
+note or rest in order: `note_4` a quarter, `note_12` a triplet eighth, `note_4.` a
+dotted quarter. `from` is the bar as it reads now, as above. Triplet brackets are
+written again around the new lengths, ties and slurs in or into the bar are moved to
+the notes they joined, and `rhythm?` comes off the bar's red `⚠` mark: a person has
+read the lengths against the page. Whatever else the mark says, and cleaning's own
+marks on the bar, stay (#290).
+
+    {"kind": "rhythm", "staff": 9, "measure": 25,
+     "from": ["[tuplet", "eighth:43", "eighth:48", "eighth:50", "tuplet]", ...],
+     "to": ["note_12", "note_12", "note_12", "note_6", "note_12", "note_4", ...],
+     "why": "picked reading c against the page"}
+
+Three more kinds are how a person's answer to a problem listed on the Fix stage is
+recorded (#290). `pitch` gives one note of a chord another pitch, picked among the
+pitches homr weighed for it; `from` is the bar as it reads now, `was` the MIDI pitch
+the note has, and `to` / `tpc` what it gets — the spelling is homr's, read off the
+page, rather than derived. Its red note goes, and so do the words `pitch?` and
+`accidental?` on the bar's red mark; anything else the mark says stays. A `slur`
+may reach into a later bar with `end_measure` and `end_index` instead of `span`,
+because a slur the scan ran from one singer into another usually crosses a barline.
+And `unmark` takes one red mark off a bar — the answer "the page prints no slur here"
+— and is content if the mark is already gone, because what it records is that
+nothing in that bar needs doing.
+
+    {"kind": "pitch", "staff": 3, "measure": 12, "index": 1, "from": [...],
+     "was": 62, "to": 63, "tpc": 11, "why": "picked homr's reading b ..."}
+    {"kind": "slur", "staff": 5, "measure": 19, "index": 3,
+     "end_measure": 20, "end_index": 0, "why": "..."}
+    {"kind": "unmark", "staff": 5, "measure": 19, "text": "slur to A2 bar 20 removed; ..."}
+
+`bar` (#295) puts a whole bar of one voice as a person picked it among homr's
+readings of it: lengths and pitches together, so one pick never undoes another. `to`
+is one entry per note or rest, its length in homr's spelling and its MIDI pitches
+with their spelling (`tpcs`), read off the page by homr rather than derived. When
+the new bar has the same notes and rests in the same places, the lengths are
+rewritten as `rhythm` does and the pitches set, so ties, slurs and words stay where
+they were — unless a note that changes pitch is tied, since the tie would then join
+two different pitches. Otherwise the bar is written afresh, as the second reading
+of the bar can be: ties and slurs reaching into it from outside are cut, as when
+MuseScore refuses a bar (`rejected_bars`), and its words are put back on its notes
+in order, the extra ones dropped. A gap cleaning left in the voice (`location`) is
+taken out first and the bar is written afresh, so the new bar has to fill the bar's
+own length (#344). Otherwise the new bar may last as long as the voice does now or
+fill the bar's own length; the second is how a voice the scan made too long is put
+right, since false triplets can leave it a length (7/6) no writable bar adds up to
+(#350). A bar whose length changes is written afresh.
+
+    {"kind": "bar", "staff": 3, "measure": 12, "from": [...],
+     "to": [{"value": "note_4.", "pitches": [62], "tpcs": [16]},
+            {"value": "note_8", "pitches": [64], "tpcs": [18]}], "why": "..."}
+
+`repeat` (#312) opens a repeat at a bar: a start-repeat sign on every staff. It has
+no `staff`, because a repeat sign is drawn across the whole system and MuseScore
+keeps one only when every staff carries it. It is how a person answers "where does
+the repeat ending at bar N go back to?" when the scan read the end sign and missed
+the start — which homr does for a sign that opens a printed system. A bar that
+already opens a repeat refuses it.
+
+    {"kind": "repeat", "measure": 46, "why": "the page prints |: at bar 46"}
+
+`volta` (#319) puts the "1." and "2." brackets over an end repeat: "1." over the
+`bars` bars ending at `measure`, which must carry the end repeat, and "2." over the
+`second` bars after it (default 1). Only the "1." length changes what is played --
+the second pass skips those bars -- so `second` only changes the picture. MuseScore
+keeps a volta on the top staff only, so that is where it goes. A bar already under a
+bracket refuses it, and so does a "2." bracket longer than the bars left; one that
+closes the score ends at the end of its last bar, as MuseScore writes it.
+
+    {"kind": "volta", "measure": 13, "bars": 2, "why": "the page prints 1. over 12-13"}
+
+`unvolta` and `unrepeat` (#378) take out what the scan invented: Suomalainen rukous
+came back with a second "1." bracket and end repeat on a bar the page does not print
+(copied from the organ's 1st ending), and MuseScore and the engraving then disagreed
+about which bars play. `unvolta` takes every volta bracket that **starts** in bar
+`measure` out, on every staff, both halves; `text` ("1." or "2") narrows it to the
+brackets reading that. `unrepeat` takes the `which` ("end" or "start") repeat sign off
+the bar on every staff. Each refuses when there is nothing to take, so a re-read that
+no longer invents it fails the clean rather than quietly matching. Put a bracket back
+the way the page prints it with `volta`, and take the emptied bar out with `delbar`.
+
+    {"kind": "unvolta", "measure": 19, "text": "1", "why": "..."}
+    {"kind": "unrepeat", "measure": 19, "which": "end", "why": "..."}
+
+`barlen` (#378) gives a bar that **every staff rests through** another length: each
+staff gets one bar rest of `to` (`"6/4"`), written as the scan writes a bar that
+differs from its time signature (`len`, dropped when `to` is the meter in force). A
+note anywhere in the bar refuses -- changing the length of music is `duration`'s and
+`bar`'s job. The 2nd ending above is printed 6/4 then 4/4; the scan read 3/2 and
+cleaning cut it to 4/4, which only a person reading the page can put back. `from` is
+required, as for `delbar`.
+
+    {"kind": "barlen", "measure": 19, "from": ["whole:R"], "to": "6/4", "why": "..."}
+
+Three kinds came out of fixing a song from its page with an LLM (#340), where each
+had to be faked and every fake damaged the score. `unslur` takes out the slur that
+starts on chord `index`, both of its halves, wherever the end half sits. `tie` joins
+the note `pitch` of chord `index` to the same pitch in the next chord, in this bar or
+at the head of the next one, so playback holds the note. `duration` gives chord
+`index` the length `to` (`quarter..` for a double-dotted quarter); when that makes the
+voice fill the time signature in force, the bar takes that length again on every
+staff, and a total that neither fills the bar nor the signature refuses. Then the
+back-steps cleaning squeezed the other voices into the short bar with go as well,
+where a voice's own notes fill the restored bar (#344). Each needs its `from`.
+
+    {"kind": "unslur", "staff": 3, "measure": 1, "index": 2, "from": [...], "why": "..."}
+    {"kind": "tie", "staff": 2, "measure": 10, "index": 2, "pitch": 60, "from": [...],
+     "why": "..."}
+    {"kind": "duration", "staff": 2, "measure": 10, "index": 0, "to": "quarter..",
+     "from": [...], "why": "the page prints a double dot"}
+
+`untie` (#342) is `tie` taken back: it takes out the tie that starts on note `pitch`
+of chord `index`, both halves, wherever the end half sits, so playback sings the note
+again. Strophic songs print **dashed** ties that belong to a later verse only, and the
+scan reads them as real ties, so the verse that re-strikes the note loses a syllable.
+It needs its `from` like the others.
+
+    {"kind": "untie", "staff": 1, "measure": 6, "index": 1, "pitch": 65, "from": [...],
+     "why": "dashed tie, verse 2 only"}
+
+`delete` (#352) takes a mark the scan invented off chord `index`: `what` is one of
+`fermata`, `articulation`, `arpeggio`, `breath`, `staff text`, `tempo` or
+`rehearsal mark` (#366: Trinklied's B1 bar 25 had a printed sharp read as an
+arpeggio), and every mark of that kind on the chord goes unless `subtype` narrows it (an
+articulation's `articStaccatoAbove`, a breath mark's symbol, a text's words). Only
+these: taking one out never needs anything else changed. A slur, a tie, a note, a red
+mark or the words have a kind of their own and are refused naming it; a clef, key,
+time signature or triplet bracket changes the bar itself and is refused too. A
+fermata or tempo mark another staff still carries at that beat is said in the log,
+since MuseScore times the beat by any staff's. It needs its `from`.
+
+    {"kind": "delete", "what": "fermata", "staff": 1, "measure": 13, "index": 2,
+     "from": [...], "why": "the page prints staccato dots here, not a fermata"}
+    {"kind": "delete", "what": "articulation", "subtype": "articAccentAbove",
+     "staff": 3, "measure": 7, "index": 0, "from": [...], "why": "..."}
+
+`delbar` (#346) takes out a bar the scan invented, on every staff: an empty bar
+homr read between a "1." and a "2." ending, say. `from` is what the bar reads now —
+one list when every staff reads the same (`["measure:R"]`), or one list per staff —
+and it is required, because replayed against a better reading it would delete a bar
+the page prints. A volta, slur or tie reaching across the bar is shortened by one,
+both halves, and a volta ending on the barline before it keeps its length; one
+starting or ending inside it, any volta starting in it, a repeat sign, or a clef,
+key or meter change in it refuses. Fixes apply **in file order**, so an entry before a `delbar`
+counts bars as they were before the deletion and one after it counts them without
+the deleted bar — which is how fixes recorded before anyone noticed the invented bar
+keep matching, and how one recorded afterwards in the app matches too.
+
+    {"kind": "delbar", "measure": 10, "from": ["measure:R"],
+     "why": "the page prints 4 bars in system 3; the scan added an empty bar 10"}
+
+`insbar` is the other way round: the scan lost a barline and squeezed two printed
+bars into one. It puts an empty bar (a whole-bar rest in the meter in force) **after**
+bar `measure` on every staff, for `bar` fixes later in the file to fill. `from` is
+what bar `measure` reads now, as for `delbar`. A slur or volta across that barline
+is lengthened by one, a volta ending on it keeps its length, and a tie across it
+refuses. File order holds as for `delbar`: entries after it count the new bar.
+
+    {"kind": "insbar", "measure": 2, "from": [[...], [...], ...],
+     "why": "the scan lost the barline between printed bars 2 and 3"}
+
+`dropnote` and `addnote` (#358) take one note off chord `index` or put one on, and
+leave its length, its words and its other notes alone. A page often prints an
+optional note in brackets — a low octave, a divisi — and the scan reads it as a real
+chord note, so the practice track sings both; the default is to sing the main note
+only. `dropnote` also takes out a tie on the note, both halves, and refuses a
+chord's only note (that is a rest, a `bar` fix's job). `addnote` refuses a pitch the
+chord has and adds no tie; its spelling comes from `tpc`, else from a note of the
+same pitch class in the chord, else from the key in force. Each needs its `from`.
+
+    {"kind": "dropnote", "staff": 4, "measure": 17, "index": 3, "pitch": 51,
+     "from": [...], "why": "the page prints (Eb3) as optional; B2 sings Eb2"}
+    {"kind": "addnote", "staff": 3, "measure": 25, "index": 0, "pitch": 52,
+     "from": [...], "why": "the page prints E3 under the G#3"}
+
+`timesig` (#353) takes a time signature the scan invented off bar `measure` on every
+staff (`"to": null`), or writes another one in its place (`"to": "6/8"`). homr read a
+3/4 into a song printed in 6/8 throughout; the notes fit both, so the automatic
+`spurious_timesigs` pass cannot tell them apart and only the page can. `from` is the
+signature the bar carries now, on every staff, and is required. The bar keeps its
+length or the fix refuses: a signature that changes the length of the bars after it
+would leave every one of them wrong, so only a change between meters of one length
+(3/4 and 6/8, 2/2 and 4/4) is allowed, and a removal only where the meter already in
+force is that length. Bar 1's opening signature is never touched.
+
+    {"kind": "timesig", "measure": 22, "from": "3/4", "to": null,
+     "why": "the page prints no meter change; 6/8 throughout"}
+
+Most edits are none of those kinds, and the shapes that are missing are not
+exotic — turning a bar-length rest into a whole-bar rest came up on one song in one
+sitting. So a fix can also just be a **sentence**:
 
     {"kind": "text",
      "what": "B1 bar 40, last eighth: drop the D, keep the C. The page prints one
@@ -56,7 +247,7 @@ that the judgement survives the next rebuild.
 """
 import logging
 from fractions import Fraction
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from lxml import etree
 
@@ -91,6 +282,18 @@ def _chords(root: etree._Element, staff_id: int, measure_no: int) -> List[etree.
     return [el for el in body if el.tag == "Chord"]
 
 
+def _no_index(chords: List[etree._Element], index: int, where: str) -> "FixError":
+    """The refusal for a chord index that is not there, naming the ones that are.
+
+    `index` counts chords only, while `from` lists the rests too, and that is the
+    mistake this answers: the chords are listed with their numbers, so a wrong first
+    guess shows the right one (#357).
+    """
+    listed = ", ".join(f"{i} = {_token(c)}" for i, c in enumerate(chords)) or "none"
+    return FixError(f"{where} has {len(chords)} chords, no index {index}; "
+                    f"index counts chords only, not rests: {listed}")
+
+
 def _length(chord: etree._Element) -> Fraction:
     base = _DUR.get((chord.findtext("durationType") or "").strip(), Fraction(0))
     dots = int((chord.findtext("dots") or "0").strip() or 0)
@@ -123,6 +326,825 @@ def _slur(chords: List[etree._Element], start: int, span: int) -> str:
     return f"slurred {span} note(s) from chord {start}"
 
 
+def _onset(body: etree._Element, chord: etree._Element) -> Fraction:
+    for el, at, _ in _timeline(body):
+        if el is chord:
+            return at
+    raise FixError("that chord is not in the bar")
+
+
+def _slur_across(root: etree._Element, staff: int, measure: int, index: int,
+                 end_measure: int, end_index: int) -> str:
+    """Slur one chord to a chord in the same or a later bar of the same staff."""
+    starts = _chords(root, staff, measure)
+    ends = _chords(root, staff, end_measure)
+    if not 0 <= index < len(starts):
+        raise _no_index(starts, index, f"m{measure}")
+    if not 0 <= end_index < len(ends):
+        raise _no_index(ends, end_index, f"m{end_measure}")
+    if (end_measure, end_index) <= (measure, index):
+        raise FixError("a slur has to end after it starts")
+    first, last = starts[index], ends[end_index]
+    along = _onset(last.getparent(), last) - _onset(first.getparent(), first)
+    bars = end_measure - measure
+
+    def location(parent: etree._Element, side: str, sign: int) -> None:
+        loc = etree.SubElement(etree.SubElement(parent, side), "location")
+        if bars:
+            etree.SubElement(loc, "measures").text = str(sign * bars)
+        value = sign * along
+        if value:
+            etree.SubElement(loc, "fractions").text = f"{value.numerator}/{value.denominator}"
+
+    head = etree.SubElement(first, "Spanner", type="Slur")
+    etree.SubElement(etree.SubElement(head, "Slur"), "up").text = "up"
+    location(head, "next", 1)
+    tail = etree.SubElement(last, "Spanner", type="Slur")
+    location(tail, "prev", -1)
+    return f"slurred chord {index} to chord {end_index} of m{end_measure}"
+
+
+def _unmark(root: etree._Element, staff: int, measure: int, text: str) -> str:
+    """Take the red mark saying `text` off a bar. Nothing to take off is fine.
+
+    The mark is looked for on every part the bar's printed staff became, because a
+    mark read off a shared staff lands on the first of them (#347).
+    """
+    gone = 0
+    for bar in _sibling_bars(root, staff, measure):
+        for el in list(bar.iter("StaffText")):
+            if (el.findtext("text") or "") == "⚠ " + text:
+                el.getparent().remove(el)
+                gone += 1
+    return f"took the red mark off ({text})" if gone else f"no red mark left ({text})"
+
+
+def _siblings(root: etree._Element, staff: int, measure: int) -> List[int]:
+    """The staves the printed staff that `staff` came from became, in bar `measure`.
+
+    Read off the maps cleaning writes for the lyrics: the per-system one when there
+    is one for that bar, else the score-wide one. A staff neither names is its own.
+    """
+    from ..lyric_txt import (_read_lyrics_staff_map,  # noqa: PLC0415 - a cycle
+                             _read_lyrics_system_map)
+    maps = [entry["map"] for entry in _read_lyrics_system_map(root) or []
+            if entry["start"] <= measure <= entry["end"]] or [_read_lyrics_staff_map(root)]
+    for outs in maps[0].values():
+        if staff in outs:
+            return sorted(set(outs))
+    return [staff]
+
+
+def _sibling_bars(root: etree._Element, staff: int, measure: int) -> List[etree._Element]:
+    bars = []
+    for sid in _siblings(root, staff, measure):
+        try:
+            bars.append(_measure(root, sid, measure))
+        except FixError:
+            continue
+    return bars or [_measure(root, staff, measure)]
+
+
+def _is_red(color: etree._Element) -> bool:
+    return color.get("r") == "255" and color.get("g") == "0" and color.get("b") == "0"
+
+
+def _settle(root: etree._Element, staff: int, measure: int) -> int:
+    """Turn the bar's red notes black once no red mark is left on it. Returns how many.
+
+    homr and the app colour the notes a mark is about (#274), and the mark lands on
+    the first part of a shared staff while the notes stay on both. Once every mark on
+    the bar is answered, nothing is left for a red note to point at (#347).
+    """
+    bars = _sibling_bars(root, staff, measure)
+    if any((el.findtext("text") or "").startswith("⚠ ")
+           for bar in bars for el in bar.iter("StaffText")):
+        return 0
+    found = [c for bar in bars for note in bar.iter("Note")
+             for c in note.findall("color") if _is_red(c)]
+    for color in found:
+        color.getparent().remove(color)
+    return len(found)
+
+
+# The three kinds an LLM fixing a song needed and could not write (#340): taking a
+# slur out, tying two notes, and giving one note another length when that changes how
+# long the bar is. Each refuses unless the bar still reads its `from`.
+
+def _expect(measure: etree._Element, expect) -> None:
+    if expect is None:
+        raise FixError("record what the bar reads now in 'from'")
+    found = _bar_tokens(measure)
+    if found != list(expect):
+        raise FixError(f"bar reads {found} now, but the fix was recorded against {list(expect)}")
+
+
+def _voice(measure: etree._Element) -> etree._Element:
+    return measure.find("voice") if measure.find("voice") is not None else measure
+
+
+def _positions(staff: etree._Element, mi: int) -> List[Tuple[Fraction, etree._Element]]:
+    """Each child of bar `mi`'s first voice with where it stands in the bar."""
+    from .rejected_bars import _bar_lengths, _walk  # noqa: PLC0415 - a cycle
+    measure = staff.findall("Measure")[mi]
+    return list(_walk(_voice(measure), _bar_lengths(staff)[mi]))
+
+
+def _resolve(home: int, pos: Fraction, location: etree._Element,
+             lengths: List[Fraction]) -> Tuple[int, Fraction]:
+    """The bar and the place in it that a `location` written at (home, pos) points at."""
+    bars, along = _relative(location)
+    index, at = home + bars, pos + along
+    while at < 0 and index > 0:
+        index -= 1
+        at += lengths[index]
+    while 0 <= index < len(lengths) and at >= lengths[index]:
+        at -= lengths[index]
+        index += 1
+    return index, at
+
+
+def _halves(chord: etree._Element, side: str) -> List[etree._Element]:
+    """The slur halves of a chord whose pointer is `side` ("next" or "prev").
+
+    MuseScore keeps a slur half inside its chord; a half written in the voice just
+    ahead of the chord stands at the chord too, so both are counted.
+    """
+    out = [sp for sp in chord.findall("Spanner[@type='Slur']") if sp.find(side) is not None]
+    el = chord.getprevious()
+    while el is not None and el.tag not in ("Chord", "Rest"):
+        if el.tag == "Spanner" and el.get("type") == "Slur" and el.find(side) is not None:
+            out.append(el)
+        el = el.getprevious()
+    return out
+
+
+def _unslur(root: etree._Element, staff_id: int, measure_no: int, index: int,
+            expect: List[str]) -> str:
+    """Take out the slur that starts on chord `index`: both of its halves.
+
+    The end half can sit in another bar, which is what a bar rewrite used to leave
+    behind. A slur whose end cannot be found loses its start all the same — an end
+    with no start is dropped by MuseScore, a start with no end is a runaway.
+    """
+    from .rejected_bars import _bar_lengths  # noqa: PLC0415 - a cycle
+    measure = _measure(root, staff_id, measure_no)
+    _expect(measure, expect)
+    chords = _chords(root, staff_id, measure_no)
+    if not 0 <= index < len(chords):
+        raise _no_index(chords, index, f"m{measure_no}")
+    chord = chords[index]
+    starts = _halves(chord, "next")
+    if not starts:
+        raise FixError(f"no slur starts on chord {index}")
+    if len(starts) > 1:
+        raise FixError(f"{len(starts)} slurs start on chord {index}; say which in a text fix")
+    head = starts[0]
+    staff = measure.getparent()
+    lengths = _bar_lengths(staff)
+    mi = staff.findall("Measure").index(measure)
+    own = next(at for at, el in _positions(staff, mi) if el is chord)
+    tail = None
+    location = head.find("next/location")
+    if location is not None:
+        bar, at = _resolve(mi, own, location, lengths)
+        if 0 <= bar < len(lengths):
+            for pos, el in _positions(staff, bar):
+                if el.tag == "Chord" and pos == at and el is not chord:
+                    ends = _halves(el, "prev")
+                    tail = ends[0] if ends else None
+                    break
+    head.getparent().remove(head)
+    if tail is None:
+        return f"took out the slur from chord {index} (no end half found)"
+    tail.getparent().remove(tail)
+    return f"took out the slur from chord {index}"
+
+
+#: What `delete` may take off a chord (#352): the element, and whether it is kept
+#: inside the chord, in the voice just ahead of it, or -- a breath mark, which MuseScore
+#: writes after the chord it follows, even at the end of a bar -- just after it. Taking any of these out never
+#: needs anything else in the score changed.
+_DELETABLE = {"fermata": ("Fermata", "before"), "articulation": ("Articulation", "inside"),
+              "arpeggio": ("Arpeggio", "inside"),
+              "breath": ("Breath", "after"), "staff text": ("StaffText", "before"),
+              "tempo": ("Tempo", "before"), "rehearsal mark": ("RehearsalMark", "before")}
+#: What `delete` refuses, and where to go instead.
+_NOT_DELETABLE = {
+    "slur": "use 'unslur', which takes out both halves",
+    "tie": "use 'untie', which takes out both halves",
+    "note": "use 'bar' to write the bar afresh", "rest": "use 'bar' to write the bar afresh",
+    "chord": "use 'bar' to write the bar afresh",
+    "mark": "use 'unmark' for a red mark", "red mark": "use 'unmark' for a red mark",
+    "lyrics": "fix the words in the lyric editor", "words": "fix the words in the lyric editor",
+    "clef": "a clef changes the bar itself", "key": "a key signature changes the bar itself",
+    "time signature": "a time signature changes the bar itself",
+    "tuplet": "a triplet bracket changes the lengths in the bar",
+}
+_PLAYED = {"Fermata", "Tempo"}
+
+
+def _mark_kind(el: etree._Element) -> str:
+    return el.findtext("subtype") or el.findtext("symbol") or ""
+
+
+def _mark_text(el: etree._Element) -> str:
+    text = el.find("text")
+    return "".join(text.itertext()).strip() if text is not None else ""
+
+
+def _marks_on(chord: etree._Element, tag: str, where: str) -> List[etree._Element]:
+    if where == "inside":
+        return chord.findall(tag)
+    out = []
+    if where == "after":
+        el = chord.getnext()
+        while el is not None and el.tag not in ("Chord", "Rest"):
+            if el.tag == tag:
+                out.append(el)
+            el = el.getnext()
+        return out
+    el = chord.getprevious()
+    while el is not None and el.tag not in ("Chord", "Rest"):
+        if el.tag == tag:
+            out.append(el)
+        el = el.getprevious()
+    return out
+
+
+def chord_marks(chord: etree._Element) -> List[str]:
+    """The marks `delete` could take off this chord, as `what[:subtype]`."""
+    out = []
+    for what, (tag, where) in _DELETABLE.items():
+        found = _marks_on(chord, tag, where)
+        for el in (reversed(found) if where == "before" else found):
+            if tag == "StaffText" and _mark_text(el).startswith("⚠"):
+                continue
+            detail = _mark_kind(el) or (_mark_text(el) if tag != "Tempo" else "")
+            out.append(f"{what}:{detail}" if detail else what)
+    return out
+
+
+def _delete_mark(root: etree._Element, staff_id: int, measure_no: int, index: int,
+                 what: str, subtype: Optional[str], expect: List[str]) -> str:
+    """Take the marks of kind `what` (narrowed by `subtype`) off chord `index`."""
+    what = (what or "").strip().lower()
+    if what in _NOT_DELETABLE:
+        raise FixError(f"cannot delete a {what}: {_NOT_DELETABLE[what]}")
+    if what not in _DELETABLE:
+        raise FixError(f"cannot delete {what!r}; 'what' is one of {', '.join(_DELETABLE)}")
+    tag, where = _DELETABLE[what]
+    measure = _measure(root, staff_id, measure_no)
+    _expect(measure, expect)
+    chords = _chords(root, staff_id, measure_no)
+    if not 0 <= index < len(chords):
+        raise FixError(f"m{measure_no} has {len(chords)} chords, no index {index}")
+    chord = chords[index]
+    found = _marks_on(chord, tag, where)
+    if tag == "StaffText":
+        red = [el for el in found if _mark_text(el).startswith("⚠")]
+        found = [el for el in found if el not in red]
+        if red and not found:
+            raise FixError("that staff text is a red mark; use 'unmark'")
+    if subtype is not None:
+        found = [el for el in found if subtype in (_mark_kind(el), _mark_text(el))]
+    if not found:
+        narrowed = f" ({subtype})" if subtype is not None else ""
+        raise FixError(f"no {what}{narrowed} on chord {index}")
+    for el in found:
+        el.getparent().remove(el)
+    done = f"took out {len(found)} {what}(s) on chord {index}"
+    if tag in _PLAYED:
+        others = _same_mark_at_beat(root, measure, chord, tag)
+        if others:
+            staves = ", ".join(str(s) for s in others)
+            done += (f" (playback still holds this beat: staff {staves} has one too)"
+                     if tag == "Fermata" else
+                     f" (playback still changes tempo here: staff {staves} has one too)")
+    return done
+
+
+def _same_mark_at_beat(root: etree._Element, measure: etree._Element,
+                       chord: etree._Element, tag: str) -> List[int]:
+    """The other staves whose same bar carries a `tag` at the beat `chord` stands on."""
+    staff = measure.getparent()
+    mi = staff.findall("Measure").index(measure)
+    at = next(pos for pos, el in _positions(staff, mi) if el is chord)
+    out = []
+    for other in root.findall(".//Score/Staff"):
+        if other is staff or len(other.findall("Measure")) <= mi:
+            continue
+        if any(el.tag == tag and pos == at for pos, el in _positions(other, mi)):
+            out.append(int(other.get("id")))
+    return out
+
+
+def _tie_spanner(side: str, bars: int, along: Fraction) -> etree._Element:
+    tie = etree.Element("Spanner", type="Tie")
+    if side == "next":
+        etree.SubElement(tie, "Tie")
+    loc = etree.SubElement(etree.SubElement(tie, side), "location")
+    if bars:
+        etree.SubElement(loc, "measures").text = str(bars)
+    if along:
+        etree.SubElement(loc, "fractions").text = f"{along.numerator}/{along.denominator}"
+    return tie
+
+
+def _pitched(chord: etree._Element, pitch: int) -> Optional[etree._Element]:
+    for note in chord.findall("Note"):
+        if (note.findtext("pitch") or "").strip() == str(pitch):
+            return note
+    return None
+
+
+def _before_pitch(note: etree._Element, el: etree._Element) -> None:
+    """Put `el` where MuseScore writes a note's spanners: just ahead of its pitch."""
+    pitch = note.find("pitch")
+    if pitch is None:
+        note.append(el)
+    else:
+        pitch.addprevious(el)
+
+
+def _tie(root: etree._Element, staff_id: int, measure_no: int, index: int, pitch: int,
+         expect: List[str]) -> str:
+    """Tie the note `pitch` of chord `index` to the same pitch in the next chord.
+
+    The next chord is the next thing the voice sounds, in this bar or the first of the
+    next one. A rest in between, or no such pitch there, refuses: a tie joins one
+    pitch to itself across no silence, which is what makes playback hold the note.
+    """
+    measure = _measure(root, staff_id, measure_no)
+    _expect(measure, expect)
+    chords = _chords(root, staff_id, measure_no)
+    if not 0 <= index < len(chords):
+        raise _no_index(chords, index, f"m{measure_no}")
+    chord = chords[index]
+    note = _pitched(chord, pitch)
+    if note is None:
+        raise FixError(f"chord {index} has no note at pitch {pitch}")
+    if any(t.find("next") is not None for t in note.findall("Spanner[@type='Tie']")):
+        raise FixError(f"pitch {pitch} of chord {index} is tied already")
+    staff = measure.getparent()
+    measures = staff.findall("Measure")
+    mi = measures.index(measure)
+    here = _positions(staff, mi)
+    own = next(at for at, el in here if el is chord)
+    after = [(at, el) for at, el in here if el.tag in ("Chord", "Rest")]
+    after = after[[el for _, el in after].index(chord) + 1:]
+    bar = mi
+    if not after:
+        bar = mi + 1
+        if bar >= len(measures):
+            raise FixError("the last note of the staff has nothing to tie to")
+        after = [(at, el) for at, el in _positions(staff, bar) if el.tag in ("Chord", "Rest")]
+    if not after:
+        raise FixError(f"m{bar + 1} is empty")
+    at, nxt = after[0]
+    if nxt.tag == "Rest":
+        raise FixError("a rest follows; a tie cannot cross it")
+    other = _pitched(nxt, pitch)
+    if other is None:
+        raise FixError(f"the next chord has no note at pitch {pitch}")
+    if any(t.find("prev") is not None for t in other.findall("Spanner[@type='Tie']")):
+        raise FixError("the next note is tied into already")
+    along = at - own
+    _before_pitch(note, _tie_spanner("next", bar - mi, along))
+    _before_pitch(other, _tie_spanner("prev", mi - bar, -along))
+    where = "the next chord" if bar == mi else f"the first chord of m{bar + 1}"
+    return f"tied pitch {pitch} of chord {index} to {where}"
+
+
+def _untie(root: etree._Element, staff_id: int, measure_no: int, index: int, pitch: int,
+           expect: List[str]) -> str:
+    """Take out the tie that starts on note `pitch` of chord `index`: both of its halves.
+
+    The end half is found where the start half points, in this bar or a later one, and
+    must be the same pitch tied back. Strophic songs print dashed ties for a later verse
+    only; homr reads them as real ties, so the verse that re-strikes the note loses a
+    syllable (#342). A tie whose end cannot be found loses its start all the same.
+    """
+    measure = _measure(root, staff_id, measure_no)
+    _expect(measure, expect)
+    chords = _chords(root, staff_id, measure_no)
+    if not 0 <= index < len(chords):
+        raise _no_index(chords, index, f"m{measure_no}")
+    chord = chords[index]
+    note = _pitched(chord, pitch)
+    if note is None:
+        raise FixError(f"chord {index} has no note at pitch {pitch}")
+    starts = [t for t in note.findall("Spanner[@type='Tie']") if t.find("next") is not None]
+    if not starts:
+        raise FixError(f"no tie starts on pitch {pitch} of chord {index}")
+    head = starts[0]
+    staff = measure.getparent()
+    mi = staff.findall("Measure").index(measure)
+    tail, bar = _tie_partner(staff, mi, chord, head, pitch)
+    head.getparent().remove(head)
+    if tail is None:
+        return f"took out the tie from pitch {pitch} of chord {index} (no end half found)"
+    tail.getparent().remove(tail)
+    where = "the next chord" if bar == mi else f"m{bar + 1}"
+    return f"took out the tie from pitch {pitch} of chord {index} to {where}"
+
+
+def _tie_partner(staff: etree._Element, mi: int, chord: etree._Element,
+                 half: etree._Element, pitch: int) -> Tuple[Optional[etree._Element], int]:
+    """The other half of the tie `half` on note `pitch` of `chord` in bar `mi`, and its bar.
+
+    A start half (`next`) points forward at the note the tie ends on, an end half
+    (`prev`) back at the note it starts on; the other half sits on that note at the
+    same pitch. None when nothing stands where the half points.
+    """
+    from .rejected_bars import _bar_lengths  # noqa: PLC0415 - a cycle
+    side, other_side = ("next", "prev") if half.find("next") is not None else ("prev", "next")
+    lengths = _bar_lengths(staff)
+    own = next(at for at, el in _positions(staff, mi) if el is chord)
+    location = half.find(f"{side}/location")
+    if location is None:
+        return None, mi
+    bar, at = _resolve(mi, own, location, lengths)
+    if not 0 <= bar < len(lengths):
+        return None, bar
+    for pos, el in _positions(staff, bar):
+        if el.tag == "Chord" and pos == at and el is not chord:
+            other = _pitched(el, pitch)
+            if other is None:
+                return None, bar
+            return next((t for t in other.findall("Spanner[@type='Tie']")
+                         if t.find(other_side) is not None), None), bar
+    return None, bar
+
+
+def _drop_note(root: etree._Element, staff_id: int, measure_no: int, index: int, pitch: int,
+               expect: List[str]) -> str:
+    """Take note `pitch` off chord `index`, and any tie on it, both halves.
+
+    For an optional note the page prints in brackets (#358): the scan reads it as a
+    chord note, and the practice track then sings both. The chord keeps its length and
+    its words. The last note of a chord is refused: that turns the chord into a rest,
+    which changes the rhythm and the words, and is a `bar` fix's job.
+    """
+    measure = _measure(root, staff_id, measure_no)
+    _expect(measure, expect)
+    chords = _chords(root, staff_id, measure_no)
+    if not 0 <= index < len(chords):
+        raise _no_index(chords, index, f"m{measure_no}")
+    chord = chords[index]
+    note = _pitched(chord, pitch)
+    if note is None:
+        raise FixError(f"chord {index} has no note at pitch {pitch}")
+    if len(chord.findall("Note")) == 1:
+        raise FixError(f"pitch {pitch} is chord {index}'s only note; a bar fix writes a rest")
+    staff = measure.getparent()
+    mi = staff.findall("Measure").index(measure)
+    ties = []
+    for half in note.findall("Spanner[@type='Tie']"):
+        other, bar = _tie_partner(staff, mi, chord, half, pitch)
+        if other is not None:
+            other.getparent().remove(other)
+        ties.append("into it" if half.find("prev") is not None else "out of it")
+    tpc = note.findtext("tpc")
+    name = note_name(pitch, int(tpc) if tpc and tpc.strip().lstrip("-").isdigit() else None)
+    chord.remove(note)
+    return (f"took {name} off chord {index}"
+            + (f" with its tie {' and '.join(ties)}" if ties else ""))
+
+
+def _add_note(root: etree._Element, staff_id: int, measure_no: int, index: int, pitch: int,
+              expect: List[str], tpc: Optional[int] = None) -> str:
+    """Put a note of `pitch` on chord `index`, untied, among its notes lowest first.
+
+    The spelling comes from `tpc` when given, else from a note of the same pitch class
+    in the chord (an octave doubling, the usual optional note), else from the key in
+    force by `spelling`, as every other kind spells a derived note.
+    """
+    measure = _measure(root, staff_id, measure_no)
+    _expect(measure, expect)
+    chords = _chords(root, staff_id, measure_no)
+    if not 0 <= index < len(chords):
+        raise _no_index(chords, index, f"m{measure_no}")
+    chord = chords[index]
+    notes = chord.findall("Note")
+    if _pitched(chord, pitch) is not None:
+        raise FixError(f"chord {index} has pitch {pitch} already")
+    if tpc is None:
+        for other in notes:
+            text = (other.findtext("tpc") or "").strip()
+            if (other.findtext("pitch") or "").strip().isdigit() and \
+                    int(other.findtext("pitch")) % 12 == pitch % 12 and text.lstrip("-").isdigit():
+                tpc = int(text)
+                break
+    if tpc is None:
+        tpc = spelling(pitch, key_in_force(measure))
+    note = etree.Element("Note")
+    etree.SubElement(note, "pitch").text = str(pitch)
+    etree.SubElement(note, "tpc").text = str(tpc)
+    higher = next((n for n in notes
+                   if int((n.findtext("pitch") or "0").strip() or 0) > pitch), None)
+    if higher is not None:
+        higher.addprevious(note)
+    elif notes:
+        notes[-1].addnext(note)
+    else:
+        chord.append(note)
+    return f"put {note_name(pitch, tpc)} on chord {index}"
+
+
+def _meter(staff: etree._Element, mi: int) -> Fraction:
+    meter = Fraction(4, 4)
+    for measure in staff.findall("Measure")[:mi + 1]:
+        ts = measure.find(".//TimeSig")
+        if ts is not None and ts.findtext("sigN") and ts.findtext("sigD"):
+            meter = Fraction(int(ts.findtext("sigN")), int(ts.findtext("sigD")))
+    return meter
+
+
+def _set_duration(root: etree._Element, staff_id: int, measure_no: int, index: int,
+                  expect: List[str], to: str) -> str:
+    """Give chord `index` the length `to` (`quarter..`), and the bar its length back.
+
+    A scan that reads a double dot as a single one leaves the bar short, cleaning then
+    writes that short length onto the bar, and the voices the page prints correctly
+    no longer fit (#340: Annin laulu bars 9, 10 and 21 came out 11/16 under 3/4). So
+    the new length has to make this voice fill either the bar as it stands or the
+    time signature in force. In the second case the bar takes the signature's length
+    again on every staff, and a whole-bar rest anywhere in it is lengthened with it.
+    Any other total refuses: a bar of a length no signature prints is the damage, not
+    a repair.
+
+    Ties and slurs keep their notes: everything after the changed one moves along.
+    """
+    dur, _, rest = (to or "").partition(":")
+    if rest:
+        raise FixError(f"'to' is a length only, like 'quarter..', not {to!r}")
+    dots = dur.count(".")
+    base = dur.replace(".", "")
+    if base not in _DUR or dur != base + "." * dots or dots > 3:
+        raise FixError(f"not a length: {to!r}")
+    measure = _measure(root, staff_id, measure_no)
+    _expect(measure, expect)
+    chords = _chords(root, staff_id, measure_no)
+    if not 0 <= index < len(chords):
+        raise _no_index(chords, index, f"m{measure_no}")
+    chord = chords[index]
+    staff = measure.getparent()
+    measures = staff.findall("Measure")
+    mi = measures.index(measure)
+    from .rejected_bars import _bar_lengths  # noqa: PLC0415 - a cycle
+    bar_length = _bar_lengths(staff)[mi]
+    meter = _meter(staff, mi)
+
+    in_tuplet = False
+    for el in _voice(measure):
+        if el.tag == "Tuplet":
+            in_tuplet = True
+        elif el.tag == "endTuplet":
+            in_tuplet = False
+        elif el is chord and in_tuplet:
+            raise FixError("that chord is in a tuplet; write the bar with 'bar' instead")
+    old, new = _length(chord), _DUR[base] * _DOT[dots]
+    if old == new:
+        raise FixError(f"chord {index} is {to} already")
+    if _voice(measure).find("location") is not None:
+        raise FixError("the bar has a gap in it; rewrite it in MuseScore")
+    delta = new - old
+    here = _positions(staff, mi)
+    moments = [(at, el) for at, el in here if el.tag in ("Chord", "Rest")]
+    total = sum((length for _, _, length in _timeline(_voice(measure))), Fraction(0))
+    new_total = total + delta
+    if new_total not in (bar_length, meter):
+        raise FixError(
+            f"the voice would last {new_total} of a whole note, but the bar is "
+            f"{bar_length} and the time signature {meter}")
+
+    own = next(at for at, el in here if el is chord)
+    onsets = {at: (at + delta if at > own else at) for at, el in moments}
+    onsets[total] = new_total
+    moves = []
+    for location, home, pos in list(_spanner_ends(staff)):
+        bars, along = _relative(location)
+        target_bar, target = home + bars, pos + along
+        new_pos = onsets.get(pos, pos) if home == mi else pos
+        new_target = onsets.get(target, target) if target_bar == mi else target
+        if new_target - new_pos != along:
+            moves.append((location, new_target - new_pos))
+
+    olds = chord.findall("dots") + chord.findall("durationType")
+    position = min(chord.index(el) for el in olds) if olds else 0
+    for old_el in olds:
+        chord.remove(old_el)
+    head = etree.Element("durationType")
+    head.text = base
+    chord.insert(position, head)
+    if dots:
+        dot = etree.Element("dots")
+        dot.text = str(dots)
+        chord.insert(position, dot)
+    for location, fractions in moves:
+        _set_fractions(location, fractions)
+
+    said = f"set chord {index} to {to}"
+    if new_total != bar_length:
+        closed = []
+        for other in root.findall(".//Score/Staff"):
+            bars_of = other.findall("Measure")
+            if mi >= len(bars_of):
+                continue
+            bar_el = bars_of[mi]
+            if new_total == meter:
+                bar_el.attrib.pop("len", None)
+            else:
+                bar_el.set("len", f"{new_total.numerator}/{new_total.denominator}")
+            for rest_el in bar_el.iter("Rest"):
+                if (rest_el.findtext("durationType") or "").strip() == "measure":
+                    node = rest_el.find("duration")
+                    if node is not None:
+                        node.text = f"{new_total.numerator}/{new_total.denominator}"
+            if _close_back_steps(other, mi, bar_length, new_total):
+                closed.append(other.get("id"))
+        said += f"; the bar is {new_total} again on every staff"
+        if closed:
+            said += f", and the back-step squeezing staff {', '.join(closed)} into it is gone"
+    return said
+
+
+def _close_back_steps(staff: etree._Element, mi: int, was: Fraction, now: Fraction) -> bool:
+    """Take out the back-steps that squeezed a voice into a bar `was` long, now `now`.
+
+    Cleaning fits a voice the page prints correctly into a bar the scan read short by
+    stepping it backwards (a `location` of -1/16): Annin laulu's T1 in bar 9 is 12/16
+    of music squeezed into the scan's 11/16, Gute Nacht's T1 in bar 6 is 4/4 in 7/8
+    (#344). Once a `duration` fix gives the bar its length back the back-step is
+    wrong, MuseScore reads the voice as too long and resets it to a rest — after every
+    recorded fix has run, so nothing in `fixes.json` could put it back. So when the
+    voice's own notes fill the bar exactly as it now is, the back-steps go, and the
+    ties and slurs on the notes after them move with them. Any other voice is left as
+    it is, for MuseScore's check to report.
+    """
+    from .rejected_bars import _bar_lengths, _walk  # noqa: PLC0415 - a cycle
+    measures = staff.findall("Measure")
+    if mi >= len(measures):
+        return False
+    lengths = _bar_lengths(staff)
+    closed = False
+    for track, voice in enumerate(measures[mi].findall("voice") or [measures[mi]]):
+        steps = [el for el in voice if el.tag == "location"]
+        if not steps:
+            continue
+        if any(_relative(step)[0] or _relative(step)[1] >= 0 for step in steps):
+            continue
+        old = list(_walk(voice, was))
+        moments = [(at, el) for at, el in old if el.tag in ("Chord", "Rest")]
+        if not moments:
+            continue
+        shift = Fraction(0)
+        new_at = {}
+        for at, el in old:
+            if el.tag == "location":
+                shift -= _relative(el)[1]
+            new_at[id(el)] = at + shift
+        if sum((_length(el) for _, el in moments), Fraction(0)) != now:
+            continue
+        end = now + sum((_relative(step)[1] for step in steps), Fraction(0))
+        if any((el.findtext("durationType") or "").strip() == "measure" or el.tag == "Tuplet"
+               for _, el in old):
+            continue
+        # Where each onset in the bar goes. Two moments at one old onset would make
+        # a spanner's target ambiguous, and a guessed target is worse than a reset.
+        onsets: Dict[Fraction, Fraction] = {}
+        for at, el in moments:
+            if at in onsets and onsets[at] != new_at[id(el)]:
+                onsets = {}
+                break
+            onsets[at] = new_at[id(el)]
+        if not onsets:
+            continue
+        onsets[end] = now
+        moves = []
+        for home, body in enumerate(measures):
+            # Only this voice moved, so only its own ties and slurs can point at it.
+            vbodies = body.findall("voice") or [body]
+            for vbody in vbodies[track:track + 1]:
+                if home == mi and vbody is not voice:
+                    continue
+                for at, el in _walk(vbody, lengths[home]):
+                    spanners = ([el] if el.tag == "Spanner" else
+                                list(el.iter("Spanner")) if el.tag in ("Chord", "Rest") else [])
+                    for spanner in spanners:
+                        for side in ("next", "prev"):
+                            location = spanner.find(f"{side}/location")
+                            if location is None:
+                                continue
+                            bars, along = _relative(location)
+                            pos = new_at[id(el)] if vbody is voice else at
+                            target_bar, target = home + bars, at + along
+                            if target_bar == mi:
+                                target = onsets.get(target, target)
+                            if target - pos != along:
+                                moves.append((location, target - pos))
+        for step in steps:
+            voice.remove(step)
+        for location, fractions in moves:
+            _set_fractions(location, fractions)
+        closed = True
+    return closed
+
+
+def tpc_of(step: str, alter: int) -> int:
+    """MuseScore's tpc for a spelt note: F C G D A E B are 13..19, a sharp is +7."""
+    return 13 + _LETTERS.index(step) + 7 * int(alter)
+
+
+def _set_pitch(root: etree._Element, staff: int, measure: int, index: int,
+               expect: List[str], was: int, to: int, tpc: int) -> str:
+    bar = _measure(root, staff, measure)
+    found = _bar_tokens(bar)
+    if found != list(expect):
+        raise FixError(f"bar reads {found} now, but the fix was recorded against {list(expect)}")
+    chords = _chords(root, staff, measure)
+    if not 0 <= index < len(chords):
+        raise _no_index(chords, index, "the bar")
+    note = next((n for n in chords[index].findall("Note")
+                 if (n.findtext("pitch") or "").strip() == str(was)), None)
+    if note is None:
+        raise FixError(f"chord {index} has no note at pitch {was}")
+    note.find("pitch").text = str(to)
+    for tag in ("tpc", "tpc2"):
+        node = note.find(tag)
+        if node is not None:
+            node.text = str(tpc)
+    if note.find("tpc") is None:
+        etree.SubElement(note, "tpc").text = str(tpc)
+    for color in note.findall("color"):
+        note.remove(color)
+    return (f"set chord {index}'s {note_name(was)} to {note_name(to, tpc)}"
+            + _answered(_strike(root, staff, measure, _PITCH_WORDS)))
+
+
+#: The words of homr's red mark each kind of pick answers. A pitch answers the note's
+#: pitch and accidental; new lengths answer the rhythm; a whole bar read against the
+#: page answers everything about its notes. `voice?` (which singer a note is) and
+#: cleaning's own marks — a slur taken out, a bar cut back, a bar MuseScore refused —
+#: are about something else in the bar and stay until that is answered too (#290).
+_PITCH_WORDS = ("pitch?", "accidental?")
+_RHYTHM_WORDS = ("rhythm?",)
+_BAR_WORDS = ("rhythm?", "pitch?", "accidental?", "notes?", "unchecked?")
+
+#: How homr worded a mark before its marks became short words (#280).
+_OLD_HOMR_MARK = "check against the page"
+
+
+def _strike_words(bar: etree._Element, words) -> List[str]:
+    """Take `words` out of homr's red marks on the bar. Returns what was answered.
+
+    A mark left with nothing to say goes. homr's older one-sentence mark is answered
+    whole, as it always was. Any other sentence is cleaning's, about another problem,
+    and is left alone.
+    """
+    struck: List[str] = []
+    for el in list(bar.iter("StaffText")):
+        node = el.find("text")
+        text = node.text if node is not None and node.text else ""
+        if not text.startswith("⚠ "):
+            continue
+        if text[2:].startswith(_OLD_HOMR_MARK):
+            el.getparent().remove(el)
+            struck.append(text[2:])
+            continue
+        said = text[2:].split(" ")
+        if not all(w.endswith("?") for w in said):
+            continue
+        left = [w for w in said if w not in words]
+        struck.extend(w for w in said if w in words and w not in struck)
+        if len(left) == len(said):
+            continue
+        if left:
+            node.text = "⚠ " + " ".join(left)
+        else:
+            el.getparent().remove(el)
+    return struck
+
+
+#: The words of homr's mark the other kinds answer: a tie written or taken out has
+#: been read against the page, and so has a slur, and a length (#347).
+_KIND_WORDS = {"tie": ("tie?",), "untie": ("tie?",), "slur": ("slur?",),
+               "unslur": ("slur?",), "duration": ("rhythm?",)}
+
+
+def _strike(root: etree._Element, staff: int, measure: int, words) -> List[str]:
+    """`_strike_words` on every part the bar's printed staff became (#347)."""
+    struck: List[str] = []
+    for bar in _sibling_bars(root, staff, measure):
+        struck.extend(w for w in _strike_words(bar, words) if w not in struck)
+    return struck
+
+
+def _answered(struck: List[str]) -> str:
+    return f" and took {' '.join(struck)} off the red mark" if struck else ""
+
+
 # A bar as tokens, so a recorded fix can say what it expects to find and what it
 # should read afterwards. Rests are "R"; a chord's notes join with "+". Tuplet
 # brackets are marked, because two bars that differ only by one are different bars
@@ -152,7 +1174,7 @@ def _bar_tokens(measure: etree._Element) -> List[str]:
     return out
 
 
-def _write_token(voice: etree._Element, token: str) -> None:
+def _write_token(voice: etree._Element, token: str, key: int = 0) -> None:
     dur, _, notes = token.partition(":")
     dots = dur.count(".")
     dur = dur.replace(".", "")
@@ -175,7 +1197,7 @@ def _write_token(voice: etree._Element, token: str) -> None:
                 raise FixError(f"bad pitch {part!r} in {token!r}")
             note = etree.SubElement(el, "Note")
             etree.SubElement(note, "pitch").text = str(pitch_no)
-            etree.SubElement(note, "tpc").text = str(_SPELLING[pitch_no % 12])
+            etree.SubElement(note, "tpc").text = str(spelling(pitch_no, key))
 
 
 # MuseScore's tpc is the note's spelling: 14 is C and each step of one is a fifth
@@ -184,6 +1206,35 @@ def _write_token(voice: etree._Element, token: str) -> None:
 # which puts the note on the wrong line of the staff while sounding correct.
 _SPELLING = {0: 14, 1: 21, 2: 16, 3: 23, 4: 18, 5: 13,
              6: 20, 7: 15, 8: 22, 9: 17, 10: 24, 11: 19}
+# In a flat key the black keys are flats: B flat, not the A sharp the table above
+# gives, which a person reading the bar against the page had to write out as a `bar`
+# fix with explicit tpcs to get right (#357). White keys stay natural either way.
+_FLAT_SPELLING = {**_SPELLING, 1: 9, 3: 11, 6: 8, 8: 10, 10: 12}
+
+
+def spelling(pitch: int, key: int = 0) -> int:
+    """The tpc a derived note gets: flats for black keys in a flat key, else sharps."""
+    return (_FLAT_SPELLING if key < 0 else _SPELLING)[pitch % 12]
+
+
+def key_in_force(measure: etree._Element) -> int:
+    """The key signature on this bar's staff at this bar: sharps up, flats down, 0 for none.
+
+    The last `KeySig` at or before the bar, so a key change part-way through the song
+    spells the notes after it in the new key.
+    """
+    staff = measure.getparent()
+    key = 0
+    for bar in staff.findall("Measure"):
+        for sig in bar.iter("KeySig"):
+            value = (sig.findtext("accidental") or sig.findtext("concertKey") or "").strip()
+            try:
+                key = int(value)
+            except ValueError:
+                pass
+        if bar is measure:
+            break
+    return key
 
 
 def _append_bar(measure: etree._Element, expect: List[str], add: List[str],
@@ -219,10 +1270,398 @@ def _append_bar(measure: etree._Element, expect: List[str], add: List[str],
                 "Removing a note is a musical decision — write the bar out by hand.")
         for el in going:
             body.remove(el)
+    key = key_in_force(measure)
     for token in add:
-        _write_token(body, token)
+        _write_token(body, token, key)
     dropped = f"dropped the last {drop} and " if drop else ""
     return f"{dropped}added {list(add)} to the end of the bar"
+
+
+# A bar's lengths rewritten, for `rhythm`. The lengths come in homr's spelling,
+# because that is where the readings a person picks between come from.
+
+_TYPES = {1: "whole", 2: "half", 4: "quarter", 8: "eighth", 16: "16th", 32: "32nd",
+          64: "64th"}
+_TYPE_NUMBER = {name: number for number, name in _TYPES.items()}
+
+
+def _parse_value(value: str):
+    """`note_12.` -> ("note", 12, 1): kind, homr's denominator, dots."""
+    kind, _, rest = (value or "").partition("_")
+    number = rest.rstrip(".")
+    if kind not in ("note", "rest") or not number.isdigit() or int(number) < 1:
+        raise FixError(f"not a length: {value!r}")
+    return kind, int(number), len(rest) - len(number)
+
+
+def value_length(value: str) -> Fraction:
+    """How long a homr length lasts, as a fraction of a whole note."""
+    _, number, dots = _parse_value(value)
+    return Fraction(1, number) * _DOT.get(dots, Fraction(1))
+
+
+def is_triplet(value: str) -> bool:
+    return _parse_value(value)[1] % 3 == 0
+
+
+def triplet_groups(values: List[str]) -> List[tuple]:
+    """Where the triplet brackets go: `(first, last)` index pairs, last inclusive.
+
+    A bracket opens at the first triplet length and closes as soon as it has run a
+    whole number of quarters and lands on a quarter, which is how a run of triplet
+    eighths is bracketed three by three and three triplet quarters as one. Raises
+    when a run cannot be bracketed so: a plain note inside it, or the bar ending first.
+    """
+    groups = []
+    start, total, at = None, Fraction(0), Fraction(0)
+    quarter = Fraction(1, 4)
+    for index, value in enumerate(values):
+        length = value_length(value)
+        if is_triplet(value):
+            if start is None:
+                start, total = index, Fraction(0)
+            total += length
+            if (total / quarter).denominator == 1 and ((at + length) / quarter).denominator == 1:
+                groups.append((start, index))
+                start = None
+        elif start is not None:
+            raise FixError("a triplet would not close on a beat")
+        at += length
+    if start is not None:
+        raise FixError("a triplet would run past the end of the bar")
+    return groups
+
+
+def element_value(el: etree._Element, in_tuplet: bool) -> Optional[str]:
+    """A Chord or Rest's length in homr's spelling, or None when it has none."""
+    number = _TYPE_NUMBER.get((el.findtext("durationType") or "").strip())
+    if number is None:
+        return None
+    dots = int((el.findtext("dots") or "0").strip() or 0)
+    if in_tuplet:
+        number = number * 3 // 2 if (number * 3) % 2 == 0 else None
+        if number is None:
+            return None
+    return f"{'rest' if el.tag == 'Rest' else 'note'}_{number}" + "." * dots
+
+
+def _timeline(body: etree._Element) -> List:
+    """The voice's Chords and Rests with where each starts in the bar.
+
+    Raises for what this cannot account for: a gap (`location`), or a tuplet that is
+    not a plain triplet, because then an onset here would be a guess.
+    """
+    out = []
+    at = Fraction(0)
+    ratio = None
+    for el in body:
+        if el.tag == "location":
+            raise FixError("the bar has a gap in it; rewrite it in MuseScore")
+        if el.tag == "Tuplet":
+            normal, actual = el.findtext("normalNotes"), el.findtext("actualNotes")
+            if (normal, actual) != ("2", "3"):
+                raise FixError("the bar has a tuplet that is not a triplet")
+            ratio = Fraction(2, 3)
+        elif el.tag == "endTuplet":
+            ratio = None
+        elif el.tag in ("Chord", "Rest"):
+            if (el.findtext("durationType") or "").strip() == "measure":
+                raise FixError("the bar holds a whole-bar rest")
+            length = _length(el) * (ratio or 1)
+            out.append((el, at, length))
+            at += length
+    return out
+
+
+def _spanner_ends(staff: etree._Element):
+    """Every tie or slur end in the staff's first voice: (location, measure, onset).
+
+    A `location` is relative: `measures` bars on and `fractions` along from the bar
+    position of the element it hangs off, which is what has to move when the notes
+    of a bar change length.
+    """
+    for mi, measure in enumerate(staff.findall("Measure")):
+        body = measure.find("voice") if measure.find("voice") is not None else measure
+        at = Fraction(0)
+        ratio = None
+        for el in body:
+            if el.tag == "Tuplet":
+                ratio = Fraction(2, 3)
+            elif el.tag == "endTuplet":
+                ratio = None
+            spanners = ([el] if el.tag == "Spanner" else
+                        list(el.iter("Spanner")) if el.tag in ("Chord", "Rest") else [])
+            for spanner in spanners:
+                for side in ("next", "prev"):
+                    location = spanner.find(f"{side}/location")
+                    if location is not None:
+                        yield location, mi, at
+            if el.tag in ("Chord", "Rest"):
+                at += _length(el) * (ratio or 1)
+
+
+def _relative(location: etree._Element):
+    measures = int((location.findtext("measures") or "0").strip() or 0)
+    fractions = Fraction((location.findtext("fractions") or "0").strip() or 0)
+    return measures, fractions
+
+
+def _set_fractions(location: etree._Element, value: Fraction) -> None:
+    node = location.find("fractions")
+    if value == 0:
+        if node is not None:
+            location.remove(node)
+        return
+    if node is None:
+        node = etree.SubElement(location, "fractions")
+    node.text = f"{value.numerator}/{value.denominator}"
+
+
+def _rewrite_rhythm(root: etree._Element, staff_id: int, measure_no: int,
+                    expect: List[str], values: List[str]) -> str:
+    """Give each Chord and Rest of a bar the length `values` names, in order."""
+    measure = _measure(root, staff_id, measure_no)
+    found = _bar_tokens(measure)
+    if found != list(expect):
+        raise FixError(f"bar reads {found} now, but the fix was recorded against {list(expect)}")
+    body = measure.find("voice") if measure.find("voice") is not None else measure
+    timeline = _timeline(body)
+    if len(timeline) != len(values):
+        raise FixError(f"the bar has {len(timeline)} notes and rests, the fix names "
+                       f"{len(values)} lengths")
+    for (el, _, _), value in zip(timeline, values):
+        kind = _parse_value(value)[0]
+        if (kind == "rest") != (el.tag == "Rest"):
+            raise FixError(f"{value!r} is a {kind}, but that is a {el.tag.lower()}")
+    total = sum((length for _, _, length in timeline), Fraction(0))
+    new_total = sum((value_length(v) for v in values), Fraction(0))
+    if new_total != total:
+        raise FixError(f"the new lengths add up to {new_total} of a whole note, the bar "
+                       f"to {total}")
+
+    # Where every note starts before and after, so ties and slurs can be moved.
+    onsets = {}
+    at = Fraction(0)
+    for (el, old, _), value in zip(timeline, values):
+        onsets[old] = at
+        at += value_length(value)
+    staff = measure.getparent()
+    measure_index = staff.findall("Measure").index(measure)
+    moves = []
+    for location, mi, own in list(_spanner_ends(staff)):
+        bars, along = _relative(location)
+        target_bar, target = mi + bars, own + along
+        new_own = onsets[own] if mi == measure_index and own in onsets else own
+        new_target = target
+        if target_bar == measure_index:
+            if target not in onsets:
+                raise FixError("a tie or slur ends inside a note of this bar")
+            new_target = onsets[target]
+        if mi == measure_index and own not in onsets:
+            raise FixError("a tie or slur starts inside a note of this bar")
+        if new_target - new_own != along:
+            moves.append((location, new_target - new_own))
+
+    # The old brackets and beams go; triplet brackets are written again around the
+    # new lengths, and beams are left to MuseScore.
+    for el in list(body):
+        if el.tag in ("Tuplet", "endTuplet", "Beam"):
+            body.remove(el)
+    groups = triplet_groups(values)
+    for (el, _, _), value in zip(timeline, values):
+        for mode in el.findall("BeamMode"):
+            el.remove(mode)
+        _, number, dots = _parse_value(value)
+        written = number * 2 // 3 if number % 3 == 0 else number
+        if written not in _TYPES:
+            raise FixError(f"cannot write {value!r}")
+        # Where the length was written, so the new one lands in MuseScore's own order.
+        olds = el.findall("dots") + el.findall("durationType")
+        position = min(el.index(old) for old in olds) if olds else 0
+        for old in olds:
+            el.remove(old)
+        head = etree.Element("durationType")
+        head.text = _TYPES[written]
+        el.insert(position, head)
+        if dots:
+            dot = etree.Element("dots")
+            dot.text = str(dots)
+            el.insert(position, dot)
+    for first, last in groups:
+        total = sum((value_length(v) for v in values[first:last + 1]), Fraction(0))
+        base = total / 2
+        if base.numerator != 1 or base.denominator not in _TYPES:
+            raise FixError("a triplet group of that length cannot be written")
+        tuplet = etree.Element("Tuplet")
+        etree.SubElement(tuplet, "normalNotes").text = "2"
+        etree.SubElement(tuplet, "actualNotes").text = "3"
+        etree.SubElement(tuplet, "baseNote").text = _TYPES[base.denominator]
+        number_el = etree.SubElement(tuplet, "Number")
+        etree.SubElement(number_el, "style").text = "Tuplet"
+        etree.SubElement(number_el, "text").text = "3"
+        start_el = timeline[first][0]
+        body.insert(body.index(start_el), tuplet)
+        timeline[last][0].addnext(etree.Element("endTuplet"))
+    for location, fractions in moves:
+        _set_fractions(location, fractions)
+    return f"set the lengths to {list(values)}" + _answered(_strike(root, staff_id, measure_no, _RHYTHM_WORDS))
+
+
+def _same_shape(timeline: List, to: List[Dict]) -> bool:
+    """Whether `to` is the bar's notes and rests in the same order, chord for chord."""
+    if len(timeline) != len(to):
+        return False
+    for (el, _, _), new in zip(timeline, to):
+        if (el.tag == "Rest") != (_parse_value(new["value"])[0] == "rest"):
+            return False
+        if el.tag == "Chord" and len(el.findall("Note")) != len(new.get("pitches") or []):
+            return False
+    return True
+
+
+def _set_pitches(chord: etree._Element, pitches: List[int], tpcs: List[int]) -> bool:
+    """Give a chord's notes these pitches, low to high. True when one moved."""
+    notes = sorted(chord.findall("Note"), key=lambda n: int(n.findtext("pitch") or 0))
+    moved = False
+    for note, (pitch, tpc) in zip(notes, sorted(zip(pitches, tpcs))):
+        moved = moved or int(note.findtext("pitch") or 0) != pitch
+        note.find("pitch").text = str(pitch)
+        for tag in ("tpc", "tpc2"):
+            node = note.find(tag)
+            if node is not None:
+                node.text = str(tpc)
+        if note.find("tpc") is None:
+            etree.SubElement(note, "tpc").text = str(tpc)
+        for color in note.findall("color"):
+            note.remove(color)
+    return moved
+
+
+def _tied_and_moving(timeline: List, to: List[Dict]) -> bool:
+    for (el, _, _), new in zip(timeline, to):
+        if el.tag != "Chord":
+            continue
+        notes = sorted(el.findall("Note"), key=lambda n: int(n.findtext("pitch") or 0))
+        for note, pitch in zip(notes, sorted(new.get("pitches") or [])):
+            if int(note.findtext("pitch") or 0) != pitch and \
+                    note.find("Spanner[@type='Tie']") is not None:
+                return True
+    return False
+
+
+def _write_moment(new: Dict) -> etree._Element:
+    kind, number, dots = _parse_value(new["value"])
+    written = number * 2 // 3 if number % 3 == 0 else number
+    if written not in _TYPES:
+        raise FixError(f"cannot write {new['value']!r}")
+    el = etree.Element("Rest" if kind == "rest" else "Chord")
+    if dots:
+        etree.SubElement(el, "dots").text = str(dots)
+    etree.SubElement(el, "durationType").text = _TYPES[written]
+    if kind == "note":
+        pitches, tpcs = new.get("pitches") or [], new.get("tpcs") or []
+        if not pitches or len(tpcs) != len(pitches):
+            raise FixError("a note needs its pitches and their spellings")
+        for pitch, tpc in sorted(zip(pitches, tpcs)):
+            note = etree.SubElement(el, "Note")
+            etree.SubElement(note, "pitch").text = str(int(pitch))
+            etree.SubElement(note, "tpc").text = str(int(tpc))
+    return el
+
+
+def _replace_bar(root: etree._Element, staff_id: int, measure_no: int,
+                 expect: List[str], to: List[Dict]) -> str:
+    """Put a whole bar of one voice as `to` says: lengths and pitches together."""
+    measure = _measure(root, staff_id, measure_no)
+    found = _bar_tokens(measure)
+    if found != list(expect):
+        raise FixError(f"bar reads {found} now, but the fix was recorded against {list(expect)}")
+    if not to:
+        raise FixError("the fix names no notes")
+    values = [new["value"] for new in to]
+    # Everything that can refuse does so before the bar is touched.
+    written = [_write_moment(new) for new in to]
+    groups = triplet_groups(values)
+    body = measure.find("voice") if measure.find("voice") is not None else measure
+    # A gap (`location`) cleaning left in the voice -- a step back that squeezed it
+    # into a short bar, or the room a note it cut away stood in -- is no reading of
+    # the page, so a bar written afresh takes it out (#344). The new bar must then
+    # fill the bar's own length, since the voice's notes no longer say what that is.
+    gaps = [el for el in body if el.tag == "location"]
+    moments = [el for el in body if el.tag in ("Chord", "Rest")]
+    # A bar holding only a whole-bar rest -- the bar an `insbar` put in (#346) -- is
+    # written afresh to its own length.
+    empty = (len(moments) == 1 and not gaps
+             and (moments[0].findtext("durationType") or "").strip() == "measure")
+    timeline = [] if empty else _timeline([el for el in body if el.tag != "location"])
+    new_total = sum((value_length(v) for v in values), Fraction(0))
+    from .rejected_bars import _bar_lengths  # noqa: PLC0415 - a cycle
+    staff = measure.getparent()
+    bar_length = _bar_lengths(staff)[staff.findall("Measure").index(measure)]
+    voice_total = sum((length for _, _, length in timeline), Fraction(0))
+    # The bar's own length (its time signature, unless it carries a length of its
+    # own) is always a reading of the page, and the voice's length is too unless the
+    # scan made it wrong: false triplets left Lasinkuultava laulu's T1 bar 9 7/6 long
+    # in 4/4, which no writable lengths add up to (#350). A gap or an empty bar
+    # leaves only the bar's own length to fill.
+    strict = bool(gaps) or empty
+    if new_total != bar_length and (strict or new_total != voice_total):
+        if strict or voice_total == bar_length:
+            raise FixError(f"the new bar adds up to {new_total} of a whole note, the bar "
+                           f"to {bar_length}")
+        raise FixError(f"the new bar adds up to {new_total} of a whole note, the voice "
+                       f"to {voice_total} and the bar to {bar_length}")
+    for gap in gaps:
+        body.remove(gap)
+    if (not strict and new_total == voice_total and _same_shape(timeline, to)
+            and not _tied_and_moving(timeline, to)):
+        said = _rewrite_rhythm(root, staff_id, measure_no, expect, values)
+        for (el, _, _), new in zip(timeline, to):
+            if el.tag == "Chord":
+                _set_pitches(el, new.get("pitches") or [], new.get("tpcs") or [])
+        said = said.replace("set the lengths to", "set the bar to").split(" and took ")[0]
+        return (f"{said} {_bar_tokens(measure)}"
+                + _answered(_strike(root, staff_id, measure_no, _BAR_WORDS)))
+
+    from .rejected_bars import _bar_lengths, _cut_spanners_into  # noqa: PLC0415 - a cycle
+
+    staff = measure.getparent()
+    measures = staff.findall("Measure")
+    lengths = _bar_lengths(staff)
+    words = [chord.find("Lyrics") for chord, _, _ in timeline if chord.tag == "Chord"]
+    words = [w for w in words if w is not None]
+    first = moments[0] if empty else timeline[0][0]
+    at = list(body).index(first)
+    gone = ("Chord", "Rest", "Tuplet", "endTuplet", "Beam", "Spanner")
+    for el in list(body):
+        # A volta bracket belongs to the bar, not to its notes: it stays, either half
+        # (an `insbar` bar can carry a bracket's end marker, #346).
+        if el.tag in gone and not (el.tag == "Spanner" and el.get("type") == "Volta"):
+            if list(body).index(el) < at:
+                at -= 1
+            body.remove(el)
+    for offset, el in enumerate(written):
+        body.insert(at + offset, el)
+    for first_i, last_i in groups:
+        length = sum((value_length(v) for v in values[first_i:last_i + 1]), Fraction(0))
+        base = length / 2
+        if base.numerator != 1 or base.denominator not in _TYPES:
+            raise FixError("a triplet group of that length cannot be written")
+        tuplet = etree.Element("Tuplet")
+        etree.SubElement(tuplet, "normalNotes").text = "2"
+        etree.SubElement(tuplet, "actualNotes").text = "3"
+        etree.SubElement(tuplet, "baseNote").text = _TYPES[base.denominator]
+        number_el = etree.SubElement(tuplet, "Number")
+        etree.SubElement(number_el, "style").text = "Tuplet"
+        etree.SubElement(number_el, "text").text = "3"
+        written[first_i].addprevious(tuplet)
+        written[last_i].addnext(etree.Element("endTuplet"))
+    chords = [el for el in written if el.tag == "Chord"]
+    for chord, lyric in zip(chords, words):
+        chord.insert(list(chord).index(chord.find("Note")), lyric)
+    _cut_spanners_into(measures, lengths, measures.index(measure), keep=("Volta",))
+    return (f"wrote the bar afresh as {_bar_tokens(measure)}"
+            + _answered(_strike(root, staff_id, measure_no, _BAR_WORDS)))
 
 
 # Reading a bar back out, so a fix can be *picked* rather than typed. The indexing
@@ -255,20 +1694,59 @@ def note_name(pitch: int, tpc: Optional[int] = None) -> str:
     return f"{letter}{_ACCIDENTALS.get(alter, '')}{octave}"
 
 
+def bar_tokens(root: etree._Element, staff_id: int, measure_no: int) -> List[str]:
+    """The bar as a fix's `from` reads it: every chord and rest, and tuplet brackets."""
+    return _bar_tokens(_measure(root, staff_id, measure_no))
+
+
+def bar_items(root: etree._Element, staff_id: int, measure_no: int) -> List[Dict]:
+    """The bar's `from` tokens, each with the chord `index` a fix would use for it.
+
+    `index` is None for a rest or a tuplet bracket, because a fix's `index` counts
+    chords only while `from` lists everything — the mismatch agents kept tripping on
+    (#357). Read in the same pass as `bar_tokens`, so the two lists line up exactly.
+    """
+    measure = _measure(root, staff_id, measure_no)
+    body = measure.find("voice") if measure.find("voice") is not None else measure
+    out: List[Dict] = []
+    chord = 0
+    for el in body:
+        if el.tag == "Chord":
+            out.append({"token": _token(el), "index": chord})
+            chord += 1
+        elif el.tag == "Rest":
+            out.append({"token": _token(el), "index": None})
+        elif el.tag in _MARKERS:
+            out.append({"token": _MARKERS[el.tag], "index": None})
+    return out
+
+
+def _has_end(note: etree._Element, side: str) -> bool:
+    return any(t.find(side) is not None for t in note.findall("Spanner[@type='Tie']"))
+
+
 def read_bar(root: etree._Element, staff_id: int, measure_no: int) -> List[Dict]:
     """One bar's chords, in the numbering a recorded fix uses. Rests are not chords.
 
     `index` is what an `undot` or `slur` entry means by `index`, and `token` is the
     same word that entry's `from` list would carry, so what is shown and what is
-    recorded cannot drift apart. `starts_slur` says a slur already begins there,
-    which is the one thing a caller has to check before offering to add another.
+    recorded cannot drift apart; `at` is where that token stands in `from`, rests and
+    brackets counted. `starts_slur` says a slur already begins there, which is the one
+    thing a caller has to check before offering to add another, and `ends_slur` that
+    one ends there. `pitches` names each note with its MIDI pitch — what a `tie` or
+    `untie` entry calls `pitch` — and whether a tie already leaves it or reaches it,
+    since a tie recorded twice is refused and one that was never there cannot be
+    taken out (#357). `marks` lists what a `delete` entry could take off the chord
+    (#352), and is left out when there is nothing.
 
     Raises `FixError` for a staff or measure that is not there, so a caller asking
     about a bar out of range gets the same answer as a fix recorded against one.
     """
+    items = bar_items(root, staff_id, measure_no)
+    at = {item["index"]: n for n, item in enumerate(items) if item["index"] is not None}
     out: List[Dict] = []
     for index, chord in enumerate(_chords(root, staff_id, measure_no)):
-        notes = []
+        notes, pitches = [], []
         for note in chord.findall("Note"):
             try:
                 pitch = int((note.findtext("pitch") or "").strip())
@@ -279,14 +1757,608 @@ def read_bar(root: etree._Element, staff_id: int, measure_no: int) -> List[Dict]
             except ValueError:
                 tpc = None
             notes.append(note_name(pitch, tpc))
+            pitches.append({"pitch": pitch, "name": notes[-1],
+                            "tied_to_next": _has_end(note, "next"),
+                            "tied_from_prev": _has_end(note, "prev")})
+        slurs = chord.findall(".//Spanner[@type='Slur']")
         out.append({
             "index": index,
+            "at": at[index],
             "token": _token(chord),
             "name": "+".join(notes) if notes else "?",
-            "starts_slur": any(sp.find(".//next") is not None
-                               for sp in chord.findall(".//Spanner[@type='Slur']")),
+            "pitches": pitches,
+            "starts_slur": any(sp.find(".//next") is not None for sp in slurs),
+            "ends_slur": any(sp.find(".//prev") is not None for sp in slurs),
         })
+        marks = chord_marks(chord)
+        if marks:
+            out[-1]["marks"] = marks
     return out
+
+
+def _start_repeat(root: etree._Element, measure_no: int) -> str:
+    """Put a start-repeat sign on bar ``measure_no`` of every staff."""
+    staves = [s for s in root.findall(".//Score/Staff") if s.find("Measure") is not None]
+    if not staves:
+        raise FixError("the score has no staves")
+    bars = []
+    for staff in staves:
+        measures = staff.findall("Measure")
+        if measure_no < 1 or measure_no > len(measures):
+            raise FixError(f"staff {staff.get('id')} has no measure {measure_no}")
+        bar = measures[measure_no - 1]
+        if bar.find("startRepeat") is not None:
+            raise FixError("a repeat already starts here")
+        bars.append(bar)
+    for bar in bars:
+        # MuseScore writes it ahead of the bar's voices, after any `irregular`.
+        at = 0
+        for index, child in enumerate(bar):
+            if child.tag in ("irregular", "breakMultiMeasureRest"):
+                at = index + 1
+        bar.insert(at, etree.Element("startRepeat"))
+    return f"repeat starts here on all {len(bars)} staves"
+
+
+def volta_spans(staff: etree._Element) -> List[Tuple[int, int]]:
+    """Each volta on a staff as ``(first bar, last bar)``, bars numbered from 1."""
+    spans = []
+    for number, measure in enumerate(staff.findall("Measure"), start=1):
+        for spanner in measure.iter("Spanner"):
+            if spanner.get("type") != "Volta" or spanner.find("Volta") is None:
+                continue
+            length = int(spanner.findtext("next/location/measures") or 0)
+            # A bracket that closes the score ends a bar's length into its last bar.
+            if (spanner.findtext("next/location/fractions") or "").strip() not in ("", "0"):
+                length += 1
+            spans.append((number, number + max(length, 1) - 1))
+    return spans
+
+
+def _volta_spanner(volta: Optional[Dict[str, str]], step: int) -> etree._Element:
+    """One end of a volta: the start carries the bracket, the end only points back."""
+    spanner = etree.Element("Spanner", type="Volta")
+    if volta is not None:
+        body = etree.SubElement(spanner, "Volta")
+        for tag, text in volta.items():
+            etree.SubElement(body, tag).text = text
+    link = etree.SubElement(spanner, "next" if volta is not None else "prev")
+    etree.SubElement(etree.SubElement(link, "location"), "measures").text = str(step)
+    return spanner
+
+
+def _add_volta(root: etree._Element, measure_no: int, bars: int, second: int = 1) -> str:
+    """Put "1." over ``bars`` bars ending at ``measure_no`` and "2." over the
+    ``second`` bars after it."""
+    staff = next((s for s in root.findall(".//Score/Staff") if s.find("Measure") is not None),
+                 None)
+    if staff is None:
+        raise FixError("the score has no staves")
+    measures = staff.findall("Measure")
+    first = measure_no - bars + 1
+    if bars < 1 or first < 1:
+        raise FixError(f"a 1. bracket of {bars} bar(s) cannot end at bar {measure_no}")
+    if second < 1:
+        raise FixError(f"a 2. bracket of {second} bar(s) cannot be drawn")
+    last = measure_no + second  # the 2. bracket's last bar, 1-based
+    if last > len(measures):
+        raise FixError("the 2. bracket needs a bar after it to close on"
+                       if second == 1 else
+                       f"the score has no bar {last} for a 2. bracket of {second} bars")
+    if measures[measure_no - 1].find("endRepeat") is None:
+        raise FixError("no repeat ends here")
+    taken = [(a, b) for a, b in volta_spans(staff) if a <= last and b >= first]
+    if taken:
+        raise FixError(f"bars {taken[0][0]}-{taken[0][1]} already have a bracket")
+
+    def at_head(bar: etree._Element, *spanners: etree._Element) -> None:
+        voice = bar.find("voice")
+        if voice is None:
+            voice = etree.SubElement(bar, "voice")
+        # After the spanners already there, so an end still comes before a start.
+        at = 0
+        for index, child in enumerate(voice):
+            if child.tag == "Spanner":
+                at = index + 1
+            else:
+                break
+        for offset, spanner in enumerate(spanners):
+            voice.insert(at + offset, spanner)
+
+    at_head(measures[first - 1], _volta_spanner(
+        {"endHookType": "1", "beginText": "1.", "endings": "1"}, bars))
+    two = _volta_spanner({"beginText": "2.", "endings": "2"}, second)
+    at_head(measures[measure_no], _volta_spanner(None, -bars), two)
+    if last < len(measures):
+        at_head(measures[last], _volta_spanner(None, -second))
+    else:
+        # Nothing after the last bar to hold the end, so it stands at the end of the
+        # last bar, a bar's length on -- the way MuseScore writes a bracket that
+        # closes the score.
+        end_bar = measures[last - 1]
+        length = (_parse_len(end_bar.get("len")) if end_bar.get("len")
+                  else _meter(staff, last - 1))
+        steps = second - 1
+        fraction = f"{length.numerator}/{length.denominator}"
+        location = two.find("next/location")
+        if steps == 0:
+            location.remove(location.find("measures"))
+        else:
+            location.find("measures").text = str(steps)
+        etree.SubElement(location, "fractions").text = fraction
+        end = _volta_spanner(None, -steps)
+        location = end.find("prev/location")
+        if steps == 0:
+            location.remove(location.find("measures"))
+        else:
+            location.find("measures").text = str(-steps)
+        etree.SubElement(location, "fractions").text = "-" + fraction
+        voice = end_bar.find("voice")
+        if voice is None:
+            voice = etree.SubElement(end_bar, "voice")
+        voice.append(end)
+    span = f"bar {first}" if bars == 1 else f"bars {first}-{measure_no}"
+    two_span = f"bar {last}" if second == 1 else f"bars {measure_no + 1}-{last}"
+    return f"1. over {span}, 2. over {two_span}"
+
+
+def _parse_len(text: str) -> Fraction:
+    n, d = (int(part) for part in text.split("/"))
+    return Fraction(n, d)
+
+
+def _all_staves(root: etree._Element) -> List[etree._Element]:
+    staves = [s for s in root.findall(".//Score/Staff") if s.find("Measure") is not None]
+    if not staves:
+        raise FixError("the score has no staves")
+    return staves
+
+
+def _remove_repeat(root: etree._Element, measure_no: int, which: str) -> str:
+    """Take the start or end repeat sign off bar ``measure_no`` on every staff."""
+    tags = {"end": "endRepeat", "start": "startRepeat"}
+    if which not in tags:
+        raise FixError(f"'which' is {which!r}; say \"end\" or \"start\"")
+    found = []
+    for staff in _all_staves(root):
+        measures = staff.findall("Measure")
+        if not 1 <= measure_no <= len(measures):
+            raise FixError(f"staff {staff.get('id')} has no measure {measure_no}")
+        found += measures[measure_no - 1].findall(tags[which])
+    if not found:
+        raise FixError(f"no repeat {which}s in this bar")
+    for sign in found:
+        sign.getparent().remove(sign)
+    return f"{which} repeat sign taken off {len(found)} staves"
+
+
+def _volta_label(spanner: etree._Element) -> str:
+    return (spanner.findtext("Volta/beginText") or "").strip().rstrip(".")
+
+
+def _remove_volta(root: etree._Element, measure_no: int, label: Optional[str]) -> str:
+    """Take the volta brackets that start in bar ``measure_no`` out, both halves, on
+    every staff. ``label`` ("1", "2.") narrows it to brackets reading that."""
+    want = None if label is None else str(label).strip().rstrip(".")
+    doomed = []
+    for staff in _all_staves(root):
+        measures = staff.findall("Measure")
+        if not 1 <= measure_no <= len(measures):
+            raise FixError(f"staff {staff.get('id')} has no measure {measure_no}")
+        claimed = set()
+        for spanner in measures[measure_no - 1].iter("Spanner"):
+            if (spanner.get("type") != "Volta" or spanner.find("Volta") is None
+                    or spanner.find("next") is None):
+                continue
+            if want is not None and _volta_label(spanner) != want:
+                continue
+            span = int((spanner.findtext("next/location/measures") or "0").strip() or 0)
+            doomed.append(spanner)
+            end = measure_no - 1 + span
+            if end >= len(measures):
+                continue
+            partner = next(
+                (sp for sp in measures[end].iter("Spanner")
+                 if sp.get("type") == "Volta" and id(sp) not in claimed
+                 and sp.find("prev") is not None
+                 and int((sp.findtext("prev/location/measures") or "0").strip() or 0)
+                 == -span),
+                None)
+            if partner is not None:
+                claimed.add(id(partner))
+                doomed.append(partner)
+    starts = sum(1 for sp in doomed if sp.find("Volta") is not None)
+    if not starts:
+        named = "" if want is None else f" reading {want}."
+        raise FixError(f"no volta bracket{named} starts in this bar")
+    for spanner in doomed:
+        spanner.getparent().remove(spanner)
+    return f"{starts} volta bracket(s) taken out, both halves"
+
+
+def _set_bar_length(root: etree._Element, measure_no: int, expect, to) -> str:
+    """Give a bar every staff rests through another length: a rest of that length.
+
+    Only silence: a bar with a note in it on any staff refuses, because changing the
+    length of music is what `duration` and `bar` are for. The length is written the
+    way the scan writes one that differs from the time signature (``len``), and the
+    ``len`` goes when the new length is the meter in force.
+    """
+    staves = _all_staves(root)
+    if not expect:
+        raise FixError("give the bar's 'from', so a bar with music in it is never emptied")
+    n, d = _parse_meter(to, "to")
+    length = Fraction(n, d)
+    per_staff = _from_per_staff(expect, staves)
+    bars = []
+    for staff, want in zip(staves, per_staff):
+        measures = staff.findall("Measure")
+        if not 1 <= measure_no <= len(measures):
+            raise FixError(f"staff {staff.get('id')} has no measure {measure_no}")
+        bar = measures[measure_no - 1]
+        found = _bar_tokens(bar)
+        if found != want:
+            raise FixError(f"staff {staff.get('id')} reads {found} now, but the fix was "
+                           f"recorded against {want}")
+        if bar.find(".//Chord") is not None or bar.find(".//Tuplet") is not None:
+            raise FixError(f"staff {staff.get('id')} has music in this bar; only a bar "
+                           "every staff rests through can change length")
+        bars.append((staff, bar))
+    for staff, bar in bars:
+        if length == _meter(staff, measure_no - 1):
+            bar.attrib.pop("len", None)
+        else:
+            bar.set("len", f"{n}/{d}")
+        voices = bar.findall("voice")
+        for voice in voices[1:]:
+            for rest in voice.findall("Rest"):
+                voice.remove(rest)
+        voice = voices[0] if voices else etree.SubElement(bar, "voice")
+        rests = voice.findall("Rest")
+        at = voice.index(rests[0]) if rests else len(voice)
+        for rest in rests:
+            voice.remove(rest)
+        rest = etree.Element("Rest")
+        etree.SubElement(rest, "durationType").text = "measure"
+        etree.SubElement(rest, "duration").text = f"{n}/{d}"
+        voice.insert(at, rest)
+    return f"bar is {n}/{d} long on all {len(bars)} staves"
+
+
+def bar_moves(fixes: List[Dict]) -> List[Tuple[str, int]]:
+    """The bars ``delbar`` takes out and ``insbar`` puts in, in file order.
+
+    Each is ``("del", bar)`` or ``("ins", after bar)``, in the numbering in force
+    where the entry stands in the file.
+    """
+    return [("del" if fix["kind"] == "delbar" else "ins", int(fix.get("measure", 0)))
+            for fix in fixes
+            if isinstance(fix, dict) and fix.get("kind") in ("delbar", "insbar")]
+
+
+def after_moves(measure: int, moves: List[Tuple[str, int]]) -> Optional[int]:
+    """Bar ``measure`` of the score before ``moves`` as numbered after them.
+
+    ``None`` when that bar is one a ``delbar`` takes out.
+    """
+    for kind, at in moves:
+        if kind == "del":
+            if measure == at:
+                return None
+            if measure > at:
+                measure -= 1
+        elif measure > at:
+            measure += 1
+    return measure
+
+
+def before_moves(measure: int, moves: List[Tuple[str, int]]) -> Optional[int]:
+    """`after_moves` the other way. ``None`` for a bar an ``insbar`` put in."""
+    for kind, at in reversed(moves):
+        if kind == "del":
+            if measure >= at:
+                measure += 1
+        else:
+            if measure == at + 1:
+                return None
+            if measure > at + 1:
+                measure -= 1
+    return measure
+
+
+def _renumber_meta(root: etree._Element, measure_no: int, inserted: bool = False) -> None:
+    """Move every bar number the score keeps in a metaTag past a deleted bar
+    ``measure_no``, or a bar inserted after it.
+
+    The per-system lyric map's bar ranges (an inserted bar joins the system of the
+    bar before it), and where each slur cleaning removed stood (`removedSlurs`, which
+    the Fix panel's slur questions read): a record with a half in a deleted bar goes,
+    since that note went with it.
+    """
+    import json  # noqa: PLC0415 - only these metaTags are JSON
+    step = 1 if inserted else -1
+
+    def moved(bar):
+        return bar + step if isinstance(bar, int) and bar > measure_no else bar
+
+    score = root.find(".//Score") if root.tag != "Score" else root
+    for meta in score.findall("metaTag") if score is not None else []:
+        name = meta.get("name")
+        if name not in ("lyricsSystemMap", "removedSlurs") or not (meta.text or "").strip():
+            continue
+        try:
+            entries = json.loads(meta.text)
+        except ValueError:
+            continue
+        kept = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                kept.append(entry)
+            elif name == "lyricsSystemMap":
+                start, end = int(entry["start"]), int(entry["end"])
+                entry["start"] = start + step if start > measure_no else start
+                entry["end"] = end + step if end >= measure_no else end
+                if entry["start"] <= entry["end"]:
+                    kept.append(entry)
+            elif inserted or measure_no not in (entry.get("measure"), entry.get("end_measure")):
+                entry["measure"] = moved(entry.get("measure"))
+                entry["end_measure"] = moved(entry.get("end_measure"))
+                kept.append(entry)
+        meta.text = json.dumps(kept, separators=(",", ":"), ensure_ascii=False)
+
+
+def _from_per_staff(expect, staves) -> List[List[str]]:
+    """A bar-level `from`: one token list for every staff, or one list per staff."""
+    per_staff = (list(expect) if all(isinstance(e, list) for e in expect)
+                 else [list(expect)] * len(staves))
+    if len(per_staff) != len(staves):
+        raise FixError(f"'from' names {len(per_staff)} staves, the score has {len(staves)}")
+    return per_staff
+
+
+def _insert_bar(root: etree._Element, after: int, expect) -> str:
+    """Put an empty bar after bar ``after`` on every staff; the bars after move down one.
+
+    The new bar is a whole-bar rest in the meter in force, for `bar` fixes to fill.
+    A slur or volta reaching across the barline is lengthened by one, both halves; a
+    volta that ends on that barline keeps its length (its end marker moves into the
+    new bar). A tie across it refuses: a tie cannot jump a bar.
+    """
+    staves = [s for s in root.findall(".//Score/Staff") if s.find("Measure") is not None]
+    if not staves:
+        raise FixError("the score has no staves")
+    if not expect:
+        raise FixError("give the 'from' of the bar it goes after, so a re-read that "
+                       "found the missing barline does not get a second bar")
+    per_staff = _from_per_staff(expect, staves)
+    m = after  # 0-based index of the new bar
+    for staff, want in zip(staves, per_staff):
+        measures = staff.findall("Measure")
+        if not 1 <= after <= len(measures):
+            raise FixError(f"staff {staff.get('id')} has no measure {after}")
+        found = _bar_tokens(measures[after - 1])
+        if found != want:
+            raise FixError(f"staff {staff.get('id')} bar {after} reads {found} now, but the "
+                           f"fix was recorded against {want}")
+    lengthen = []  # (step, partner end marker or None, span)
+    carry = []     # (volta end marker, the new bar's staff index)
+    for n, staff in enumerate(staves):
+        measures = staff.findall("Measure")
+        claimed = set()
+        for i, measure in enumerate(measures):
+            for spanner in measure.iter("Spanner"):
+                if spanner.find("next") is None:
+                    continue
+                kind = spanner.get("type")
+                step = spanner.find("next/location/measures")
+                span = int((step.text if step is not None else "0") or 0)
+                end = i + span
+                if not (i < m <= end):
+                    continue
+                partner = next(
+                    (sp for sp in measures[end].iter("Spanner")
+                     if sp.get("type") == kind and id(sp) not in claimed
+                     and sp.find("prev") is not None
+                     and (sp.findtext("prev/location/measures") or "0").strip() == str(-span)),
+                    None)
+                if partner is not None:
+                    claimed.add(id(partner))
+                if kind == "Volta" and end == m:
+                    if partner is not None:
+                        carry.append((partner, n))
+                    continue
+                if kind == "Tie":
+                    raise FixError(f"a tie from bar {i + 1} to bar {end + 1} on staff "
+                                   f"{staff.get('id')} crosses this barline")
+                lengthen.append((step, partner, span))
+    for step, partner, span in lengthen:
+        step.text = str(span + 1)
+        if partner is not None:
+            partner.find("prev/location/measures").text = str(-(span + 1))
+    for n, staff in enumerate(staves):
+        # The signature as written (4/4, not 1/1), as MuseScore writes a bar rest.
+        meter = "4/4"
+        for measure in staff.findall("Measure")[:after]:
+            ts = measure.find(".//TimeSig")
+            if ts is not None and ts.findtext("sigN") and ts.findtext("sigD"):
+                meter = f"{ts.findtext('sigN').strip()}/{ts.findtext('sigD').strip()}"
+        bar = etree.Element("Measure")
+        voice = etree.SubElement(bar, "voice")
+        rest = etree.SubElement(voice, "Rest")
+        etree.SubElement(rest, "durationType").text = "measure"
+        etree.SubElement(rest, "duration").text = meter
+        staff.findall("Measure")[after - 1].addnext(bar)
+        for marker, at in carry:
+            if at == n:
+                voice.insert(0, marker)
+    _renumber_meta(root, after, inserted=True)
+    said = f"empty bar put in after bar {after} on all {len(staves)} staves"
+    if lengthen:
+        said += f"; {len(lengthen)} spanner(s) across the barline lengthened"
+    return said
+
+
+def _delete_bar(root: etree._Element, measure_no: int, expect) -> str:
+    """Take bar ``measure_no`` out of every staff, and the bars after it move up one.
+
+    Spanners reaching across the bar (a volta, a slur, a tie over an empty bar) are
+    shortened by one bar, both halves; a volta that ends on the barline before it
+    keeps its length. One that starts or ends inside the bar, a volta starting in
+    it, a repeat sign, or a clef, key or meter change in it refuses: each says the bar is
+    part of the music, which a bar the scan invented is not.
+    """
+    staves = [s for s in root.findall(".//Score/Staff") if s.find("Measure") is not None]
+    if not staves:
+        raise FixError("the score has no staves")
+    if not expect:
+        raise FixError("give the bar's 'from', so a bar that is really there is never deleted")
+    per_staff = _from_per_staff(expect, staves)
+    d = measure_no - 1
+    for staff, want in zip(staves, per_staff):
+        measures = staff.findall("Measure")
+        if not 0 <= d < len(measures):
+            raise FixError(f"staff {staff.get('id')} has no measure {measure_no}")
+        if len(measures) < 2:
+            raise FixError("it is the only bar")
+        bar = measures[d]
+        found = _bar_tokens(bar)
+        if found != want:
+            raise FixError(f"staff {staff.get('id')} reads {found} now, but the fix was "
+                           f"recorded against {want}")
+        for tag, what in (("startRepeat", "a repeat starts"), ("endRepeat", "a repeat ends"),
+                          ("Clef", "the clef changes"), ("KeySig", "the key changes"),
+                          ("TimeSig", "the meter changes")):
+            if bar.find(f".//{tag}") is not None:
+                raise FixError(f"{what} in this bar on staff {staff.get('id')}")
+    # Look first, change after: a refusal on the last staff must not leave the
+    # first ones half edited.
+    shorten = []  # (step, partner end marker or None, span)
+    carry = []    # (volta end marker, the bar after the deleted one)
+    for staff in staves:
+        measures = staff.findall("Measure")
+        claimed = set()
+        for i, measure in enumerate(measures):
+            for spanner in measure.iter("Spanner"):
+                if spanner.find("next") is None:
+                    continue
+                kind = spanner.get("type")
+                step = spanner.find("next/location/measures")
+                span = int((step.text if step is not None else "0") or 0)
+                end = i + span
+                where = f"on staff {staff.get('id')}"
+                if kind == "Volta" and i == d:
+                    raise FixError(f"a volta bracket starts in this bar {where}")
+                if end < d or i > d or (i == d and end == d):
+                    continue
+                partner = next(
+                    (sp for sp in measures[end].iter("Spanner")
+                     if sp.get("type") == kind and id(sp) not in claimed
+                     and sp.find("prev") is not None
+                     and (sp.findtext("prev/location/measures") or "0").strip() == str(-span)),
+                    None)
+                if partner is not None:
+                    claimed.add(id(partner))
+                if kind == "Volta" and end == d:
+                    # A bracket's end marker stands in the bar after its last bar, so
+                    # this one ends on the barline before the deleted bar: its marker
+                    # moves on into the bar that takes the deleted one's place.
+                    if partner is None or d + 1 >= len(measures):
+                        raise FixError(f"the volta over bars {i + 1}-{end} {where} has no "
+                                       "bar after this one to end on")
+                    carry.append((partner, measures[d + 1]))
+                    continue
+                if i == d or end == d:
+                    raise FixError(f"a {kind} from bar {i + 1} to bar {end + 1} {where} "
+                                   "starts or ends in this bar")
+                shorten.append((step, partner, span))
+    for step, partner, span in shorten:
+        step.text = str(span - 1)
+        if partner is not None:
+            partner.find("prev/location/measures").text = str(-(span - 1))
+    for marker, bar in carry:
+        voice = bar.find("voice")
+        if voice is None:
+            voice = etree.SubElement(bar, "voice")
+        voice.insert(0, marker)  # an end before any start in the bar
+    shortened = len(shorten)
+    for staff in staves:
+        measures = staff.findall("Measure")
+        bar = measures[d]
+        # A system break on an invented bar belongs to the bar the page ends its line on.
+        for brk in bar.findall("LayoutBreak"):
+            before = measures[d - 1] if d > 0 else None
+            if before is not None and before.find("LayoutBreak") is None:
+                before.append(brk)
+        staff.remove(bar)
+    _renumber_meta(root, measure_no)
+    said = f"bar deleted from all {len(staves)} staves, later bars move up one"
+    if shortened:
+        said += f"; {shortened} spanner(s) across it shortened"
+    return said
+
+
+def _parse_meter(text, what: str) -> Tuple[int, int]:
+    try:
+        n, d = (int(part) for part in str(text).split("/"))
+    except ValueError:
+        raise FixError(f"{what} {text!r} is not a time signature like 3/4") from None
+    if n < 1 or d < 1:
+        raise FixError(f"{what} {text!r} is not a time signature like 3/4")
+    return n, d
+
+
+def _set_timesig(root: etree._Element, measure_no: int, expect, to) -> str:
+    """Take the time signature off bar ``measure_no`` of every staff, or replace it.
+
+    Only where the bar keeps its length (see the module notes): the bars the
+    signature governs are not touched, so a change of length would leave them all
+    contradicting their meter.
+    """
+    staves = [s for s in root.findall(".//Score/Staff") if s.find("Measure") is not None]
+    if not staves:
+        raise FixError("the score has no staves")
+    if not expect:
+        raise FixError("give the signature's 'from', so one the page prints is never removed")
+    was_n, was_d = _parse_meter(expect, "from")
+    if measure_no == 1:
+        raise FixError("bar 1 carries the opening time signature")
+    signs = []
+    for staff in staves:
+        measures = staff.findall("Measure")
+        if not 1 <= measure_no <= len(measures):
+            raise FixError(f"staff {staff.get('id')} has no measure {measure_no}")
+        found = measures[measure_no - 1].findall(".//TimeSig")
+        if len(found) != 1:
+            raise FixError(f"staff {staff.get('id')} carries {len(found)} time signatures "
+                           f"in this bar, not one")
+        ts = found[0]
+        reads = f"{ts.findtext('sigN')}/{ts.findtext('sigD')}"
+        if reads != f"{was_n}/{was_d}":
+            raise FixError(f"staff {staff.get('id')} reads {reads} now, but the fix was "
+                           f"recorded against {was_n}/{was_d}")
+        signs.append(ts)
+    if to is None:
+        new = None
+        length = _meter(staves[0], measure_no - 2)
+    else:
+        new = _parse_meter(to, "to")
+        length = Fraction(*new)
+    if length != Fraction(was_n, was_d):
+        then = (f"{to}" if to is not None else f"the meter in force, {length},")
+        raise FixError(f"{was_n}/{was_d} and {then} give bars of different lengths; "
+                       f"this fix only changes how a bar of the same length is written")
+    for ts in signs:
+        if new is None:
+            ts.getparent().remove(ts)
+            continue
+        ts.find("sigN").text, ts.find("sigD").text = str(new[0]), str(new[1])
+        # Beaming groups and a common/cut subtype belong to the old meter.
+        for tag in ("subtype", "groups"):
+            for el in ts.findall(tag):
+                ts.remove(el)
+    if new is None:
+        return f"took the {was_n}/{was_d} time signature off on all {len(signs)} staves"
+    return f"{was_n}/{was_d} became {new[0]}/{new[1]} on all {len(signs)} staves"
 
 
 def free_text(fixes: List[Dict]) -> List[str]:
@@ -321,18 +2393,107 @@ def apply_fixes(root: etree._Element, fixes: List[Dict]) -> List[str]:
         kind = fix.get("kind")
         if kind == "text":
             continue
+        if kind == "repeat":
+            measure = int(fix["measure"])
+            try:
+                what = _start_repeat(root, measure)
+            except FixError as exc:
+                raise FixError(f"m{measure} (repeat): {exc}") from None
+            done.append(f"m{measure}: {what} — {fix.get('why', 'no reason recorded')}")
+            continue
+        if kind == "insbar":
+            measure = int(fix["measure"])
+            try:
+                what = _insert_bar(root, measure, fix.get("from"))
+            except FixError as exc:
+                raise FixError(f"m{measure} (insbar): {exc}") from None
+            done.append(f"m{measure}: {what} — {fix.get('why', 'no reason recorded')}")
+            continue
+        if kind == "delbar":
+            measure = int(fix["measure"])
+            try:
+                what = _delete_bar(root, measure, fix.get("from"))
+            except FixError as exc:
+                raise FixError(f"m{measure} (delbar): {exc}") from None
+            done.append(f"m{measure}: {what} — {fix.get('why', 'no reason recorded')}")
+            continue
+        if kind == "timesig":
+            measure = int(fix["measure"])
+            try:
+                what = _set_timesig(root, measure, fix.get("from"), fix.get("to"))
+            except FixError as exc:
+                raise FixError(f"m{measure} (timesig): {exc}") from None
+            done.append(f"m{measure}: {what} — {fix.get('why', 'no reason recorded')}")
+            continue
+        if kind == "volta":
+            measure = int(fix["measure"])
+            try:
+                what = _add_volta(root, measure, int(fix["bars"]), int(fix.get("second", 1)))
+            except FixError as exc:
+                raise FixError(f"m{measure} (volta): {exc}") from None
+            done.append(f"m{measure}: {what} — {fix.get('why', 'no reason recorded')}")
+            continue
+        if kind in ("unrepeat", "unvolta", "barlen"):
+            measure = int(fix["measure"])
+            try:
+                if kind == "unrepeat":
+                    what = _remove_repeat(root, measure, str(fix.get("which", "")))
+                elif kind == "unvolta":
+                    what = _remove_volta(root, measure, fix.get("text"))
+                else:
+                    what = _set_bar_length(root, measure, fix.get("from"), fix.get("to"))
+            except FixError as exc:
+                raise FixError(f"m{measure} ({kind}): {exc}") from None
+            done.append(f"m{measure}: {what} — {fix.get('why', 'no reason recorded')}")
+            continue
         staff, measure = int(fix["staff"]), int(fix["measure"])
         try:
             if kind == "append":
                 # No chord index: a bar this fix repairs may have no chords at all yet.
                 what = _append_bar(_measure(root, staff, measure), fix.get("from", []),
                                    fix.get("add", []), int(fix.get("drop", 0)))
+            elif kind == "rhythm":
+                what = _rewrite_rhythm(root, staff, measure, fix.get("from", []),
+                                       fix.get("to", []))
+            elif kind == "bar":
+                what = _replace_bar(root, staff, measure, fix.get("from", []),
+                                    fix.get("to", []))
+            elif kind == "pitch":
+                what = _set_pitch(root, staff, measure, int(fix["index"]),
+                                  fix.get("from", []), int(fix["was"]), int(fix["to"]),
+                                  int(fix["tpc"]))
+            elif kind == "unslur":
+                what = _unslur(root, staff, measure, int(fix.get("index", 0)), fix.get("from"))
+            elif kind == "delete":
+                what = _delete_mark(root, staff, measure, int(fix.get("index", 0)),
+                                    str(fix.get("what", "")), fix.get("subtype"),
+                                    fix.get("from"))
+            elif kind == "tie":
+                what = _tie(root, staff, measure, int(fix.get("index", 0)), int(fix["pitch"]),
+                            fix.get("from"))
+            elif kind == "untie":
+                what = _untie(root, staff, measure, int(fix.get("index", 0)),
+                              int(fix["pitch"]), fix.get("from"))
+            elif kind == "dropnote":
+                what = _drop_note(root, staff, measure, int(fix.get("index", 0)),
+                                  int(fix["pitch"]), fix.get("from"))
+            elif kind == "addnote":
+                what = _add_note(root, staff, measure, int(fix.get("index", 0)),
+                                 int(fix["pitch"]), fix.get("from"),
+                                 int(fix["tpc"]) if "tpc" in fix else None)
+            elif kind == "duration":
+                what = _set_duration(root, staff, measure, int(fix.get("index", 0)),
+                                     fix.get("from"), str(fix.get("to", "")))
+            elif kind == "unmark":
+                what = _unmark(root, staff, measure, str(fix.get("text", "")))
+            elif kind == "slur" and "end_measure" in fix:
+                what = _slur_across(root, staff, measure, int(fix.get("index", 0)),
+                                    int(fix["end_measure"]), int(fix.get("end_index", 0)))
             elif kind in ("undot", "slur"):
                 index = int(fix.get("index", 0))
                 chords = _chords(root, staff, measure)
                 if index < 0 or index >= len(chords):
-                    raise FixError(
-                        f"staff {staff} m{measure} has {len(chords)} chords, no index {index}")
+                    raise _no_index(chords, index, f"staff {staff} m{measure}")
                 what = (_undot(chords[index]) if kind == "undot"
                         else _slur(chords, index, int(fix.get("span", 1))))
             else:
@@ -341,6 +2502,10 @@ def apply_fixes(root: etree._Element, fixes: List[Dict]) -> List[str]:
             # Say which entry, not just what went wrong: two bars of the same song can
             # read identically, and the message is all the reader gets.
             raise FixError(f"staff {staff} m{measure} ({kind}): {exc}") from None
+        if kind in _KIND_WORDS:
+            what += _answered(_strike(root, staff, measure, _KIND_WORDS[kind]))
+        if _settle(root, staff, measure):
+            what += " and turned its red notes black"
         line = f"staff {staff} m{measure}: {what} — {fix.get('why', 'no reason recorded')}"
         logger.debug(line)
         done.append(line)

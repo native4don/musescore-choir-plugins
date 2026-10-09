@@ -12,6 +12,8 @@ import datetime
 import logging
 from google.auth.transport.requests import Request
 
+from . import staff_lines
+
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube"]
 
@@ -158,6 +160,37 @@ def add_video_to_playlist(youtube, playlist_id, video_id):
     _execute(request)
 
 
+def _all_items(make_request, log=None):
+    """Every item of a paged list call; make_request(page_token) builds one page."""
+    items, token = [], None
+    while True:
+        resp = _execute(make_request(token), log=log)
+        items += resp.get("items", [])
+        token = resp.get("nextPageToken")
+        if not token:
+            return items
+
+
+def own_playlists(youtube, log=None):
+    """The account's own playlists as [{id, title}], in YouTube's order."""
+    items = _all_items(lambda token: youtube.playlists().list(
+        part="snippet", mine=True, maxResults=50, pageToken=token), log=log)
+    return [{"id": i["id"], "title": i["snippet"]["title"]} for i in items]
+
+
+def playlist_video_items(youtube, playlist_id, log=None):
+    """{video_id: playlistItem id} for every video in a playlist. Removing a video
+    from a playlist needs the item id, not the video id."""
+    items = _all_items(lambda token: youtube.playlistItems().list(
+        part="contentDetails", playlistId=playlist_id, maxResults=50,
+        pageToken=token), log=log)
+    return {i["contentDetails"]["videoId"]: i["id"] for i in items}
+
+
+def remove_from_playlist(youtube, item_id, log=None):
+    _execute(youtube.playlistItems().delete(id=item_id), log=log)
+
+
 def upload_to_youtube(song_dir, video_paths, extra_playlist_id=None, log=None,
                       progress=None, display_name=None, on_uploaded=None):
     """Upload merged videos.
@@ -171,6 +204,14 @@ def upload_to_youtube(song_dir, video_paths, extra_playlist_id=None, log=None,
     log = log or logging.info
     basename = os.path.basename(song_dir)
     nice = display_name or basename
+
+    # Which staff each part is sung from, for the site's phone zoom (#323). A song
+    # whose score cannot be read still uploads, just without the line.
+    try:
+        staves = staff_lines.song_part_staves(song_dir)
+    except Exception as e:
+        log(f"Could not work out the parts' staves ({e}); uploading without them.")
+        staves = {}
 
     log("Authenticating with YouTube…")
     youtube = get_authenticated_service()
@@ -187,7 +228,10 @@ def upload_to_youtube(song_dir, video_paths, extra_playlist_id=None, log=None,
         part = stem[len(basename) + 1:] if stem.startswith(basename + " ") else stem
         title = f"{nice} {part}".strip()
         log(f"Uploading {i}/{total}: {title}…")
-        video_id = upload_video(youtube, video_path, title, description="Practice track", progress=progress, log=log)
+        description = staff_lines.with_line(staff_lines.DESCRIPTION,
+                                            staff_lines.line_for(part, staves))
+        video_id = upload_video(youtube, video_path, title, description=description,
+                                progress=progress, log=log)
         url = f"https://youtu.be/{video_id}"
         log(f"Uploaded {title}: {url}")
         if playlist_id:
@@ -195,10 +239,37 @@ def upload_to_youtube(song_dir, video_paths, extra_playlist_id=None, log=None,
         if extra_playlist_id:
             add_video_to_playlist(youtube, extra_playlist_id, video_id)
         if on_uploaded:
+            # Which file went up, by name, size and mtime: a later render rewrites
+            # the same name, and only these say the local copy is what YouTube has
+            # (#371: freeing the local videos depends on it).
+            st = os.stat(video_path)
             on_uploaded({"title": title, "part": part, "video_id": video_id, "url": url,
-                         "playlist_id": playlist_id, "playlist_title": playlist_title})
+                         "playlist_id": playlist_id, "playlist_title": playlist_title,
+                         "file": os.path.basename(video_path), "size": st.st_size,
+                         "mtime_ns": st.st_mtime_ns, "uploaded_at": time.time()})
 
     log("All videos uploaded.")
+
+
+def confirm_uploads(video_ids, log=None):
+    """What YouTube says about these videos: {id: {"processed", "published_at"}}.
+
+    Ids YouTube does not know (deleted, or never there) are left out. One list
+    call per 50 ids, 1 quota unit each.
+    """
+    youtube = get_authenticated_service()
+    out = {}
+    ids = list(video_ids)
+    for start in range(0, len(ids), 50):
+        resp = _execute(youtube.videos().list(part="status,snippet",
+                                              id=",".join(ids[start:start + 50]),
+                                              maxResults=50), log=log)
+        for item in resp.get("items", []):
+            out[item["id"]] = {
+                "processed": item.get("status", {}).get("uploadStatus") == "processed",
+                "published_at": item.get("snippet", {}).get("publishedAt"),
+            }
+    return out
 
 
 def _update_video_title(youtube, video_id, title, log=None):
@@ -211,6 +282,23 @@ def _update_video_title(youtube, video_id, title, log=None):
     snippet["title"] = title
     _execute(youtube.videos().update(part="snippet", body={"id": video_id, "snippet": snippet}), log=log)
     return True
+
+
+def _update_video_description(youtube, video_id, line, log=None):
+    """Put this staff line into a video's description, keeping the rest of it (and
+    the categoryId the snippet update needs). Returns the new description, or None
+    when the video is gone or already says exactly this."""
+    resp = _execute(youtube.videos().list(part="snippet", id=video_id), log=log)
+    items = resp.get("items", [])
+    if not items:
+        return None
+    snippet = items[0]["snippet"]
+    description = staff_lines.with_line(snippet.get("description", ""), line)
+    if description == snippet.get("description", ""):
+        return None
+    snippet["description"] = description
+    _execute(youtube.videos().update(part="snippet", body={"id": video_id, "snippet": snippet}), log=log)
+    return description
 
 
 def _update_playlist_title(youtube, playlist_id, title, log=None):

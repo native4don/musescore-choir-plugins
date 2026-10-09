@@ -32,11 +32,17 @@ def singing_parts(mscx_path: str) -> List[str]:
     return [name for name in part_names(root) if name not in silent]
 
 
-def _note_events(path: str) -> Counter:
+def _note_events(path: str, only: Optional[Iterable[str]] = None) -> Counter:
+    """(measure, pitch, duration) counts; `only` limits it to staves of those parts."""
     root = etree.parse(path).getroot()
     score = root.find(".//Score") if root.tag != "Score" else root
+    names = {stub.get("id"): (part.findtext("trackName") or "").strip()
+             for part in score.findall("Part") for stub in part.findall("Staff")}
+    wanted = set(only) if only is not None else None
     events = Counter()
     for staff in score.findall("Staff"):
+        if wanted is not None and names.get(staff.get("id")) not in wanted:
+            continue
         for measure_index, measure in enumerate(staff.findall("Measure"), 1):
             for chord in measure.findall(".//Chord"):
                 duration = (
@@ -62,6 +68,23 @@ def compare_notes(source_mscx: str, cleaned_mscx: str) -> Dict:
     cleaned_count = sum(cleaned.values())
     if source == cleaned:
         return _result("passed", f"All {source_count} source note events are preserved by measure and duration.",
+                       source_notes=source_count, cleaned_notes=cleaned_count)
+    # A per-system `S1b` sings `S1`'s notes where it has none of its own, so those
+    # bars hold a second copy of notes the source has once. That is the clean doing
+    # what it was told; anything else missing or extra is still a warning.
+    from src.clean_score.utils.per_system import _fallback_of
+
+    fallbacks = _fallback_of(singing_parts(cleaned_mscx))
+    # Each b-part copies its base on its own, so S1b and S1c borrowing one note of
+    # S1's are two copies of it: count per pair, then add up.
+    copies = Counter()
+    for child, base in fallbacks.items():
+        copies += (_note_events(cleaned_mscx, only=[child])
+                   & _note_events(cleaned_mscx, only=[base]))
+    if fallbacks and not (source - cleaned) and not ((cleaned - source) - copies):
+        borrowed = cleaned_count - source_count
+        return _result("passed", f"All {source_count} source note events are preserved by measure "
+                       f"and duration; {borrowed} more are b-parts singing their base part's notes.",
                        source_notes=source_count, cleaned_notes=cleaned_count)
     return _result(
         "warning",
@@ -127,7 +150,7 @@ def verify_media(song: state.Song, outputs: Iterable[str], parts: Iterable[str])
     by_part: Dict[str, Dict] = {}
     prefix = song.slug + " "
     for name in outputs:
-        path = song.path("media", "video", os.path.basename(name))
+        path = song.media_path("video", os.path.basename(name))
         label = os.path.splitext(os.path.basename(name))[0]
         if label.startswith(prefix):
             label = label[len(prefix):]
@@ -196,15 +219,9 @@ def summary(song: state.Song, systems: int) -> Dict:
         if folded:
             detail += (f" {collapsed_count} of them are meter findings shown as "
                        f"{len(folded)} line(s) in the Fix panel.")
-        # A count did not communicate anything: the walk's song said "60 open
-        # issue(s)" here and offered approval on the next line. The verdict is what a
-        # number that size means, and it rides beside the count as its own field
-        # rather than inside the sentence -- the panel says it once, loudly, above
-        # the row, and a row that repeated it would only be teaching a reader to skim.
-        judgement = health_check.verdict(open_issues, health_check.score_bars(cleaned))
         health_result = _result("passed" if not open_count else "warning", detail,
                                 open_count=open_count, row_count=len(open_issues),
-                                collapsed_count=collapsed_count, verdict=judgement)
+                                collapsed_count=collapsed_count)
 
     stored = song.data.get("verification", {}).get("notes")
     if not stored:
@@ -245,7 +262,7 @@ def summary(song: state.Song, systems: int) -> Dict:
         media_result = dict(media)
         for result in media_result.get("files", {}).values():
             name = result.get("name")
-            path = song.path("media", "video", name) if name else ""
+            path = song.media_path("video", name) if name else ""
             if not path or not os.path.exists(path):
                 result.update(status="warning", detail="File is missing.")
                 media_result["status"] = "warning"

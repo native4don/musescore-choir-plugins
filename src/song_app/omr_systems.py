@@ -74,7 +74,7 @@ import copy
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from lxml import etree
 
@@ -310,6 +310,7 @@ def _extract_staff(part: etree._Element, number: int) -> Staff:
     clef = key = time = None
     per_bar: List[List[_Placed]] = []
     tails: List[List[etree._Element]] = []
+    ends: List[int] = []
 
     for source in part.findall("measure"):
         measure = etree.Element("measure", number=source.get("number") or "")
@@ -356,12 +357,24 @@ def _extract_staff(part: etree._Element, number: int) -> Staff:
 
         per_bar.append(notes)
         tails.append(trailing)
+        # Where this staff's music ends, read off its own notes: another staff of
+        # the part running long must not stretch this one.
+        ends.append(max((p.onset + _duration(p.note) for p in notes), default=0))
         measures.append(measure)
 
     numbering = _voice_numbering(per_bar)
-    for measure, notes, trailing in zip(measures, per_bar, tails):
-        for element in _voiced(notes, numbering):
+    for measure, notes, trailing, end in zip(measures, per_bar, tails, ends):
+        voiced = _voiced(notes, numbering)
+        for element in voiced:
             measure.append(element)
+        # MuseScore puts a barline where the cursor stands, not at the bar's end.
+        # A voice that stops early -- its last rest printed once for both voices,
+        # so written into the other -- would otherwise close the bar part-way
+        # through, and the music after it reads as a bar of its own (#354).
+        short = end - _cursor(voiced)
+        if trailing and short > 0:
+            move = etree.SubElement(measure, "forward")
+            etree.SubElement(move, "duration").text = str(short)
         for element in trailing:
             measure.append(element)
 
@@ -467,6 +480,19 @@ def _voiced(notes: List["_Placed"], numbering: Dict[str, int]) -> List[etree._El
     return out
 
 
+def _cursor(elements: Sequence[etree._Element]) -> int:
+    """Where the cursor stands after ``elements``, by the same rule they were read by."""
+    at = 0
+    for element in elements:
+        if element.tag == "note":
+            at += _duration(element)
+        elif element.tag == "backup":
+            at -= _int(element.findtext("duration"))
+        elif element.tag == "forward":
+            at += _int(element.findtext("duration"))
+    return at
+
+
 def _voice_key(voice: str):
     """Order two of homr's voice labels the way MusicXML numbering means them.
 
@@ -508,7 +534,8 @@ def _staff_attributes(attributes: etree._Element, number: int) -> etree._Element
 # --- assembling ----------------------------------------------------------
 
 
-def assemble(scans: Sequence[SystemScan], out_path: str) -> str:
+def assemble(scans: Sequence[SystemScan], out_path: str,
+             log: Optional[Logger] = None) -> str:
     """Write the systems out as one score, one part per staff column.
 
     Columns are filled **from the top**: a system of two staves puts them in
@@ -530,6 +557,10 @@ def assemble(scans: Sequence[SystemScan], out_path: str) -> str:
     under that comparator and not a guarantee that a different ranking would move
     the two sides by the same amount, so the gap is a historical measurement that
     nobody has checked against issue #196's rule.
+
+    **Repeat signs and volta brackets belong to the whole system** (#312), so one
+    staff reading one is written on every staff of it -- see
+    :func:`_system_barlines`. ``log`` hears about each copy that was needed.
 
     Three seams are closed here, all of them consequences of each crop being its
     own document. ``divisions`` is unified across the score and every duration
@@ -597,9 +628,11 @@ def assemble(scans: Sequence[SystemScan], out_path: str) -> str:
         # voice out of it: which staff is which part is the grid's question.
         etree.SubElement(score_part, "part-name").text = f"Staff {column + 1}"
 
+    barlines = [_system_barlines(scan, log) for scan in scans]
     for column in range(width):
         part = etree.SubElement(score, "part", id=f"P{column + 1}")
-        _fill_column(part, scans, column, divisions, meters)
+        _fill_column(part, scans, column, divisions, meters, barlines)
+    _join_slurs(score, scans)
 
     tree = etree.ElementTree(score)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -613,14 +646,19 @@ def _fill_column(
     column: int,
     divisions: int,
     meters: Sequence[Sequence["_BarMeter"]],
+    barlines: Optional[Sequence[Dict[int, Dict[str, etree._Element]]]] = None,
 ) -> None:
     number = 0
     prevailing_key: Optional[str] = None
     prevailing_clef: Optional[str] = None
     first = True
+    # The notes sounding at the end of the previous system, and its key there.
+    ending: List[_Sounding] = []
+    ending_fifths = 0
 
     for system, scan in enumerate(scans):
         staff = scan.staves[column] if column < scan.width else None
+        fifths = _fifths(staff.key) if staff is not None and staff.key is not None else ending_fifths
 
         for bar in range(scan.bars):
             number += 1
@@ -629,6 +667,11 @@ def _fill_column(
             if source is None:
                 measure = _rest_measure(number, meter.ticks)
             else:
+                # The key in force at this bar, for the line-break check below: a
+                # system may change key part-way, and its last bar is in the new one.
+                declared_key = source.find("attributes/key")
+                if declared_key is not None:
+                    fifths = _fifths(declared_key)
                 measure = _scaled(source, staff.divisions, divisions)
                 measure.set("number", str(number))
 
@@ -654,8 +697,498 @@ def _fill_column(
                 if declared is not None:
                     prevailing_key = _canonical(declared.find("key")) or prevailing_key
                     prevailing_clef = _canonical(declared.find("clef")) or prevailing_clef
+            if barlines is not None:
+                _set_barlines(measure, barlines[system].get(bar, {}))
+            if system and bar == 0 and source is not None:
+                _mark_lost_accidental(measure, ending, ending_fifths, fifths)
             first = False
             part.append(measure)
+            if bar == scan.bars - 1:
+                ending = _sounding(measure)[1] if source is not None else []
+                ending_fifths = fifths
+
+
+# --- repeats ------------------------------------------------------------
+
+#: What a barline says that is about the music rather than its drawing.
+_FORM = ("repeat", "ending")
+_BARLINE_ORDER = {"bar-style": 0, "ending": 2, "repeat": 3}
+
+
+def _system_barlines(
+    scan: SystemScan, log: Optional[Logger] = None,
+) -> Dict[int, Dict[str, etree._Element]]:
+    """The repeat and volta barlines of one system, bar by bar, read off every staff.
+
+    A repeat sign and a volta bracket are drawn across the whole system, so one
+    staff reading one is enough evidence for all of them -- and the converter
+    needs all of them: MuseScore 3 keeps a start repeat only when every part
+    carries it (#312: Kantajani bar 27, read on two staves of four, came out of
+    the conversion with no repeat at all, and with it copied onto the other two
+    it was kept). homr reads a sign that opens a system on some staves and not
+    others often enough that this is the common case, not a corner.
+
+    What is collected is the union, per bar and per side: each ``<repeat>`` and
+    ``<ending>`` any staff wrote there, once. The barline's style is left to
+    whichever staff drew it, since a style is a drawing and not a form.
+    """
+    found: Dict[int, Dict[str, etree._Element]] = {}
+    seen: Dict[Tuple[int, str], int] = {}
+    for staff in scan.staves:
+        for bar, measure in enumerate(staff.measures):
+            for barline in measure.findall("barline"):
+                side = barline.get("location") or "right"
+                marks = [child for child in barline if child.tag in _FORM]
+                if not marks:
+                    continue
+                seen[(bar, side)] = seen.get((bar, side), 0) + 1
+                union = found.setdefault(bar, {}).setdefault(
+                    side, etree.Element("barline", location=side))
+                for mark in marks:
+                    if not any(_same(mark, kept) for kept in union):
+                        union.append(copy.deepcopy(mark))
+    if log is not None:
+        for (bar, side), count in sorted(seen.items()):
+            if count < scan.width:
+                what = ", ".join(_describe(mark) for mark in found[bar][side])
+                log(f"System {scan.index} bar {bar + 1}: {what} read on {count} of "
+                    f"{scan.width} staves, written on all.")
+    return found
+
+
+def _same(a: etree._Element, b: etree._Element) -> bool:
+    return a.tag == b.tag and dict(a.attrib) == dict(b.attrib)
+
+
+def _describe(mark: etree._Element) -> str:
+    if mark.tag == "repeat":
+        return "start repeat" if mark.get("direction") == "forward" else "end repeat"
+    return f"volta {mark.get('number') or ''} {mark.get('type') or ''}".strip()
+
+
+def _set_barlines(measure: etree._Element, wanted: Dict[str, etree._Element]) -> None:
+    """Give a bar every repeat and volta its system has there, each where it belongs.
+
+    A left barline opens the bar: it goes after any ``print`` and ``attributes``
+    and before the first note, which is where a score writes it. Flattening puts
+    every barline after the notes, which is right for the right-hand one only.
+    """
+    for side, union in wanted.items():
+        barline = next((b for b in measure.findall("barline")
+                        if (b.get("location") or "right") == side), None)
+        if barline is None:
+            barline = etree.Element("barline", location=side)
+            measure.append(barline)
+        for mark in union:
+            if not any(_same(mark, kept) for kept in barline if kept.tag in _FORM):
+                barline.append(copy.deepcopy(mark))
+        # MusicXML's order: the drawing first, then the volta, then the repeat.
+        barline[:] = sorted(barline, key=lambda child: _BARLINE_ORDER.get(child.tag, 1))
+    for barline in measure.findall("barline"):
+        if barline.get("location") != "left":
+            continue
+        measure.remove(barline)
+        at = 0
+        for index, child in enumerate(measure):
+            if child.tag in ("print", "attributes"):
+                at = index + 1
+            else:
+                break
+        measure.insert(at, barline)
+
+#: How many bars at a system's end may hold the start of a slur that runs into
+#: the next system: homr keeps a loose start there (``EDGE_BARS`` in the fork's
+#: ``slur_resolution``), and the two must agree.
+EDGE_BARS = 2
+
+
+@dataclass
+class _LooseEnd:
+    note: etree._Element
+    slur: etree._Element
+    voice: str
+
+
+def _join_slurs(score: etree._Element, scans: Sequence[SystemScan]) -> None:
+    """Join the two halves of a slur the page carries over a system break.
+
+    Each system is read on its own, so a slur crossing a break comes back as a
+    start in the last bar of one crop with no stop, and a stop in the first bar
+    of the next with no start: homr keeps exactly those loose ends and drops
+    every other (eerovil/musescore-choir-plugins#318). Here, where both systems
+    are in view, they are paired and given a slur number no other slur in those
+    two bars uses, so the stream stays unambiguous.
+
+    **Paired only within one column of two systems that print the same number
+    of staves.** Where the count changes, column N is not the same printed staff
+    on both sides of the break -- Illan viimeinen tango's lower staff of system 6
+    is staff 3 of system 7 -- and a slur from one part into another cannot be
+    written. Within a column the halves pair in order when the two sides hold
+    the same number of halves, and otherwise voice to voice, a start taking the
+    first stop in its voice.
+
+    **A tie over the break comes back the same way**, because homr's model
+    reads ties and slurs as one kind of arc and only turns a pair into a tie
+    once it sees both ends. Measured on the six songs of #274, 22 of the 30
+    pairs joined here were a held note tied over the line, so a pair from the
+    system's last note to the next system's first note at the same pitch is
+    written as a tie (the whole written pitch: Shakkitarina's B natural slurred
+    to B flat over the break is a slur).
+
+    **A half without a partner is never dropped silently** on a guess that it
+    was a tie: the same pitch across the break may be another staff's or another
+    voice's note, and a slur that disappears unmarked is the failure #318 exists
+    to stop. The one quiet case is a half on a note that already carries a tie
+    the same way, which is the same arc written twice.
+
+    Any other half without a partner is taken out and its note marked red under
+    `⚠ slur?`, the way homr marks its own doubts: either the page carries a slur
+    across the break that the other side lost, or homr read a slur that is not
+    there, and only a person looking at the page can say which.
+    """
+    parts = score.findall("part")
+    starts_at: List[int] = []
+    at = 0
+    for scan in scans:
+        starts_at.append(at)
+        at += scan.bars
+    for column, part in enumerate(parts):
+        _join_column(part, scans, column, starts_at)
+
+
+def _join_column(part, scans, column, starts_at) -> None:
+    measures = part.findall("measure")
+    loose_starts: Dict[int, List[_LooseEnd]] = {}
+    loose_stops: Dict[int, List[_LooseEnd]] = {}
+    for system, first in enumerate(starts_at):
+        block = measures[first:first + scans[system].bars]
+        open_: Dict[str, List[_LooseEnd]] = {}
+        # Stops that closed nothing, past the first bar: each is the other half
+        # of a pair inside one bar that flattening put out of document order (a
+        # slur from one voice into the other), and its start is no half of
+        # anything over the break.
+        orphans: List[Tuple[etree._Element, str]] = []
+        for index, measure in enumerate(block):
+            for note in measure.findall("note"):
+                for slur in note.findall("notations/slur"):
+                    number = slur.get("number", "1")
+                    end = _LooseEnd(note, slur, note.findtext("voice") or "1")
+                    if slur.get("type") == "start":
+                        open_.setdefault(number, []).append(end)
+                    elif slur.get("type") == "stop":
+                        if open_.get(number):
+                            open_[number].pop()
+                        elif index == 0:
+                            loose_stops.setdefault(system, []).append(end)
+                        else:
+                            orphans.append((measure, number))
+        # Each orphaned stop sets aside only its own partner: the first start
+        # left open in the same bar with the same number. Any other start in
+        # that bar is still a half to join, or to mark.
+        set_aside = set()
+        for measure, number in orphans:
+            partner = next((end for end in open_.get(number, [])
+                            if end.note.getparent() is measure
+                            and id(end) not in set_aside), None)
+            if partner is not None:
+                set_aside.add(id(partner))
+        # Only the edge bars: homr keeps a loose start only in the system's last
+        # EDGE_BARS bars (a slur may cross one barline before the edge).
+        edge = {id(m) for m in block[-EDGE_BARS:]}
+        loose_starts[system] = [end for ends in open_.values() for end in ends
+                                if id(end.note.getparent()) in edge
+                                and id(end) not in set_aside]
+
+    for system in range(-1, len(scans)):
+        starts = loose_starts.get(system, [])
+        # The system's last bar: only its last note can start a tie over the
+        # break. A start a bar earlier is a slur, whatever its pitch.
+        closing = (measures[starts_at[system] + scans[system].bars - 1]
+                   if 0 <= system < len(scans) else None)
+
+        def ends_system(note: etree._Element) -> bool:
+            return note.getparent() is closing and _on_edge(note, last=True)
+
+        stops = loose_stops.get(system + 1, [])
+        same_shape = (0 <= system < len(scans) - 1 and column < scans[system].width
+                      and scans[system].width == scans[system + 1].width)
+        pairs: List[Tuple[_LooseEnd, _LooseEnd]] = []
+        if same_shape and starts and stops:
+            starts = sorted(starts, key=_reading_order)
+            stops = sorted(stops, key=_reading_order)
+            taken = set()
+            # A half on the system's last note and one on the next system's
+            # first note at the same written pitch are a held note tied over
+            # the line; pair those first, so a slur beside the tie does not
+            # take its stop.
+            for start in starts:
+                if not ends_system(start.note):
+                    continue
+                match = [stop for stop in stops if id(stop) not in taken
+                         and _on_edge(stop.note, last=False)
+                         and _written_pitch(stop.note) == _written_pitch(start.note)]
+                if match:
+                    taken.update((id(start), id(match[0])))
+                    pairs.append((start, match[0]))
+            rest = [start for start in starts if id(start) not in taken]
+            left = [stop for stop in stops if id(stop) not in taken]
+            if len(rest) == len(left):
+                pairs += list(zip(rest, left))
+            else:
+                for start in rest:
+                    # The first stop in the voice, as homr's own pairing and
+                    # MuseScore's would close it.
+                    match = [stop for stop in left
+                             if stop.voice == start.voice and id(stop) not in taken]
+                    if match:
+                        taken.add(id(match[0]))
+                        pairs.append((start, match[0]))
+        paired = {id(end) for pair in pairs for end in pair}
+        tied_over: List[Tuple[_LooseEnd, _LooseEnd]] = []
+        for start, stop in pairs:
+            if (ends_system(start.note) and _on_edge(stop.note, last=False)
+                    and _written_pitch(start.note) == _written_pitch(stop.note)):
+                _remove_slur(start)
+                _remove_slur(stop)
+                _tie(start.note, "start")
+                _tie(stop.note, "stop")
+                tied_over.append((start, stop))
+                continue
+            _number_pair(start.slur, stop.slur)
+        for end in starts:
+            if id(end) in paired:
+                continue
+            # A slur and a tie both running over the line to one note come back
+            # as two starts and one stop: homr writes one arc mark per note.
+            # The slur ends where the tie does -- written, and marked, since
+            # the stop was inferred rather than read.
+            shared = next((stop for start, stop in tied_over
+                           if start.voice == end.voice
+                           and _reading_order(end) < _reading_order(start)), None)
+            if shared is not None:
+                notations = shared.note.find("notations")
+                stop_slur = etree.SubElement(notations, "slur", type="stop")
+                _number_pair(end.slur, stop_slur)
+                _mark_note(end.note, "slur?")
+                continue
+            _drop_loose_end(end, already_tied=_has_tie(end.note, "start"))
+        for end in stops:
+            if id(end) not in paired:
+                _drop_loose_end(end, already_tied=_has_tie(end.note, "stop"))
+
+
+def _number_pair(start: etree._Element, stop: etree._Element) -> None:
+    """Give a joined slur a number no other slur in the bars it spans uses.
+
+    Every bar from the start's through the stop's, not just those two: a start
+    may stand a bar before the system's last, and a slur in that last bar
+    sharing the number would close it or overlap it."""
+    first = start.getparent().getparent().getparent()
+    last = stop.getparent().getparent().getparent()
+    part = first.getparent()
+    bars = list(part.findall("measure"))
+    span = bars[bars.index(first):bars.index(last) + 1]
+    used = {slur.get("number") for measure in span for slur in measure.iter("slur")
+            if slur is not start and slur is not stop}
+    number = next(str(n) for n in range(1, 17) if str(n) not in used)
+    start.set("number", number)
+    stop.set("number", number)
+
+
+def _reading_order(end: "_LooseEnd") -> Tuple[int, int]:
+    """Where a half stands in its part: the bar, then the note within it."""
+    measure = end.note.getparent()
+    part = measure.getparent()
+    return list(part).index(measure), list(measure).index(end.note)
+
+
+def _written_pitch(note: etree._Element) -> Tuple[str, str, int]:
+    """Step, octave and alteration: a slur from B natural to B flat is a slur."""
+    return (*_step_octave(note), _int(note.findtext("pitch/alter")))
+
+
+def _step_octave(note: etree._Element) -> Tuple[str, str]:
+    return note.findtext("pitch/step") or "", note.findtext("pitch/octave") or ""
+
+
+def _edge_notes(measure: etree._Element, last: bool) -> List[etree._Element]:
+    """The pitched notes that end (or open) each voice of the bar."""
+    per_voice: Dict[str, List[etree._Element]] = {}
+    for note in measure.findall("note"):
+        if note.find("pitch") is None or note.find("grace") is not None:
+            continue
+        group = per_voice.setdefault(note.findtext("voice") or "1", [])
+        if note.find("chord") is not None and group:
+            group[-1].append(note)
+        else:
+            group.append([note])
+    picked = [groups[-1 if last else 0] for groups in per_voice.values() if groups]
+    return [note for chord in picked for note in chord]
+
+
+def _on_edge(note: etree._Element, last: bool) -> bool:
+    return any(note is other for other in _edge_notes(note.getparent(), last))
+
+
+#: Where <tie> goes among a note's children (MusicXML's own order).
+_BEFORE_TIE = {"grace", "cue", "chord", "pitch", "unpitched", "rest", "duration"}
+
+
+def _tie(note: etree._Element, kind: str) -> None:
+    index = 0
+    for i, child in enumerate(note):
+        if isinstance(child.tag, str) and child.tag in _BEFORE_TIE:
+            index = i + 1
+    note.insert(index, etree.Element("tie", type=kind))
+    notations = note.find("notations")
+    if notations is None:
+        notations = etree.SubElement(note, "notations")
+    etree.SubElement(notations, "tied", type=kind)
+
+
+def _remove_slur(end: _LooseEnd) -> None:
+    notations = end.slur.getparent()
+    notations.remove(end.slur)
+    if len(notations) == 0:
+        end.note.remove(notations)
+
+
+def _has_tie(note: etree._Element, kind: str) -> bool:
+    return any(tie.get("type") == kind for tie in note.findall("tie"))
+
+
+def _drop_loose_end(end: _LooseEnd, already_tied: bool = False) -> None:
+    """Take out a half with no partner, marking its note -- unless the note
+    already carries a tie the same way, which is the same arc said twice."""
+    _remove_slur(end)
+    if not already_tied:
+        _mark_note(end.note, "slur?")
+
+
+def _mark_note(note: etree._Element, word: str) -> None:
+    """The note goes red and `⚠ <word>` stands above it, as homr marks a doubt."""
+    measure = note.getparent()
+    _colour_red(note)
+    children = list(measure)
+    at = children.index(note)
+    while at > 0 and children[at].find("chord") is not None:
+        at -= 1
+    direction = etree.Element("direction", placement="above")
+    words = etree.SubElement(etree.SubElement(direction, "direction-type"), "words")
+    words.set("color", "#FF0000")
+    words.text = f"⚠ {word}"
+    measure.insert(at, direction)
+
+
+#: Order the key signature adds accidentals in: sharps from the left, flats from
+#: the right.
+_SHARP_ORDER = "FCGDAEB"
+
+
+@dataclass
+class _Sounding:
+    step: str
+    octave: str
+    alter: int
+    note: Optional[etree._Element] = field(default=None, compare=False)
+
+
+def _key_alter(step: str, fifths: int) -> int:
+    if fifths > 0 and step in _SHARP_ORDER[:fifths]:
+        return 1
+    if fifths < 0 and step in _SHARP_ORDER[::-1][:-fifths]:
+        return -1
+    return 0
+
+
+def _fifths(key: etree._Element) -> int:
+    return _int(key.findtext("fifths"))
+
+
+def _sounding(measure: etree._Element) -> Tuple[List[_Sounding], List[_Sounding]]:
+    """The pitched notes that open the bar and the ones still sounding at its end."""
+    cursor = last = 0
+    placed: List[Tuple[int, int, _Sounding]] = []
+    for element in measure:
+        if element.tag == "backup":
+            cursor -= _duration(element)
+        elif element.tag == "forward":
+            cursor += _duration(element)
+        elif element.tag == "note":
+            duration = 0 if element.find("grace") is not None else _duration(element)
+            if element.find("chord") is None:
+                last, cursor = cursor, cursor + duration
+            pitch = element.find("pitch")
+            if pitch is not None:
+                placed.append((last, last + duration, _Sounding(
+                    pitch.findtext("step") or "", pitch.findtext("octave") or "",
+                    _int(pitch.findtext("alter")), element)))
+    end = max((stop for _, stop, _ in placed), default=0)
+    return ([note for start, _, note in placed if start == 0],
+            [note for _, stop, note in placed if stop == end])
+
+
+#: Where <notehead> goes among a note's children (MusicXML's own order).
+_BEFORE_NOTEHEAD = {
+    "grace", "cue", "chord", "pitch", "unpitched", "rest", "tie", "duration",
+    "instrument", "footnote", "level", "voice", "type", "dot", "accidental",
+    "time-modification", "stem",
+}
+
+
+def _colour_red(note: etree._Element) -> None:
+    note.set("color", "#FF0000")
+    head = note.find("notehead")
+    if head is None:
+        head = etree.Element("notehead")
+        head.text = "normal"
+        index = 0
+        for i, child in enumerate(note):
+            if isinstance(child.tag, str) and child.tag in _BEFORE_NOTEHEAD:
+                index = i + 1
+        note.insert(index, head)
+    head.set("color", "#FF0000")
+
+
+def _mark_lost_accidental(
+    measure: etree._Element, ending: Sequence[_Sounding], before: int, after: int
+) -> None:
+    """Mark a system's first bar where a note carried over the line break may have
+    lost the accidental it was printed with.
+
+    A note tied over a line break keeps its accidental and the page does not print
+    it again. Each system is read on its own, so homr gives the continuation the
+    key's pitch: on Shakkitarina system 3 (eerovil/musescore-choir-plugins#274)
+    three staves end system 2 on a printed E♮ tied over, and system 3 opens on an
+    E♭. homr drops the tie at the page edge, so nothing here can tell such a note
+    from a new bar that really starts on the key's E♭ -- this only puts the red
+    check-against-the-page mark on the bar, the way homr marks its own doubts,
+    and changes no note.
+    """
+    for opening in _sounding(measure)[0]:
+        for held in ending:
+            if (held.step, held.octave) != (opening.step, opening.octave):
+                continue
+            if held.alter == _key_alter(held.step, before):
+                continue  # nothing printed beside it to carry
+            if opening.alter == held.alter or opening.alter != _key_alter(opening.step, after):
+                continue
+            direction = etree.Element("direction", placement="above")
+            words = etree.SubElement(etree.SubElement(direction, "direction-type"), "words")
+            words.set("color", "#FF0000")
+            words.text = "⚠ accidental?"
+            at = next((i for i, el in enumerate(measure)
+                       if el.tag not in ("print", "attributes")), len(measure))
+            if opening.note is not None:
+                # The note itself goes red and the word stands above it, the way
+                # homr marks its own doubts.
+                _colour_red(opening.note)
+                children = list(measure)
+                at = children.index(opening.note)
+                while at > 0 and children[at].find("chord") is not None:
+                    at -= 1
+            measure.insert(at, direction)
+            return
 
 
 def _signature(scan: SystemScan, staff: Optional[Staff]):
@@ -824,7 +1357,9 @@ def _meter_plan(
         lengths = [_bar_length_agreed(scans[system], over, divisions)
                    for over in range(bar, stop)]
         meter = _reconcile(declared, running,
-                           [length for length in lengths if length], divisions)
+                           [length for length in lengths if length], divisions,
+                           seam=bar == 0 and system > 0
+                           and _time_is_guessed(scans[system], bar))
         ticks = meter.ticks(divisions)
         plan[system][bar] = _BarMeter(meter, running is None or meter != running, ticks)
         for over in range(bar + 1, stop):
@@ -843,11 +1378,23 @@ def _reconcile(
     running: Optional[_Meter],
     lengths: Sequence[int],
     divisions: int,
+    seam: bool = False,
 ) -> _Meter:
     """The meter a span is really in: its own length, in homr's denominator.
 
     ``lengths`` is one entry per **bar** of the span, not one per staff.
+
+    At a ``seam`` -- the head of a system after the first whose signature homr
+    guessed rather than read (:func:`_time_is_guessed`) -- a span measuring
+    exactly the meter already in force carries that meter. homr guesses in
+    quarters: Vieläkö huvittaisi carries 2/2 into three systems and each came
+    back 4/4, which the score then wrote as a meter change at every seam
+    (eerovil/musescore-choir-plugins#274). A signature homr read off the page is
+    a change even at the same length -- the same song's 4/4 at bar 26 -- and a
+    span of a different length is a change whatever was declared.
     """
+    if seam and running is not None and _agreed(lengths) == running.ticks(divisions):
+        return running
     beat_type = (declared or running or _Meter(*_FALLBACK_TIME)).beat_type
     # A signature that restates the meter already in force carries no numerator
     # of its own -- homr writes one at the head of every crop and again wherever
@@ -874,6 +1421,27 @@ def _agreed(values: Sequence[int], least: int = 1) -> Optional[int]:
         counts[value] = counts.get(value, 0) + 1
     value, count = max(counts.items(), key=lambda item: (item[1], item[0]))
     return value if count * 2 > len(values) else None
+
+
+def _time_is_guessed(scan: SystemScan, bar: int) -> bool:
+    """Whether every signature this bar declares is homr's own fallback.
+
+    homr writes a signature it decoded off the page into the attributes it opens
+    with the clef and key, and one it had to make up -- a crop that prints none --
+    into the first attributes of the measure, beside ``<divisions>``. A bar with
+    no signature at all has nothing guessed about it.
+    """
+    found = False
+    for staff in scan.staves:
+        if bar >= staff.bars:
+            continue
+        for attributes in staff.measures[bar].findall("attributes"):
+            if attributes.find("time") is None:
+                continue
+            found = True
+            if attributes.find("divisions") is None or attributes.find("clef") is not None:
+                return False
+    return found
 
 
 def _declared_time(scan: SystemScan, bar: int) -> Optional[_Meter]:

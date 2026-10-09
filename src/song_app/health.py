@@ -91,7 +91,14 @@ def _parse_fraction(text: Optional[str]) -> Optional[Fraction]:
         return None
 
 
+#: A chord carrying one of these is a grace note: it takes no time in the bar.
+_GRACE = {"acciaccatura", "appoggiatura", "grace4", "grace8", "grace16", "grace32",
+          "grace8after", "grace16after", "grace32after"}
+
+
 def _chord_rest_len(el: etree._Element, tuplet_scale: Fraction) -> Optional[Fraction]:
+    if el.tag == "Chord" and any(child.tag in _GRACE for child in el):
+        return Fraction(0)
     dt = el.findtext("durationType")
     if dt == "measure":
         return None  # measure-length rest; handled by caller as the full bar
@@ -161,7 +168,9 @@ def scan(cleaned_path: str) -> List[Dict]:
         sid = int(staff.get("id", "0"))
         label = staff_name.get(sid) or f"staff {sid}"
         sig = Fraction(4, 4)
-        for mi, measure in enumerate(staff.findall("Measure"), start=1):
+        measures = staff.findall("Measure")
+        pickup = None  # bar 1's length, when it is an anacrusis shorter than its meter
+        for mi, measure in enumerate(measures, start=1):
             # Time signature can change at a measure (in any voice).
             ts = measure.find(".//TimeSig")
             if ts is not None:
@@ -174,6 +183,8 @@ def scan(cleaned_path: str) -> List[Dict]:
             len_attr = _parse_fraction(measure.get("len"))
             if len_attr is not None:
                 nominal = len_attr
+                if mi == 1 and len_attr < sig:
+                    pickup = len_attr
 
             voices = measure.findall("voice")
             note_bearing = 0
@@ -204,7 +215,11 @@ def scan(cleaned_path: str) -> List[Dict]:
             if mi > 1 and ts is None and not uneven and sig <= _PLAUSIBLE_METER:
                 agreed = {t for t, has, _ in
                           (_voice_length(v, nominal) for v in voices) if has}
-                if len(agreed) == 1 and agreed != {sig}:
+                # The closing bar of a song that opens with a pickup is printed short
+                # by the pickup's length, so the two make one bar between them (#353).
+                closes_pickup = (mi == len(measures) and pickup is not None
+                                 and agreed == {sig - pickup})
+                if len(agreed) == 1 and agreed != {sig} and not closes_pickup:
                     got = agreed.pop()
                     found = {
                         "id": f"unprinted-meter-m{mi}-s{sid}",
@@ -258,10 +273,8 @@ def scan(cleaned_path: str) -> List[Dict]:
             # again in the one place a person compares two scans.
             "collapsed": len(collapsed),
             "collapsed_bars": len(bars),
-            # The bars themselves, not just how many. `verdict` asks how much of the
-            # score is affected, and that is a union over rows -- a count cannot be
-            # unioned with anything, so a collapsed row would have had to be guessed
-            # at exactly where the score is worst.
+            # The bars themselves, not just how many: a count cannot be unioned
+            # with anything, should something need to ask which bars are affected.
             "collapsed_measures": bars,
             "detail": (
                 f"{len(bars)} bar(s) sit at a length the engraving never prints "
@@ -285,64 +298,6 @@ def finding_count(issues: Iterable[Dict]) -> int:
     return sum(int(i.get("collapsed") or 1) for i in issues)
 
 
-# ---------------------------------------------------------------------------
-# Is this parse worth repairing at all?
-#
-# A count is not a verdict. Sixty findings was shown to an operator as sixty rows
-# each with a Dismiss button, and what he said back was "sixty is very probably a
-# garbage scan, but I would have to see it with my eyes" -- which is a different
-# claim from "sixty issues", and it is the claim the app was never making. A parse
-# that rough is not a repair list; it is a reading to go and check against the page,
-# and possibly to throw away. So the app says that, in those words, and then gets
-# out of the way: this is a warning that aims attention, never a refusal. The call
-# he described is one he keeps.
-#
-# WHICH SIGNAL. Raw count is the obvious candidate and is the wrong one -- a long
-# song earns more findings than a short one for being long, and a wide score earns
-# more than a narrow one for having more staves. Three candidates were measured over
-# the 46 scores in `songs/` that carry a health record (see the pull request for the
-# table): findings per bar, findings per staff-bar, and the share of bars carrying at
-# least one finding. The last is the one used here. It is bounded, it does not move
-# with the number of staves or the length of the piece, and it says something a person
-# can act on out loud -- "more than a fifth of the bars of this score have something
-# wrong with them" -- where a density does not.
-#
-# WHERE THE LINE IS. Measured, not picked. On those 46 scores the share runs
-# 0.000 (30 scores), then 0.015 up to 0.121 (13 scores), then nothing at all until
-# 0.260, 0.299 and 0.538. The three above the gap are the two worst parses on this
-# host and the walk's own song, the one the operator called garbage. 0.2 sits in the
-# empty middle with nothing near it, which is the same shape of argument
-# `_FREE_METER_SHARE` rests on.
-_UNUSABLE_BAR_SHARE = 0.2
-
-# ...and a share alone would condemn a short score for one bad bar: three bars out of
-# fourteen is 0.21. A verdict about a whole parse should not be reachable by two
-# findings, so it takes a handful of affected bars as well as a large share of them.
-_UNUSABLE_MIN_BARS = 3
-
-
-def bars_touched(issues: Iterable[Dict]) -> int:
-    """How many distinct bars these findings land in.
-
-    A collapsed meter row stands for many bars, so it contributes all of them --
-    otherwise the score most worth judging is the one that looks smallest, which is
-    exactly the hole #124 closed one level up.
-    """
-    bars = set()
-    for issue in issues:
-        listed = issue.get("collapsed_measures")
-        if listed:
-            bars.update(int(b) for b in listed)
-        elif issue.get("collapsed"):
-            # Written before the bar numbers were recorded: all we have is how many.
-            # Offsetting them past the real bars would double-count nothing, but it
-            # would also be a lie about *which* bars, so they are simply added on.
-            bars.update(range(-int(issue["collapsed_bars"] or 0), 0))
-        elif issue.get("measure") is not None:
-            bars.add(int(issue["measure"]))
-    return len(bars)
-
-
 def score_bars(cleaned_path: str) -> int:
     """How many bars the cleaned score is long (the longest staff)."""
     with open(cleaned_path, "r", encoding="utf-8") as f:
@@ -351,38 +306,6 @@ def score_bars(cleaned_path: str) -> int:
     if score is None:
         return 0
     return max((len(st.findall("Measure")) for st in score.findall("Staff")), default=0)
-
-
-def verdict(issues: Iterable[Dict], bars: int) -> Dict:
-    """Judge the parse as a whole: `clean`, `repairable`, or `unusable`.
-
-    `issues` are the open findings; `bars` is the length of the score they were
-    found in. Returns the numbers as well as the sentence, so a caller can say it
-    its own way without recomputing the rule.
-    """
-    issues = list(issues)
-    findings = finding_count(issues)
-    touched = min(bars_touched(issues), bars) if bars else bars_touched(issues)
-    share = (touched / bars) if bars else 0.0
-    if not findings:
-        return {"level": "clean", "findings": 0, "bars": bars, "bars_touched": 0,
-                "share": 0.0, "message": "Nothing to repair."}
-    if bars and share > _UNUSABLE_BAR_SHARE and touched >= _UNUSABLE_MIN_BARS:
-        return {
-            "level": "unusable", "findings": findings, "bars": bars,
-            "bars_touched": touched, "share": share,
-            "message": (
-                f"This parse looks unusable: {touched} of {bars} bars ({share:.0%}) "
-                f"carry a finding. That is not a repair list — read it against the "
-                f"page before going on. Nothing here stops you; the judgement is yours."
-            ),
-        }
-    return {
-        "level": "repairable", "findings": findings, "bars": bars,
-        "bars_touched": touched, "share": share,
-        "message": (f"{findings} finding(s) in {touched} of {bars} bars"
-                    if bars else f"{findings} finding(s)"),
-    }
 
 
 def merge_issues(found: List[Dict], previous: List[Dict]) -> List[Dict]:

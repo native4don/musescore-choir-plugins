@@ -7,19 +7,24 @@ import json
 import os
 import subprocess
 import sys
+import time
 import traceback
 from typing import Dict, List, Optional, Set
 
 import dotenv
+from lxml import etree
 from fastapi import FastAPI, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
                                Response)
 from fastapi.staticfiles import StaticFiles
 
-from . import (agentdeck, health, heavy_slot, homr_install, job_state, omr,
-               pdf_systems, pipeline, pwa_assets, scan, state, system_finder, verification)
+from . import (agentdeck, bar_readings, free_videos, health, heavy_slot, homr_install,
+               job_state, omr,
+               pdf_systems, pipeline, playlists, problems, pwa_assets, scan, site_refresh,
+               state, system_finder, verification)
 from src.clean_score.utils.score_fixes import FixError
 from src.scrollvideo.score import format_groups, parse_groups
+from src.media_root import media_dir
 
 SCRIPT_DIR = state.SCRIPT_DIR
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -154,7 +159,7 @@ def _media_version(path: str) -> str:
 
 def _media_list(song: state.Song) -> List[Dict]:
     """Merged per-voice videos (and the raw recording) available for review."""
-    vdir = song.path("media", "video")
+    vdir = song.media_path("video")
     if not os.path.isdir(vdir):
         return []
     out = []
@@ -213,8 +218,10 @@ def _derived(song: state.Song) -> Dict:
         # What the scan stage has read, what is still a hole, and what the app
         # threw away this read because its input had moved under it.
         "scan_status": scan.status(song),
-        "scan_discarded": discarded,
+        "scan_discarded": [scan.said(line) for line in discarded],
         "media": _media_list(song),
+        # Which videos YouTube has and whether the local copies can go (#371).
+        "upload_status": free_videos.status(song),
         "jobs": job_state.load(song.dir),
         "verification_summary": verification.summary(song, systems),
     }
@@ -260,7 +267,7 @@ def _import_one(name: str) -> bool:
     pdf = next((f for f in files if f.lower().endswith(".pdf") and not f.endswith(".render.pdf")), None)
     lyrics = "lyrics.json" if "lyrics.json" in files else None
 
-    vdir = os.path.join(d, "media", "video")
+    vdir = os.path.join(media_dir(d), "video")
     outputs = []
     if os.path.isdir(vdir):
         outputs = [f for f in sorted(os.listdir(vdir))
@@ -530,28 +537,6 @@ def api_homr_engines() -> Dict:
                         for e in omr.engines()]}
 
 
-@app.post("/api/songs/{slug}/approve-scan")
-def api_approve_scan(slug: str, body: Dict = None) -> Dict:
-    """The one explicit OK: a person looked at this parse, so the song may leave.
-
-    The revision comes back from the browser and has to match what is on disk. A
-    scan that finished while the panel was open would otherwise be approved by a
-    click aimed at the reading it replaced.
-    """
-    song = _require(slug)
-    expected = (body or {}).get("revision")
-    current = scan.revision(song)
-    if expected and expected != current:
-        raise HTTPException(
-            409, "The scan changed while you were looking at it; check the new "
-                 "systems before saying it is right.")
-    try:
-        scan.approve(song)
-    except scan.ScanError as exc:
-        raise HTTPException(400, str(exc)) from None
-    return _derived(_require(slug))
-
-
 @app.get("/api/songs/{slug}/scan-system/{index}")
 def api_scan_system(slug: str, index: int, dpi: int = 200):
     """One scanned system, engraved — the parse as a picture, beside its band.
@@ -602,11 +587,25 @@ def api_save_systems(slug: str, answers: Dict = None) -> Dict:
     return {"ok": True}
 
 
+def _error_text(exc: BaseException) -> str:
+    """What a failed job says. Our own errors are sentences; anything else names its type.
+
+    A bare `str(KeyError(3))` is `"3"`, and that was the whole of what one failed
+    clean told anybody — the traceback only reaches the service journal (#357).
+    """
+    if isinstance(exc, (RuntimeError, FixError)):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _run_clean(slug: str) -> None:
     song = _require(slug)
     xml = song.source_path("xml")
     log = lambda m: _job_emit(slug, "clean", m)
     try:
+        # A pick made on a reading the scan has since replaced is about a bar that is
+        # not there any more; replaying it would fail the clean, or worse, fit.
+        bar_readings.drop_stale_picks(song, log)
         opens: Dict = {}
         cleaned, source_mscx = pipeline.run_clean(
             xml, song.dir, per_system=(song.mode == "per-system"), log=log,
@@ -640,17 +639,12 @@ def _run_clean(slug: str) -> None:
         n = health.finding_count(open_issues)
         final = f"Done. {n} issue(s) to review." if n else "Done. No issues found."
         log(final)
-        # This is the first moment the verdict is knowable, so it is the first moment
-        # it is said. A count on its own reads as a to-do list however large it gets.
-        judgement = health.verdict(open_issues, health.score_bars(cleaned))
-        if judgement["level"] == "unusable":
-            log(judgement["message"])
         _job_finish(song, "clean")
         hub.emit(slug, {"type": "state"})
     except Exception as exc:  # surface to the UI rather than dying silently
         traceback.print_exc()
-        _job_emit(slug, "clean", str(exc), "error")
-        _job_finish(song, "clean", str(exc))
+        _job_emit(slug, "clean", _error_text(exc), "error")
+        _job_finish(song, "clean", _error_text(exc))
         hub.emit(slug, {"type": "state"})
 
 
@@ -789,6 +783,109 @@ def api_record_slur(slug: str, body: Dict) -> Dict:
     return _derived(song)
 
 
+@app.get("/api/songs/{slug}/readings")
+def api_readings(slug: str) -> Dict:
+    """The unsure bars homr offered other readings of, matched to the cleaned score.
+
+    Its own route rather than part of the song state: finding them parses every
+    fragment and the cleaned score, which only the Fix panel needs.
+    """
+    song = _require(slug)
+    cleaned = _cleaned_or_400(song)
+    try:
+        found = bar_readings.offers(song, cleaned)
+    except (OSError, RuntimeError, etree.XMLSyntaxError) as exc:
+        raise HTTPException(500, str(exc))
+    return {"offers": found}
+
+
+@app.get("/api/songs/{slug}/readings/{offer}/{letter}.svg")
+def api_reading_svg(slug: str, offer: str, letter: str):
+    """One reading of one bar, engraved."""
+    song = _require(slug)
+    _cleaned_or_400(song)
+    try:
+        svg = bar_readings.option_svg(song, offer, letter)
+    except FixError as exc:
+        raise HTTPException(404, str(exc))
+    except (OSError, RuntimeError, StopIteration) as exc:
+        raise HTTPException(500, str(exc))
+    return Response(svg, media_type="image/svg+xml", headers=dict(REVALIDATE))
+
+
+@app.post("/api/songs/{slug}/readings/pick")
+def api_pick_reading(slug: str, body: Dict) -> Dict:
+    """Apply the reading a person picked against the page, or record that none fits."""
+    song = _require(slug)
+    _cleaned_or_400(song)
+    body = body or {}
+    offer, choice = str(body.get("offer") or ""), str(body.get("choice") or "")
+    if not offer or not choice:
+        raise HTTPException(400, "say which bar (offer) and which reading (choice)")
+    # A clean or render reads the score this rewrites.
+    if is_scanning(song) or any(
+            job_state.is_running(song.dir, kind) for kind in ("clean", "render", "upload")):
+        raise HTTPException(409, "A scan, clean, render, or upload is running for this "
+                                 "song — wait for it to finish, then pick again.")
+    try:
+        done = bar_readings.record_pick(song, offer, choice)
+    except FixError as exc:
+        raise HTTPException(400, str(exc))
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(500, str(exc))
+    hub.emit(slug, {"type": "log", "line": f"Picked a reading — {done['applied']}"})
+    # Our own write, as with a recorded slur: claim it, or the watcher re-checks it.
+    _rescan(song)
+    return _derived(song)
+
+
+@app.get("/api/songs/{slug}/problems")
+def api_problems(slug: str) -> Dict:
+    """Every problem of the cleaned score, one row per bar and part, with its choices.
+
+    Its own route for the same reason `/readings` is: it parses the cleaned score and
+    every fragment, which only the Fix panel needs.
+    """
+    song = _require(slug)
+    _cleaned_or_400(song)
+    try:
+        rows = problems.problems(song)
+    except (OSError, RuntimeError, etree.XMLSyntaxError) as exc:
+        raise HTTPException(500, str(exc))
+    return {"rows": rows}
+
+
+@app.post("/api/songs/{slug}/problems/pick")
+def api_pick_problem(slug: str, body: Dict) -> Dict:
+    """Apply a person's answer to one problem's choice: a reading, a slur, a repeat or its brackets."""
+    song = _require(slug)
+    _cleaned_or_400(song)
+    body = body or {}
+    choice, kind, letter = (str(body.get(k) or "") for k in ("choice", "kind", "letter"))
+    if not choice or not letter:
+        raise HTTPException(400, "say which problem (choice) and which answer (letter)")
+    if is_scanning(song) or any(
+            job_state.is_running(song.dir, k) for k in ("clean", "render", "upload")):
+        raise HTTPException(409, "A scan, clean, render, or upload is running for this "
+                                 "song — wait for it to finish, then pick again.")
+    try:
+        if kind == "slur":
+            done = problems.record_slur_choice(song, choice, letter)
+        elif kind == "repeat":
+            done = problems.record_repeat_choice(song, choice, letter)
+        elif kind == "volta":
+            done = problems.record_volta_choice(song, choice, letter)
+        else:
+            done = bar_readings.record_pick(song, choice, letter)
+    except FixError as exc:
+        raise HTTPException(400, str(exc))
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(500, str(exc))
+    hub.emit(slug, {"type": "log", "line": f"Picked {letter} — {done['applied']}"})
+    _rescan(song)
+    return _derived(song)
+
+
 @app.post("/api/songs/{slug}/issues/{issue_id}/dismiss")
 def api_dismiss(slug: str, issue_id: str) -> Dict:
     song = _require(slug)
@@ -887,6 +984,70 @@ def api_playlists() -> List[Dict]:
     return state.load_playlists()
 
 
+def _youtube_failed(exc: Exception) -> HTTPException:
+    """YouTube refusing or unreachable, said in words (#338)."""
+    from src.stemmanauha.upload_to_youtube import QuotaExceeded
+    if isinstance(exc, QuotaExceeded):
+        return HTTPException(503, str(exc))
+    return HTTPException(503, f"YouTube could not be reached: {exc}")
+
+
+@app.post("/api/playlists")
+def api_remember_playlist(body: Dict) -> List[Dict]:
+    """Offer one more of the account's playlists for songs to be picked into."""
+    playlist_id = (body.get("playlist_id") or "").strip()
+    if not playlist_id:
+        raise HTTPException(400, "Which playlist?")
+    state.save_playlist(playlist_id, body.get("title") or None)
+    return state.load_playlists()
+
+
+@app.delete("/api/playlists/{playlist_id}")
+def api_forget_playlist(playlist_id: str) -> List[Dict]:
+    """Stop offering a playlist. It is not touched on YouTube."""
+    state.forget_playlist(playlist_id)
+    return state.load_playlists()
+
+
+@app.get("/api/youtube-playlists")
+def api_youtube_playlists() -> List[Dict]:
+    try:
+        return playlists.account_playlists()
+    except Exception as exc:
+        raise _youtube_failed(exc)
+
+
+@app.get("/api/songs/{slug}/playlists")
+def api_song_playlists(slug: str) -> Dict:
+    song = _require(slug)
+    try:
+        return playlists.song_playlists(song)
+    except playlists.PlaylistError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise _youtube_failed(exc)
+
+
+@app.post("/api/songs/{slug}/playlists")
+def api_song_playlist_membership(slug: str, body: Dict) -> Dict:
+    """Put this song's videos into a playlist, or take them out (#338)."""
+    song = _require(slug)
+    if is_recording(song):
+        raise HTTPException(409, "A recording or upload is running; try again when it is done.")
+    log = lambda m: hub.emit(slug, {"type": "log", "line": m})
+    try:
+        row = playlists.set_membership(song, (body.get("playlist_id") or "").strip(),
+                                       bool(body.get("member")), log,
+                                       title=body.get("title") or None)
+    except playlists.PlaylistError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise _youtube_failed(exc)
+    # The site lists the choir's playlists, so it would otherwise wait for its schedule.
+    site_refresh.refresh_stemmanauhat(log)
+    return row
+
+
 @app.get("/api/prompt")
 def api_prompt() -> Dict:
     path = os.path.join(SCRIPT_DIR, "lyric_json_prompt.txt")
@@ -941,6 +1102,15 @@ def api_lyrics(slug: str, body: Dict) -> Dict:
     except Exception as exc:
         raise HTTPException(400, f"Import failed: {exc}")
     current_fingerprint = state.file_fingerprint(cleaned)
+    # Claim the write before the slow health check below (#336). The file watcher
+    # sees the score change at once, and until the new fingerprint is on disk it
+    # takes the import for an edit made in MuseScore: it checks the score again and
+    # tells the page the score moved, so the page fetches every system's picture
+    # again instead of the one or two the import changed.
+    with state.song_lock(song.slug):
+        claimed = state.load(song.slug) or song
+        claimed.data["cleaned_fingerprint"] = current_fingerprint
+        claimed.save()
     song.data["lyrics"] = {
         "json": "lyrics.json",
         "imported_against": current_fingerprint,
@@ -964,7 +1134,9 @@ def api_lyrics(slug: str, body: Dict) -> Dict:
     if result.ok:
         song.set_stage("review")
     song.save()
-    return _derived(song)
+    # The bars that did not take their words, said in the reply itself rather than
+    # left for the caller to dig out of the song's `lyrics.warnings` (#340).
+    return {**_derived(song), "mismatches": song.data["lyrics"]["warnings"]}
 
 
 # --------------------------------------------------------------------------
@@ -1113,7 +1285,7 @@ def _printed_systems(song) -> list:
     the page's systems were. Empty when the source never had breaks — the renderer
     then falls back to numbering at a regular interval.
     """
-    return pipeline.printed_system_starts(_bounds_score(song))
+    return pipeline.cleaned_system_starts(song.dir, _bounds_score(song))
 
 
 def _cleaned_breaks(song) -> tuple:
@@ -1121,7 +1293,7 @@ def _cleaned_breaks(song) -> tuple:
     cleaned = song.cleaned_path()
     if not cleaned or not os.path.exists(cleaned):
         return None, []
-    return cleaned, pipeline.line_break_measures(_bounds_score(song))
+    return cleaned, pipeline.cleaned_line_breaks(song.dir, _bounds_score(song))
 
 
 @app.get("/api/songs/{slug}/compare")
@@ -1170,6 +1342,29 @@ def api_system_image(slug: str, index: int, dpi: int = 400):
     return FileResponse(path, media_type="image/png", headers=dict(REVALIDATE))
 
 
+@app.get("/api/songs/{slug}/system/{index}/where")
+def api_system_where(slug: str, index: int, staff: int, staves: int,
+                     bar: Optional[int] = None, bars: Optional[int] = None, dpi: int = 200):
+    """Where one staff, and one bar of it, is in a printed system's crop (#368).
+
+    `{"box": {top, bottom, left, right, bar}}` in fractions of the crop at `dpi`, or
+    `{"box": null}` when the crop does not show the staves the score says it prints.
+    """
+    from PIL import Image
+
+    song = _require(slug)
+    pdf = _song_pdf(song)
+    try:
+        path = pipeline.system_crop(song.dir, pdf, index, max(50, min(dpi, 600)))
+        with Image.open(path) as image:
+            box = system_finder.bar_box(image, staff, staves, bar, bars)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+    return {"box": box}
+
+
 @app.get("/api/songs/{slug}/pdf")
 def api_pdf(slug: str):
     song = _require(slug)
@@ -1190,6 +1385,7 @@ def api_render(slug: str, doc: str = "cleaned"):
     song = _require(slug)
     try:
         breaks = None
+        tidy = False
         if doc == "original":
             xml = song.source_path("xml")
             if not xml or not os.path.exists(xml):
@@ -1205,9 +1401,10 @@ def api_render(slug: str, doc: str = "cleaned"):
             # usually has them -- when it does not, the render is unchanged.
             xml = song.source_path("xml")
             if xml and os.path.exists(xml):
-                breaks = pipeline.line_break_measures(
-                    pipeline.convert_to_mscx(xml, song.dir)) or None
-        rendered = pipeline.render_score_pdf(mscx, breaks)
+                breaks = pipeline.cleaned_line_breaks(
+                    song.dir, pipeline.convert_to_mscx(xml, song.dir)) or None
+            tidy = True
+        rendered = pipeline.render_score_pdf(mscx, breaks, tidy=tidy)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1318,30 +1515,62 @@ def _staff_groups(cleaned: str, text) -> str:
         raise HTTPException(400, str(exc)) from None
 
 
-def _remember_margins(song: state.Song, top: float, bottom: float,
-                      staff_groups: Optional[str] = None) -> None:
-    """Keep the framing this song was last shown at.
+def _remember_record_settings(song: state.Song, **wanted) -> None:
+    """Keep the Record settings this song was last shown or rendered with.
 
-    The staff grouping (#246) is part of the framing — it changes what is drawn,
-    not what is heard — so it is kept the same way, when given.
-
-    Written when a render is asked for and when a preview succeeds, so nudging a
-    margin to see what it looks like is enough to keep it — that is the moment the
-    choice is actually made. Only a real change is written, and never while a job
-    is running: the state file is saved whole, so a needless write here could land
-    on top of what a finishing render just recorded. Pass a freshly loaded song for
-    the same reason.
+    The framing (margins, and the staff grouping of #246 — it changes what is
+    drawn, not what is heard), the output quality, the tempo the app supplies and
+    the encoder choice. Written when a render is asked for, when the panel's
+    Preview or Save settings is pressed (#301), and when a preview succeeds, so
+    nudging a value to see what it looks like is enough to keep it — that is the
+    moment the choice is actually made. Only a real change is written, and never
+    while a job is running: the state file is saved whole, so a needless write
+    here could land on top of what a finishing render just recorded. Pass a
+    freshly loaded song for the same reason.
     """
     rec = song.data.get("record", {})
-    wanted = {"top_margin": top, "bottom_margin": bottom}
-    if staff_groups is not None:
-        wanted["staff_groups"] = staff_groups
     if all(rec.get(key) == value for key, value in wanted.items()):
         return
     if is_recording(song):
         return
     song.data.setdefault("record", {}).update(wanted)
     song.save()
+
+
+def _scroll_settings(song: state.Song, opts: Dict) -> Dict:
+    """The scrolling renderer's settings out of a request, checked the way a render
+    checks them; anything the request leaves out falls back to what this song
+    chose last, then to the app-wide default.
+
+    One place for both the render and Save settings, so a value the render would
+    refuse is refused on save too, with the same message. The staff grouping and
+    the tempo need the cleaned score; without one they are left out. The tempo is
+    left out too when the score carries its own, since it would be ignored.
+    """
+    remembered = song.data.get("record", {})
+    quality = opts.get("quality", remembered.get("quality"))
+    out = {
+        "quality": quality if quality in pipeline.SCROLL_QUALITY else "4k",
+        "hardware_encoding": opts.get(
+            "hardware_encoding", remembered.get("hardware_encoding")) is not False,
+    }
+    for key, label, default in (
+            ("top_margin", "Top", DEFAULT_TOP_MARGIN_PERCENT),
+            ("bottom_margin", "Bottom", DEFAULT_BOTTOM_MARGIN_PERCENT)):
+        out[key] = _margin(opts.get(key, remembered.get(key, default)), label)
+    cleaned = song.cleaned_path()
+    if cleaned and os.path.exists(cleaned):
+        out["staff_groups"] = _staff_groups(
+            cleaned, opts.get("staff_groups", remembered.get("staff_groups", "")))
+        if not pipeline.has_opening_tempo(cleaned):
+            try:
+                bpm = int(opts.get("bpm", remembered.get("bpm", 80)))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "BPM must be a whole number") from None
+            if not 20 <= bpm <= 300:
+                raise HTTPException(400, "BPM must be between 20 and 300")
+            out["bpm"] = bpm
+    return out
 
 
 @app.get("/api/songs/{slug}/scroll-preview")
@@ -1355,13 +1584,13 @@ async def api_scroll_preview(slug: str, quality: str = "4k",
     scroll curve and *pixels* `build_videos` would use, drawn by the same code at a
     height a page can carry. It does not count as a render — no stage moves and no
     video appears; the only files it leaves behind are its own cache. The one thing
-    it does record is the framing it was asked for (`_remember_margins`), because
+    it does record is the settings it was asked for (`_remember_record_settings`), because
     nudging a margin and looking at the result *is* how the choice gets made, and
     having to render before it would stick lost it every time.
 
     It also fails where a render would, and that is half its value: a D.C./D.S.
-    jump or margins that leave no picture come back here as an ordinary error
-    message, seconds in, instead of after minutes of engraving and encoding.
+    jump that cannot be matched to the page or margins that leave no picture come
+    back here as an ordinary error message, seconds in, instead of after minutes of engraving and encoding.
     """
     song = _require(slug)
     cleaned = song.cleaned_path()
@@ -1389,8 +1618,13 @@ async def api_scroll_preview(slug: str, quality: str = "4k",
         raise HTTPException(400, str(exc) or exc.__class__.__name__)
     # Only once the picture came out: a framing the renderer refuses is not one to
     # come back to. Reloaded, because preparing can take seconds.
-    _remember_margins(_require(slug), settings["top_margin_percent"],
-                      settings["bottom_margin_percent"], groups)
+    remember = {"quality": settings["quality"],
+                "top_margin": settings["top_margin_percent"],
+                "bottom_margin": settings["bottom_margin_percent"],
+                "staff_groups": groups}
+    if settings["initial_bpm"]:
+        remember["bpm"] = settings["initial_bpm"]
+    _remember_record_settings(_require(slug), **remember)
     return JSONResponse(payload, headers=dict(REVALIDATE))
 
 
@@ -1463,8 +1697,6 @@ def _run_record(slug: str, opts: Dict) -> None:
         rec = current_song.data.setdefault("record", {})
         rec.setdefault("uploads", []).append(info)
         rec["playlist_id"] = info.get("playlist_id")
-        if info.get("playlist_id"):
-            state.save_playlist(info["playlist_id"], info.get("playlist_title"))
         current_song.save()
         hub.emit(slug, {"type": "state"})
 
@@ -1522,6 +1754,7 @@ def _run_record(slug: str, opts: Dict) -> None:
             rec["verification"] = verification.verify_media(
                 song, rec["outputs"], verification.singing_parts(cleaned))
             rec["error"] = None
+            rec.pop("freed", None)  # the videos are on disk again
             song.set_stage("upload")
             song.save()
             log(f"Done. {len(outputs)} video(s) ready.")
@@ -1565,6 +1798,7 @@ def _run_record(slug: str, opts: Dict) -> None:
         song = _require(slug)
         rec = song.data.setdefault("record", {})
         if not upload_only:
+            rec.pop("freed", None)  # the videos are on disk again
             rec["exported"] = True
             rec["renderer"] = "screen"
             rec["audio_delay_ms"] = int(opts.get("audio_delay_ms", 1300))
@@ -1581,6 +1815,10 @@ def _run_record(slug: str, opts: Dict) -> None:
                 else previous_rendered_against
             rec["verification"] = verification.verify_media(
                 song, rec["outputs"], verification.singing_parts(cleaned))
+        if youtube and rec.get("uploads"):
+            # One refresh picks up every video this run uploaded (#321).
+            rec["site_refresh"] = {"at": time.time(),
+                                   "ok": site_refresh.refresh_stemmanauhat(log)}
         rec["error"] = None
         # After recording, move on to the Upload stage; uploading stays there.
         if not merge_only:
@@ -1601,6 +1839,27 @@ def _run_record(slug: str, opts: Dict) -> None:
         hub.emit(slug, {"type": "state"})
 
 
+RECORD_SETTINGS = ("quality", "hardware_encoding", "top_margin", "bottom_margin",
+                   "staff_groups", "bpm")
+
+
+@app.post("/api/songs/{slug}/record-settings")
+async def api_record_settings(slug: str, body: Dict = None) -> Dict:
+    """Save the scrolling renderer's settings without rendering (#301).
+
+    The Record panel's Save settings button, and its Preview button before it
+    opens the preview. Refused while a job runs: a render writes these same
+    fields when it finishes, and the state file is saved whole.
+    """
+    song = _require(slug)
+    if is_recording(song) or is_scanning(song) or job_state.is_running(song.dir, "clean"):
+        raise HTTPException(409, "A scan, clean or render is running — save the "
+                                 "settings after it finishes.")
+    settings = _scroll_settings(song, body or {})
+    _remember_record_settings(song, **settings)
+    return {"record": {key: song.data.get("record", {}).get(key) for key in RECORD_SETTINGS}}
+
+
 @app.post("/api/songs/{slug}/record")
 async def api_record(slug: str, body: Dict = None) -> Dict:
     song = _require(slug)
@@ -1615,38 +1874,27 @@ async def api_record(slug: str, body: Dict = None) -> Dict:
             raise HTTPException(409, "Review and approve the current score before rendering")
     scrolling_render = (opts.get("renderer") or "scroll") == "scroll" \
         and not (opts.get("merge_only") or opts.get("upload_only"))
-    cleaned = song.cleaned_path()
     if scrolling_render:
-        # Remembered the way the BPM is: at request time, and falling back to what
-        # this song chose last before the app-wide default. Writing them only after
-        # a render succeeded meant a margin nudged against a render that then failed
-        # was gone by the next page load, and the panel offered the default again.
-        remembered = song.data.get("record", {})
-        for key, label, default in (
-                ("top_margin", "Top", DEFAULT_TOP_MARGIN_PERCENT),
-                ("bottom_margin", "Bottom", DEFAULT_BOTTOM_MARGIN_PERCENT)):
-            opts[key] = _margin(opts.get(key, remembered.get(key, default)), label)
-        if cleaned and os.path.exists(cleaned):
-            opts["staff_groups"] = _staff_groups(
-                cleaned, opts.get("staff_groups", remembered.get("staff_groups", "")))
-        _remember_margins(song, opts["top_margin"], opts["bottom_margin"],
-                          opts.get("staff_groups"))
-    if scrolling_render and cleaned and os.path.exists(cleaned) \
-            and not pipeline.has_opening_tempo(cleaned):
-        try:
-            bpm = int(opts.get("bpm", song.data.get("record", {}).get("bpm", 80)))
-        except (TypeError, ValueError):
-            raise HTTPException(400, "BPM must be a whole number") from None
-        if not 20 <= bpm <= 300:
-            raise HTTPException(400, "BPM must be between 20 and 300")
-        opts["bpm"] = bpm
-        song.data.setdefault("record", {})["bpm"] = bpm
-        song.save()
+        # Remembered at request time, falling back to what this song chose last
+        # before the app-wide default. Writing them only after a render succeeded
+        # meant a margin nudged against a render that then failed was gone by the
+        # next page load, and the panel offered the default again.
+        settings = _scroll_settings(song, opts)
+        opts.pop("bpm", None)  # only a tempo the score lacks is passed on
+        opts.update(settings)
+        _remember_record_settings(song, **settings)
     else:
         opts.pop("bpm", None)
+    if opts.get("upload_only"):
+        names = song.data.get("record", {}).get("outputs", [])
+        # An empty list is an older song: the upload finds its videos by name, as before.
+        if names and not all(os.path.exists(song.media_path("video", os.path.basename(n)))
+                             for n in names):
+            raise HTTPException(409, "The videos are not on disk (freed after an "
+                                     "upload?) — record again to make them.")
     kind = "upload" if opts.get("upload_only") else "render"
     if not job_state.start_if_idle(
-            song.dir, kind, ("scan", "clean", "render", "upload"), source_fingerprint):
+            song.dir, kind, ("scan", "clean", "render", "upload", "free"), source_fingerprint):
         raise HTTPException(409, "Another scan, clean, render, or upload is already running for this song.")
     # The durable start above is the atomic gate; the PID lock keeps the existing
     # process-aware recording indicator and stale-lock recovery behavior.
@@ -1659,7 +1907,7 @@ async def api_record(slug: str, body: Dict = None) -> Dict:
     opts["_source_fingerprint"] = source_fingerprint
     if opts.get("upload_only"):
         opts["_existing_outputs"] = [
-            song.path("media", "video", os.path.basename(name))
+            song.media_path("video", os.path.basename(name))
             for name in song.data.get("record", {}).get("outputs", [])
         ]
     asyncio.get_running_loop().run_in_executor(None, _run_record, slug, opts)
@@ -1670,7 +1918,7 @@ async def api_record(slug: str, body: Dict = None) -> Dict:
 def api_media(slug: str, name: str):
     song = _require(slug)
     safe = os.path.basename(name)
-    path = song.path("media", "video", safe)
+    path = song.media_path("video", safe)
     if not os.path.exists(path):
         raise HTTPException(404, "No such media")
     kind = "video/mp4" if safe.lower().endswith(".mp4") else "video/quicktime"
@@ -1685,6 +1933,8 @@ def api_youtube_delete(slug: str) -> Dict:
     ids = [u.get("video_id") for u in uploads if u.get("video_id")]
     if not ids:
         raise HTTPException(400, "Nothing uploaded to delete")
+    if job_state.is_running(song.dir, "free"):
+        raise HTTPException(409, "The local videos are being freed — try again in a moment.")
     try:
         from src.stemmanauha.upload_to_youtube import delete_videos
         delete_videos(ids, log=lambda m: hub.emit(slug, {"type": "log", "line": m}))
@@ -1693,13 +1943,52 @@ def api_youtube_delete(slug: str) -> Dict:
     song.data["record"]["uploads"] = []
     song.data["record"]["playlist_id"] = None
     song.save()
+    # The site would otherwise list the deleted videos until its schedule runs.
+    site_refresh.refresh_stemmanauhat(lambda m: hub.emit(slug, {"type": "log", "line": m}))
     return _derived(song)
+
+
+def _free_videos(slug: str) -> Dict:
+    song = _require(slug)
+    log = lambda m: _job_emit(slug, "free", m)
+    try:
+        from src.stemmanauha.upload_to_youtube import confirm_uploads
+        freed = free_videos.free(song, lambda ids: confirm_uploads(ids, log=log), log=log)
+        _job_finish(song, "free")
+        return freed
+    except Exception as exc:
+        _job_emit(slug, "free", str(exc), "error")
+        _job_finish(song, "free", str(exc))
+        raise
+
+
+@app.post("/api/songs/{slug}/free-videos")
+async def api_free_videos(slug: str) -> Dict:
+    """Delete the local videos once YouTube is confirmed to have every one (#371).
+
+    Holds the song's job gate while it runs, so no render, upload or second free
+    starts underneath it, and refuses while one is running.
+    """
+    song = _require(slug)
+    if is_recording(song) or is_scanning(song) or not job_state.start_if_idle(
+            song.dir, "free", ("scan", "clean", "render", "upload", "free")):
+        raise HTTPException(409, "A recording or upload is running — free the "
+                                 "videos after it finishes.")
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _free_videos, slug)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except Exception as exc:
+        raise HTTPException(502, f"Could not confirm with YouTube: {exc}") from None
+    finally:
+        hub.emit(slug, {"type": "state"})
+    return _derived(_require(slug))
 
 
 @app.post("/api/songs/{slug}/reveal-media")
 def api_reveal_media(slug: str) -> Dict:
     song = _require(slug)
-    vdir = song.path("media", "video")
+    vdir = song.media_path("video")
     if not os.path.isdir(vdir):
         raise HTTPException(404, "No media yet")
     subprocess.Popen(["open", vdir])

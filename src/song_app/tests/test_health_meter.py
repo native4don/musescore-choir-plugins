@@ -232,3 +232,86 @@ def test_the_verification_summary_reports_the_underlying_count(tmp_path, monkeyp
 
     # The library badge is the other place two songs are compared by a number.
     assert song.to_summary()["open_issues"] == 4
+
+
+def test_a_grace_note_takes_no_time_in_the_bar(tmp_path):
+    """Lempilintu (eerovil/musescore-choir-plugins#274): a solo bar with two grace
+    eighths before its half note was reported as 7/4 of a 6/4 bar."""
+    path = _score(tmp_path, [[8], [8]])
+    root = etree.parse(path).getroot()
+    voice = root.find(".//Staff/Measure[2]/voice")
+    grace = etree.Element("Chord")
+    etree.SubElement(grace, "appoggiatura")
+    etree.SubElement(grace, "durationType").text = "eighth"
+    etree.SubElement(etree.SubElement(grace, "Note"), "pitch").text = "62"
+    voice.insert(0, grace)
+    etree.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
+    assert _kinds(path, "malformed-measure") == []
+
+
+def _meter_findings(path):
+    """Listed and collapsed alike, so an exemption cannot pass by being collapsed."""
+    return [i for i in health.scan(path) if i["kind"] in ("unprinted-meter", "meter-collapsed")]
+
+
+def _score_with_meters(tmp_path, measures, lens, sigs):
+    """Like `_score`, with a TimeSig at every bar `sigs` names ({index: (n, d)})."""
+    path = _score(tmp_path, measures, sig=None, lens=lens)
+    tree = etree.parse(path)
+    for mi, measure in enumerate(tree.getroot().find("Score/Staff").findall("Measure")):
+        if mi in sigs:
+            for v in measure.findall("voice"):
+                ts = etree.Element("TimeSig")
+                etree.SubElement(ts, "sigN").text = str(sigs[mi][0])
+                etree.SubElement(ts, "sigD").text = str(sigs[mi][1])
+                v.insert(0, ts)
+    tree.write(path, encoding="UTF-8", xml_declaration=True)
+    return path
+
+
+# The closing bar of a song that opens with a pickup (#353). Kesäaamu opens with a
+# sixteenth in 6/8 and closes on a bar of 11/16: the two make one bar between them,
+# which is how the page prints it, and four "bar is 11/16" rows said otherwise.
+# Four ordinary bars between them, so the overrides stay a minority of the score.
+
+def test_a_last_bar_that_completes_the_pickup_is_quiet(tmp_path):
+    path = _score(tmp_path, [[1]] + [[8]] * 4 + [[7]], lens=["1/8"] + [None] * 4 + ["7/8"])
+    assert not _meter_findings(path)
+
+
+def test_a_short_last_bar_with_no_pickup_is_still_reported(tmp_path):
+    path = _score(tmp_path, [[8]] * 5 + [[7]], lens=[None] * 5 + ["7/8"])
+    assert [i["measure"] for i in _kinds(path, "unprinted-meter")] == [6]
+
+
+def test_a_last_bar_that_does_not_complete_the_pickup_is_still_reported(tmp_path):
+    path = _score(tmp_path, [[1]] + [[8]] * 4 + [[6]], lens=["1/8"] + [None] * 4 + ["6/8"])
+    assert [i["measure"] for i in _kinds(path, "unprinted-meter")] == [6]
+
+
+def test_only_the_last_bar_is_let_through(tmp_path):
+    """A bar of the pickup's complement in the middle of the song is not a closing bar."""
+    path = _score(tmp_path, [[1], [7]] + [[8]] * 4, lens=["1/8", "7/8"] + [None] * 4)
+    assert [i["measure"] for i in _kinds(path, "unprinted-meter")] == [2]
+
+
+def test_a_compound_meter_pickup_is_completed_the_same_way(tmp_path):
+    """Metsämiehen juomalaulu's shape: 9/8 with a 4/8 pickup and a 5/8 last bar."""
+    path = _score(tmp_path, [[4]] + [[9]] * 3 + [[5]], sig=(9, 8),
+                  lens=["4/8", None, None, None, "5/8"])
+    assert not _meter_findings(path)
+
+
+def test_the_meter_at_the_end_decides(tmp_path):
+    """4/4 changing to 3/4: a 1/4 pickup is completed by a 2/4 last bar."""
+    path = _score_with_meters(tmp_path, [[2], [8], [6], [6], [4]],
+                              lens=["1/4", None, None, None, "2/4"],
+                              sigs={0: (4, 4), 2: (3, 4)})
+    assert not _meter_findings(path)
+
+
+def test_the_exempt_last_bar_is_still_checked_for_extra_voices(tmp_path):
+    """Only the meter finding is waived; two voices on one staff are still reported."""
+    path = _score(tmp_path, [[2]] + [[8]] * 3 + [[6, 6]], lens=["1/4", None, None, None, "3/4"])
+    assert not _meter_findings(path)
+    assert [i["measure"] for i in _kinds(path, "extra-voices")] == [5]

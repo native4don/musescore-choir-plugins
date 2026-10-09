@@ -158,12 +158,41 @@ label { display: block; margin: 12px 0 4px; color: var(--muted); }
 .slureffect { margin: 4px 0 8px; }
 .slurcropimg { display: block; width: 100%; margin: 8px 0; background: #fff; }
 
+/* Every problem, one card per bar and part (#290): what is wrong, the page, then the
+   choices — homr's options engraved, or a slur's answers as words — one tap each. */
+.problems { margin: 12px 0; }
+.problem .detail .dismiss { padding: 2px 8px; font-size: 12px; }
+.readpick { border-top: 1px solid var(--line); padding: 8px 0 0; margin-top: 8px; }
+.readtitle { font-weight: 600; margin-bottom: 4px; }
+.readtext { white-space: normal; }
+.readcrop { display: block; width: 100%; margin: 8px 0; background: #fff; }
+.cropwrap { position: relative; margin: 8px 0; }
+.cropwrap .readcrop { margin: 0; }
+.cropmark { position: absolute; border: 3px solid #e5a000; background: rgba(255, 200, 0, 0.18);
+  border-radius: 4px; pointer-events: none; box-sizing: border-box; }
+.cropmark.staffonly { border-style: dashed; background: rgba(255, 200, 0, 0.1); }
+.readswap { color: var(--warn); font-weight: 600; }
+.readwarn { background: var(--panel2); border-left: 4px solid var(--warn); padding: 6px 8px;
+  margin: 6px 0; font-size: 0.9em; }
+.readwarn strong { color: var(--warn); }
+.readwarn ul { margin: 4px 0; padding-left: 18px; }
+.problem .barpos { margin: 8px 0 0; font-weight: 600; }
+.readopts { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+.readopt[hidden] { display: none; }
+.readopt { display: flex; align-items: center; gap: 8px; padding: 6px 8px; text-align: left; }
+.readletter { font-weight: 700; min-width: 1.2em; }
+.readsvg { background: #fff; border-radius: 4px; max-width: 100%; height: auto; flex: 0 1 auto;
+  min-width: 0; max-height: 96px; object-fit: contain; object-position: left; }
+
 /* grid form */
 table.grid { border-collapse: collapse; width: 100%; margin-bottom: 12px; }
 table.grid th, table.grid td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
 table.grid th { background: var(--panel2); color: var(--muted); font-weight: 600; }
 table.grid input { width: 100%; }
 table.grid input.unset { border-color: var(--warn); }
+table.grid input.undernamed { border-color: var(--warn); }
+table.grid .undernote { color: var(--warn); font-size: 12px; }
+table.grid .undernote:empty { display: none; }
 .sysblock { margin-bottom: 18px; }
 .sysblock h4 { margin: 0 0 6px; }
 .syshead { justify-content: space-between; margin-bottom: 6px; }
@@ -196,10 +225,6 @@ table.grid input.unset { border-color: var(--warn); }
 .banner.good { color: var(--good); border-color: var(--good); }
 .banner.err { color: var(--bad); border-color: var(--bad); }
 .banner.warn { color: var(--warn); border-color: var(--warn); }
-/* The verdict on a whole parse. Loud, because the thing it is arguing against is a
-   long tidy list of small rows that reads as ordinary work. */
-.verdict strong { display: block; margin-bottom: 4px; }
-.verdict .hint { margin-top: 4px; }
 .scanfound { color: var(--warn); }
 .verify { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 12px 0; background: var(--panel); }
 .verify h3 { margin: 0 0 4px; }
@@ -244,7 +269,7 @@ table.grid input.unset { border-color: var(--warn); }
 .record-common { margin-top: 10px; }
 .record-advanced { margin: 12px 0; border: 1px solid var(--line); border-radius: 9px; padding: 0 10px; }
 .record-advanced summary { cursor: pointer; padding: 10px 0; color: var(--muted); }
-.record-actions { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; }
+.record-actions { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 8px; }
 .record-actions.screen { grid-template-columns: 1fr; }
 .record-actions .primary { width: 100%; }
 .result { margin: 12px 0; }
@@ -252,6 +277,13 @@ table.grid input.unset { border-color: var(--warn); }
 .result video { width: 100%; border-radius: 8px; background: #000; }
 .uploads { margin: 4px 0 8px; padding-left: 18px; }
 .uploads li { margin: 2px 0; }
+.videostate { margin: 4px 0 8px; padding-left: 18px; }
+.videostate li.changed, .videostate li.not_uploaded { color: #b3261e; }
+.free-note.err { color: #b3261e; }
+.playlists .plrow { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0; }
+.playlists .plrow label { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.playlists .plnote { color: var(--muted); font-size: 0.9em; }
+.playlists .plhide { flex: none; font-size: 0.85em; padding: 2px 8px; }
 
 /* ---- Systems: printed-system boundaries drawn over the page ---- */
 .sysbar { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
@@ -321,15 +353,10 @@ table.grid input.unset { border-color: var(--warn); }
    stays in the sequence instead of the comparison quietly skipping a system. */
 .cmperr { border: 1px solid #a33; color: #a33; background: #fff4f4;
           border-radius: 4px; padding: .5rem .6rem; font-size: .8rem; }
-.newbadge { margin-left: .5rem; padding: .05rem .35rem; border-radius: 999px;
-            background: #ffe9c2; color: #7a4a00; font-weight: 600; font-size: .7rem; }
 
-/* Scan panel: a hole and the gate. Both are things the operator has to act on,
-   so they sit in the panel rather than in the log. */
-.scanhole .row { margin-top: .4rem; }
-.scanok { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--line);
-          border-radius: 8px; background: var(--panel2); }
-.scanok h3 { margin: 0 0 4px; }
+/* Scan panel: a hole is something the operator has to act on, so it sits in the
+   panel rather than in the log. */
+.scanhole .row, .scandone .row { margin-top: .4rem; }
 .panel .warn { color: var(--warn); }
 
 /* ---- Scroll preview ------------------------------------------------------
@@ -346,6 +373,14 @@ table.grid input.unset { border-color: var(--warn); }
 .pvtime { font-variant-numeric: tabular-nums; color: var(--muted); }
 .pvstatus { margin: .3rem 0; color: var(--muted); font-size: .85rem; }
 .pvstatus.err { color: #b3261e; }
+.save-note { display: block; min-height: 1.2em; margin-top: 4px; }
+.save-note.err { color: #b3261e; }
+/* No real percentage exists while the score is drawn, so the bar only says "working". */
+.pvprogress { position: relative; height: 4px; width: min(100%, 360px); overflow: hidden;
+  border-radius: 2px; background: rgba(127, 127, 127, .25); margin: .3rem 0; }
+.pvprogress::after { content: ""; position: absolute; top: 0; bottom: 0; width: 35%;
+  background: #4c8dff; animation: pvprogress 1.3s ease-in-out infinite; }
+@keyframes pvprogress { from { left: -35%; } to { left: 100%; } }
 .pvaudio-controls { align-items: center; gap: .5rem; margin-top: .35rem; }
 .pvaudio { flex: 1 1 16rem; min-width: 12rem; max-width: 100%; height: 34px; }
 .pvaudio-status { color: var(--muted); font-size: .8rem; }
@@ -503,3 +538,23 @@ table.grid input.unset { border-color: var(--warn); }
   .new-issue-link > span { display: none; }
   #reload-page > span[aria-hidden] { display: inline; }
 }
+
+/* Something slow is happening (#303): a score being built, a system being
+   engraved. Said in words with a running count, and holding the place the
+   picture will take, so nothing jumps when it lands. */
+.busynote { color: var(--muted); padding: 40px 12px; text-align: center; }
+.busynote.small { padding: 0; margin: 0; color: #777; font-size: .85rem; }
+.vupdating { position: sticky; top: 0; z-index: 2; width: max-content; margin: 0 auto 6px;
+             padding: 3px 10px; border-radius: 999px; font-size: .8rem;
+             background: var(--panel2); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.4); }
+.pdferr { padding: 40px 12px; }
+.cmpslot { display: flex; align-items: center; justify-content: center; min-height: 8rem;
+           margin-bottom: .35rem; border: 1px dashed #bbb; border-radius: 4px; background: #f6f6f6; }
+.cmpslot.err { border: 1px solid #a33; color: #a33; background: #fff4f4; padding: .5rem; }
+.cmpimg.fresh { animation: cmpfade .15s ease-in; }
+@keyframes cmpfade { from { opacity: 0; } to { opacity: 1; } }
+/* A cleaned system being brought up to date keeps its old picture under a note (#336). */
+.cmpcleaned { position: relative; }
+.liveupd { position: absolute; top: .3rem; right: .3rem; padding: .1rem .45rem; border-radius: 4px;
+           background: rgba(255,255,255,.9); color: #555; font-size: .8rem; border: 1px solid #ccc; }
+.liveerr { color: #a33; font-size: .85rem; margin: .2rem 0 .35rem; }

@@ -1,0 +1,422 @@
+"""Every problem in one list, each with its choices (#290).
+
+What the Fix panel shows is built here, so this pins what a row is: one per bar and
+part, everything wrong there said once, homr's other readings offered beside it as
+whole bars — lengths and pitches together, and the second reading (#295) — and a slur the scan ran between two singers offered back in either, both or
+neither. Then the answers: each goes onto the score and into fixes.json, and the slur
+answer comes back on a re-clean.
+"""
+import json
+from fractions import Fraction
+
+import pytest
+from lxml import etree
+
+from src.clean_score.tests.test_cross_voice_slurs import _score as _slur_score
+from src.clean_score.utils import score_fixes
+from src.clean_score.utils.cross_voice_slurs import (
+    _bar_lengths, _resolve, drop_cross_voice_slurs, removed_slurs, store_removed)
+from src.clean_score.utils.problem_marks import mark_bar, marks
+from src.clean_score.utils.score_fixes import FixError
+from src.song_app import bar_readings, pdf_systems, pipeline, problems, state
+from src.song_app.tests.test_bar_readings import (  # noqa: F401 - make_song is a fixture
+    READINGS, _fixes, _score, _tokens, make_song)
+
+# homr's second guess at bar 2's D3: an E flat, or a C.
+NOTES = {**READINGS, "version": 2, "notes": [
+    {"part": 0, "staff": 1, "bar": 2, "voice": "1", "moment": 1, "chord": 0,
+     "moments": READINGS["bars"][0]["moments"],
+     "pitches": [{"step": "D", "alter": 0, "octave": 3, "probability": None},
+                 {"step": "E", "alter": -1, "octave": 3, "probability": 0.3},
+                 {"step": "C", "alter": 0, "octave": 3, "probability": 0.05}]}]}
+
+
+def _pitch(song, staff=1, measure=3, index=1):
+    root = etree.parse(song.cleaned_path()).getroot()
+    note = score_fixes._chords(root, staff, measure)[index].find("Note")
+    return int(note.findtext("pitch")), int(note.findtext("tpc"))
+
+
+# ---------------------------------------------------------------- the list
+
+
+def _bar_of(option):
+    return [(m["value"], [bar_readings.pitch_name(p) for p in m["pitches"]])
+            for m in option["moments"]]
+
+
+def test_one_row_per_bar_and_part_with_whole_bars_to_pick(make_song):
+    song = make_song(readings=NOTES)
+    [row] = problems.problems(song)
+    assert (row["measure"], row["part"]) == (3, "B1")
+    [choice] = row["choices"]
+    assert choice["kind"] == "bar" and choice["shown"] == 6
+    # Three readings of the lengths times three pitches for the D: nine bars.
+    assert [o["letter"] for o in choice["options"]] == list("abcdefghi")
+    assert choice["options"][0]["current"]
+    assert all(o["svg"].endswith(f"/{o['letter']}.svg") for o in choice["options"])
+
+
+def _bands(song, *ranges):
+    pdf_systems.save_bounds(song.dir, [
+        pdf_systems.SystemBounds(index=i, page=1, top=0.1 * i, bottom=0.1 * i + 0.08,
+                                 measure_start=start, measure_end=end)
+        for i, (start, end) in enumerate(ranges, start=1)])
+
+
+def test_a_row_says_which_bar_of_its_printed_line_it_is(make_song):
+    """The crop is the whole line, so the row says which of its bars is meant (#310)."""
+    song = make_song(readings=NOTES)
+    _bands(song, (1, 1), (2, 5))
+    [row] = problems.problems(song)
+    assert (row["measure"], row["system"]) == (3, 2)
+    assert (row["bar_in_system"], row["bars_in_system"]) == (2, 4)
+
+
+@pytest.mark.parametrize("ranges, position", [
+    (((1, 2), (3, 6)), (1, 4)),   # the first bar of its line
+    (((1, 3), (4, 6)), (3, 3)),   # the last
+])
+def test_the_ends_of_a_line_count_from_one(make_song, ranges, position):
+    song = make_song(readings=None)
+    root = etree.parse(song.cleaned_path()).getroot()
+    mark_bar(root.findall(".//Score/Staff")[0].findall("Measure")[2], "pitch?")
+    etree.ElementTree(root).write(song.cleaned_path(), encoding="UTF-8")
+    _bands(song, *ranges)
+    [row] = problems.problems(song)
+    assert (row["bar_in_system"], row["bars_in_system"]) == position
+
+
+def test_without_bar_ranges_the_position_is_not_guessed(make_song):
+    song = make_song(readings=NOTES)
+    [row] = problems.problems(song)
+    assert row["system"] == 2   # still known, from the scan
+    assert (row["bar_in_system"], row["bars_in_system"]) == (None, None)
+    _bands(song, (0, 0), (0, 0))   # bands drawn but never labelled with bars
+    [row] = problems.problems(song)
+    assert (row["bar_in_system"], row["bars_in_system"]) == (None, None)
+
+
+def _marked_row(song, *meta):
+    """The one row a mark on B1 bar 3 makes, with the routing metaTags `meta` stored."""
+    root = etree.parse(song.cleaned_path()).getroot()
+    mark_bar(root.findall(".//Score/Staff")[0].findall("Measure")[2], "pitch?")
+    score = root.find("Score")
+    for name, text in meta:
+        tag = etree.SubElement(score, "metaTag", name=name)
+        tag.text = text
+    etree.ElementTree(root).write(song.cleaned_path(), encoding="UTF-8")
+    [row] = problems.problems(song)
+    return (row["staff_in_system"], row["staves_in_system"],
+            row["voice_on_staff"], row["voices_on_staff"])
+
+
+def _systems(*entries):
+    """lyricsSystemMap entries as a per-system clean writes them: (start, end, source, staves)."""
+    return json.dumps([{"start": a, "end": b, "map": source, "source": source, "staves": n}
+                       for a, b, source, n in entries])
+
+
+@pytest.mark.parametrize("meta, place", [
+    # A per-system score: B1 is printed second of two in the system holding bar 3.
+    ([("lyricsSystemMap", _systems((1, 2, {"1": [1]}, 1), (3, 6, {"1": [2], "2": [1]}, 2)))],
+     (2, 2, 1, 1)),
+    # Two parts on one printed staff, B1 the lower of them.
+    ([("lyricsSystemMap", _systems((1, 6, {"1": [2, 1]}, 1)))], (1, 1, 2, 2)),
+    # An ordinary clean: one map for the whole score, the split staff's upper voice first.
+    ([("lyricsStaffMap", "1:1,2;2:3")], (1, 2, 1, 2)),
+    # The system map wins over the identity staff map a per-system clean also writes.
+    ([("lyricsStaffMap", "1:1;2:2"),
+      ("lyricsSystemMap", _systems((1, 6, {"1": [2], "2": [1]}, 2)))], (2, 2, 1, 1)),
+    # The page position, not the lyric rank: ranked first, printed second of three.
+    ([("lyricsSystemMap", json.dumps([{"start": 1, "end": 6, "map": {"1": [1], "2": [2]},
+                                        "source": {"1": [2], "2": [1]}, "staves": 3}]))],
+     (2, 3, 1, 1)),
+])
+def test_a_row_says_which_staff_and_voice_of_the_system_it_is(make_song, meta, place):
+    """The crop shows every staff, so the row says which one the part is on (#310)."""
+    assert _marked_row(make_song(readings=None), *meta) == place
+
+
+@pytest.mark.parametrize("meta", [
+    [],                                                       # a score from before the maps
+    [("lyricsSystemMap", _systems((1, 2, {"1": [1]}, 1)))],  # bar 3 not covered
+    [("lyricsSystemMap", json.dumps([{"start": 1, "end": 6, "map": {"1": [1]}}]))],  # cleaned before "source"
+    [("lyricsStaffMap", "1:2;2:3")],                         # B1 not printed anywhere
+])
+def test_without_a_record_of_the_page_the_staff_is_not_guessed(make_song, meta):
+    assert _marked_row(make_song(readings=None), *meta) == (None, None, None, None)
+
+
+def test_a_mark_and_its_health_row_are_said_once(make_song):
+    song = make_song(readings=None)
+    root = etree.parse(song.cleaned_path()).getroot()
+    mark_bar(root.findall(".//Score/Staff")[0].findall("Measure")[2], "pitch?")
+    etree.ElementTree(root).write(song.cleaned_path(), encoding="UTF-8")
+    song.data["health"] = {"issues": [
+        {"id": "marked-m3-s1", "kind": "marked-problem", "measure": 3, "staff": "B1",
+         "detail": "pitch?", "status": "open"},
+        {"id": "malformed-m2-s1-v0", "kind": "malformed-measure", "measure": 2, "staff": "B1",
+         "detail": "voice 1 is short", "status": "open"}]}
+    song.save()
+    with open(song.path("fixes.json"), "w") as fh:
+        json.dump([{"kind": "text", "source": pipeline.CLEAN_MARK_SOURCE, "measure": 3, "staff": 1,
+                    "what": "Bar 3, B1 (red mark in the score): pitch?"},
+                   {"kind": "text", "what": "The tenors share the bass words in bar 9."}], fh)
+    rows = problems.problems(song)
+    assert [(r["measure"], r["part"]) for r in rows] == [(2, "B1"), (3, "B1"), (None, "")]
+    assert rows[1]["notes"] == [{"text": "pitch?", "kind": "mark", "dismiss": "marked-m3-s1"}]
+    assert rows[0]["notes"][0]["dismiss"] == "malformed-m2-s1-v0"
+    assert rows[2]["notes"][0]["text"].startswith("The tenors")
+
+
+def test_a_dismissed_mark_stays_dismissed(make_song):
+    song = make_song(readings=None)
+    root = etree.parse(song.cleaned_path()).getroot()
+    mark_bar(root.findall(".//Score/Staff")[0].findall("Measure")[2], "pitch?")
+    etree.ElementTree(root).write(song.cleaned_path(), encoding="UTF-8")
+    song.data["health"] = {"issues": [
+        {"id": "marked-m3-s1", "kind": "marked-problem", "measure": 3, "staff": "B1",
+         "detail": "pitch?", "status": "dismissed"}]}
+    song.save()
+    assert problems.problems(song) == []
+
+
+# ---------------------------------------------------------------- whole bars (#295)
+
+# homr read the crop a second time and got one half note, C3.
+SECOND = {**NOTES, "version": 3, "second": [
+    {"part": 0, "staff": 1, "bar": 2, "voice": "1", "length": "1/2",
+     "moments": READINGS["bars"][0]["moments"],
+     "second": [{"kind": "note", "value": "note_2",
+                 "pitches": [{"step": "C", "alter": 0, "octave": 3}]}]}]}
+
+
+def test_whole_bars_are_ranked_lengths_and_pitches_together(make_song):
+    [offer] = bar_readings.offers(make_song(readings=NOTES))
+    assert [_bar_of(o) for o in offer["options"]][:5] == [
+        [("note_4", ["C3"]), ("note_4", ["D3"])],   # a: as read
+        [("note_4.", ["C3"]), ("note_8", ["D3"])],  # the next lengths, the D as read
+        [("note_4", ["C3"]), ("note_4", ["Eb3"])],  # the lengths as read, the next pitch
+        [("note_4.", ["C3"]), ("note_8", ["Eb3"])],
+        [("note_8", ["C3"]), ("note_4.", ["D3"])],
+    ]
+    # The notes that differ from the bar as read are the ones drawn blue.
+    assert offer["options"][2]["differs"] == [(1, 0)]
+
+
+def test_the_second_reading_is_always_b(make_song):
+    song = make_song(readings=SECOND)
+    [offer] = bar_readings.offers(song)
+    b = offer["options"][1]
+    assert b["second"] and _bar_of(b) == [("note_2", ["C3"])]
+    [row] = problems.problems(song)
+    assert row["choices"][0]["options"][1]["label"] == "second reading"
+
+
+def test_picking_the_second_reading_writes_the_bar_afresh(make_song, tmp_path):
+    song = make_song(readings=SECOND)
+    [offer] = bar_readings.offers(song)
+    bar_readings.record_pick(song, offer["id"], "b")
+    assert _tokens(song) == ["half:48"]
+    [entry] = _fixes(song)
+    assert entry["kind"] == "bar" and entry["letter"] == "b"
+    assert "second reading" in entry["why"]
+    # The word on the first note stays.
+    root = etree.parse(song.cleaned_path()).getroot()
+    assert score_fixes._measure(root, 1, 3).findtext(".//Lyrics/text") == "la"
+    [offer] = bar_readings.offers(song)
+    assert offer["decision"] == {"picked": "b"}
+    # A rebuild from the scan gets it back.
+    with open(song.cleaned_path(), "w") as fh:
+        fh.write(_score(((1, "B1", 0),)))
+    assert pipeline.apply_recorded_fixes(song.cleaned_path(), song.dir) == 1
+    assert _tokens(song) == ["half:48"]
+
+
+def test_a_bar_with_another_pitch_is_picked_whole(make_song):
+    song = make_song(readings=NOTES)
+    [offer] = bar_readings.offers(song)
+    bar_readings.record_pick(song, offer["id"], "d")  # dotted quarter, eighth E flat
+    assert _tokens(song) == ["quarter.:48", "eighth:51"]
+    assert _pitch(song) == (51, 11)  # E flat, spelt as one
+
+
+def test_a_whole_bar_follows_an_octave_shifted_tenor(make_song):
+    song = make_song(staves=((1, "T1", 12),), readings=NOTES)
+    [offer] = bar_readings.offers(song)
+    assert [m["pitches"] for m in offer["options"][2]["to"]] == [[60], [63]]
+
+
+def test_a_pick_made_before_whole_bars_counts_as_decided(make_song):
+    song = make_song(readings=NOTES)
+    [offer] = bar_readings.offers(song)
+    with open(song.path("fixes.json"), "w") as fh:
+        json.dump([{"kind": "rhythm", "source": "reading", "offer": offer["id"],
+                    "system": 2, "content": song.data["scan"]["systems"]["2"]["content"],
+                    "staff": 1, "part": "B1", "measure": 3, "from": _tokens(song),
+                    "to": ["note_4.", "note_8"], "why": "picked earlier"}], fh)
+    [offer] = bar_readings.offers(song)
+    assert offer["decision"] == {"picked": "earlier"}
+
+
+def test_an_option_is_engraved_with_the_other_pitch(make_song):
+    pytest.importorskip("verovio")
+    song = make_song(readings=NOTES)
+    [offer] = bar_readings.offers(song)
+    svg = bar_readings.option_svg(song, offer["id"], "c")
+    assert svg.startswith("<?xml") or "<svg" in svg[:400]
+    assert "#1f6fd1" in svg
+
+
+# ---------------------------------------------------------------- a slur
+
+
+def _slur_song(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "SONGS_DIR", str(tmp_path))
+    song = state.create("Slurred", per_system=False)
+    root = _slur_score()
+    store_removed(root, drop_cross_voice_slurs(root))
+    etree.ElementTree(root).write(song.path("song_cleaned.mscx"), encoding="UTF-8")
+    song.data["cleaned"] = "song_cleaned.mscx"
+    song.save()
+    return song
+
+
+def test_a_removed_slur_is_one_question_on_its_first_bar(tmp_path, monkeypatch):
+    song = _slur_song(tmp_path, monkeypatch)
+    rows = problems.problems(song)
+    assert [(r["measure"], r["part"]) for r in rows] == [(1, "T1")]
+    [row] = rows
+    assert [n["text"] for n in row["notes"]] == [
+        "slur to T2 bar 2 removed; check the page",
+        "Bar 2, T2: slur from T1 bar 1 removed; check the page"]
+    [choice] = row["choices"]
+    assert choice["kind"] == "slur"
+    assert [o["label"] for o in choice["options"]] == [
+        "Slur in T1 (E4 → E4)", "Slur in T2 (C4 → C4)", "Slur in both T1 and T2",
+        "No slur here on the page"]
+
+
+def test_a_slur_answer_draws_it_across_the_barline_and_comes_back(tmp_path, monkeypatch):
+    song = _slur_song(tmp_path, monkeypatch)
+    [choice] = problems.problems(song)[0]["choices"]
+    problems.record_slur_choice(song, choice["id"], "b")  # in T2
+
+    root = etree.parse(song.cleaned_path()).getroot()
+    assert marks(root) == []
+    staff = root.findall(".//Score/Staff")[1]
+    [head] = [sp for sp in staff.iter("Spanner") if sp.find("next") is not None]
+    loc = head.find("next/location")
+    assert (loc.findtext("measures"), loc.findtext("fractions")) == ("1", "-3/4")
+    assert _resolve(0, Fraction(3, 4), loc, _bar_lengths(staff)) == (1, Fraction(0))
+    # Answered, so the row has nothing left to ask.
+    [row] = problems.problems(song)
+    assert row["notes"] == [] and row["choices"][0]["decision"] == {"picked": "b"}
+
+    # A re-clean takes the slur out and marks the bars again; the answer puts it back.
+    rebuilt = _slur_score()
+    store_removed(rebuilt, drop_cross_voice_slurs(rebuilt))
+    etree.ElementTree(rebuilt).write(song.cleaned_path(), encoding="UTF-8")
+    pipeline.apply_recorded_fixes(song.cleaned_path(), song.dir)
+    again = etree.parse(song.cleaned_path()).getroot()
+    assert marks(again) == []
+    assert len([sp for sp in again.findall(".//Score/Staff")[1].iter("Spanner")
+                if sp.find("next") is not None]) == 1
+
+
+def test_no_slur_takes_the_marks_off_and_adds_nothing(tmp_path, monkeypatch):
+    song = _slur_song(tmp_path, monkeypatch)
+    before = len(list(etree.parse(song.cleaned_path()).getroot().iter("Spanner")))
+    [choice] = problems.problems(song)[0]["choices"]
+    problems.record_slur_choice(song, choice["id"], "d")
+    root = etree.parse(song.cleaned_path()).getroot()
+    assert marks(root) == []
+    assert len(list(root.iter("Spanner"))) == before
+    assert {f["kind"] for f in _fixes(song)} == {"unmark"}
+
+
+def test_a_slur_answered_twice_or_unknown_is_refused(tmp_path, monkeypatch):
+    song = _slur_song(tmp_path, monkeypatch)
+    [choice] = problems.problems(song)[0]["choices"]
+    with pytest.raises(FixError):
+        problems.record_slur_choice(song, choice["id"], "z")
+    with pytest.raises(FixError):
+        problems.record_slur_choice(song, "slur-9-9-0-9-9-0", "a")
+    assert _fixes(song) == []
+    problems.record_slur_choice(song, choice["id"], "a")
+    with pytest.raises(FixError):
+        problems.record_slur_choice(song, choice["id"], "b")
+
+
+def test_the_removed_slurs_travel_in_the_score():
+    root = _slur_score()
+    records = drop_cross_voice_slurs(root)
+    store_removed(root, records)
+    again = etree.fromstring(etree.tostring(root))
+    assert removed_slurs(again) == records
+    store_removed(again, [])
+    assert removed_slurs(again) == [] and again.find(".//metaTag") is None
+
+
+def test_unmark_is_content_when_the_mark_is_already_gone():
+    root = _slur_score()
+    done = score_fixes.apply_fixes(root, [
+        {"kind": "unmark", "staff": 1, "measure": 1, "text": "nothing here", "why": "x"}])
+    assert "no red mark left" in done[0]
+
+
+def _marked_bar(song, *texts):
+    """Bar 3 of B1 with these red marks on it, written back to the cleaned score."""
+    root = etree.parse(song.cleaned_path()).getroot()
+    bar = root.findall(".//Score/Staff")[0].findall("Measure")[2]
+    for text in texts:
+        mark_bar(bar, text)
+    return root
+
+
+def _pitch_entry(song):
+    """A recorded `pitch` pick (kept in fixes.json from before whole-bar choices)."""
+    return {"kind": "pitch", "staff": 1, "measure": 3, "index": 1,
+            "from": _tokens(song), "was": 50, "to": 51, "tpc": 11, "why": "test"}
+
+
+def test_a_pitch_pick_leaves_the_rest_of_the_bars_marks(make_song):
+    """A bar homr doubted for two things is still marked for the one not answered."""
+    song = make_song(readings=None)
+    root = _marked_bar(song, "pitch? rhythm?", "slur to B2 bar 4 removed; check the page")
+    [done] = score_fixes.apply_fixes(root, [_pitch_entry(song)])
+    assert "took pitch? off" in done
+    assert sorted(m["text"] for m in marks(root)) == [
+        "rhythm?", "slur to B2 bar 4 removed; check the page"]
+
+
+def test_a_pitch_pick_answering_the_whole_mark_takes_it_off(make_song):
+    song = make_song(readings=None)
+    root = _marked_bar(song, "pitch? accidental?")
+    score_fixes.apply_fixes(root, [_pitch_entry(song)])
+    assert marks(root) == []
+
+
+def test_a_slur_answer_still_counts_after_a_bar_is_put_in_after_it(tmp_path, monkeypatch):
+    # The answer names the bars as they stood; an `insbar` later in the file moves
+    # the slur's end a bar on (#346), and the question must not come back undecided.
+    song = _slur_song(tmp_path, monkeypatch)
+    [choice] = problems.problems(song)[0]["choices"]
+    problems.record_slur_choice(song, choice["id"], "d")
+    root = etree.parse(song.cleaned_path()).getroot()
+    first = [score_fixes.bar_tokens(root, int(s.get("id")), 1)
+             for s in root.findall(".//Score/Staff")]
+    entries = _fixes(song) + [{"kind": "insbar", "measure": 1, "from": first, "why": "page"}]
+    with open(song.path("fixes.json"), "w") as fh:
+        json.dump(entries, fh)
+    rebuilt = _slur_score()
+    store_removed(rebuilt, drop_cross_voice_slurs(rebuilt))
+    etree.ElementTree(rebuilt).write(song.cleaned_path(), encoding="UTF-8")
+    pipeline.apply_recorded_fixes(song.cleaned_path(), song.dir)
+    [row] = problems.problems(song)
+    [again] = row["choices"]
+    assert again["id"] != choice["id"]  # the end bar moved on
+    assert again["decision"] == {"picked": "d"}
+    with pytest.raises(FixError):
+        problems.record_slur_choice(song, again["id"], "b")

@@ -18,10 +18,10 @@ import tempfile
 
 import numpy as np
 import pytest
-from lxml import etree
 from PIL import Image
 
 from src.scrollvideo import build, preview as preview_mod, video as video_mod
+from src.scrollvideo import score as score_mod
 from src.scrollvideo.preview import AUDIO_SOURCE, PREVIEW_HEIGHT, preview
 from src.scrollvideo.video import BACKGROUND_ALPHA, BAND_ALPHA, HIGHLIGHT
 
@@ -223,15 +223,15 @@ def test_the_scroll_curve_is_the_renderers_own(fermata_mscx, payload):
 def test_a_fermata_is_timed_on_musescores_clock(fermata_mscx, payload):
     """The whole reason the video keeps time: verovio's own timestamps are wrong.
 
-    Measure 1 ends on a chord stretched three times over, which MuseScore plays
-    and verovio does not know about. A preview on verovio's clock would run a
-    second short and drift away from the audio it is previewing.
+    Measure 1 ends on a fermata, held one beat longer (#380), which MuseScore
+    plays and verovio does not know about. A preview on verovio's clock would run
+    half a second short and drift away from the audio it is previewing.
     """
     ready = _prepared(fermata_mscx)
     verovio_seconds = max(float(entry.get("tstamp", 0.0))
                           for entry in ready.engraving.timemap) / 1000.0
     assert payload["duration"] == round(ready.duration, 3)
-    assert payload["duration"] - build.TAIL_SECONDS > verovio_seconds + 0.5
+    assert payload["duration"] - build.TAIL_SECONDS > verovio_seconds + 0.4
 
 
 def test_margins_move_the_preview_exactly_as_they_move_the_video(fermata_mscx, tmp_path):
@@ -297,16 +297,21 @@ def test_a_repeated_section_jumps_back_instead_of_sliding(repeat_mscx, tmp_path)
     assert len(ids) > len(set(ids))
 
 
+def test_a_jump_is_followed_as_the_render_follows_it(tmp_path):
+    """A D.S. al Coda plays in MuseScore's order in the preview too: the same
+    curve as `prepare`'s, landing back at the segno and forward at the coda."""
+    score = os.path.join(FILES, "dal_segno.mscx")
+    payload = preview(score, str(tmp_path / "jump"), **SIZE)
+    ready = _prepared(score)
+    drawn = build.raster(ready, PREVIEW_HEIGHT)
+    times, xs = ready.anchors
+    assert payload["scroll"]["times"] == pytest.approx(list(times))
+    assert payload["scroll"]["xs"] == pytest.approx([x * drawn.px_per_unit for x in xs])
+    assert len(ready.cuts) == 2
+
+
 def test_it_refuses_what_a_render_would_refuse(tmp_path, fermata_mscx):
     """Failing here is the point: seconds, rather than minutes into an encode."""
-    score = etree.parse(fermata_mscx)
-    measure = score.getroot().find(".//Staff/Measure")
-    etree.SubElement(etree.SubElement(measure, "Jump"), "jumpTo").text = "start"
-    path = tmp_path / "jump.mscx"
-    score.write(str(path))
-    with pytest.raises(NotImplementedError, match="Jump"):
-        preview(str(path), str(tmp_path / "out"), **SIZE)
-
     with pytest.raises(ValueError, match="margin"):
         preview(fermata_mscx, str(tmp_path / "out"), **SIZE, top_margin_percent=500.0)
 
@@ -331,8 +336,9 @@ def test_nothing_is_encoded_and_no_voice_is_mixed(fermata_mscx, tmp_path, monkey
         AUDIO_SOURCE,
         *[name for name in os.listdir(out) if name.endswith(".png")],
     }
+    prepared, _ = score_mod.prepare(fermata_mscx, str(tmp_path))
     assert open(os.path.join(out, AUDIO_SOURCE), "rb").read() == open(
-        fermata_mscx, "rb").read()
+        prepared, "rb").read()
 
 
 def test_a_long_score_is_sent_as_tiles_a_browser_can_decode(fermata_mscx, tmp_path,

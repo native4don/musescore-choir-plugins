@@ -23,23 +23,27 @@ import numpy as np
 from lxml import etree
 
 from . import audio as audio_mod
+from . import playorder
 from . import score as score_mod
 from . import spacing as spacing_mod
 from .engrave import engrave
 from .geometry import playing_coverage, rasterise
-from .timing import (SMOOTH_SECONDS, TempoMap, note_events, rest_events,
-                     scroll_anchors, smooth_scroll)
+from .timing import (SMOOTH_SECONDS, TempoMap, cut_anchors, note_events,
+                     rest_events, scroll_anchors, smooth_scroll)
 from .video import (NVIDIA_ENCODER, SOFTWARE_ENCODER, TAIL_SECONDS, mux, place,
                     preferred_encoder, render)
 
 Logger = Callable[[str], None]
 
-# Section repeats and voltas are fine: verovio expands them in its timemap exactly
+# Section repeats and voltas are verovio's: it expands them in its timemap exactly
 # as MuseScore does, and `engrave` maps the repeat-pass ids back to the notes on the
-# page. D.C./D.S. jumps it does *not* follow (on Jouluriemua verovio plays 181
-# quarters where MuseScore plays 257.5), so those are refused. A Marker (segno,
-# coda, fine) on its own is just a label and changes nothing without a Jump.
-JUMP_MARKUP = ("Jump",)
+# page. A D.C./D.S. jump it follows only sometimes (on Jouluriemua verovio plays 181
+# quarters where MuseScore plays 257.5), so a score with one is laid out in the bar
+# order MuseScore reports instead (`playorder`). A Marker (segno, coda, fine) on its
+# own is just a label and changes nothing without a Jump. A score with repeats
+# is checked against that bar order too, and follows it when verovio's differs:
+# a scan's "2." bracket that opens and never closes stops verovio expanding the
+# repeat at all (#374).
 
 # How closely the highlights must track the audio before we are willing to ship a
 # video: nearly every onset within a fifth of a second.
@@ -170,11 +174,6 @@ def _collect_audio_results(futures: dict, progress: Logger) -> dict:
     return results
 
 
-def unsupported_repeats(root: etree._Element) -> List[str]:
-    """Repeat structures this pipeline cannot follow (empty when there are none)."""
-    return [tag for tag in JUMP_MARKUP if root.find(f".//{tag}") is not None]
-
-
 @dataclass(frozen=True)
 class Prepared:
     """Everything decided about a render before a single pixel is drawn.
@@ -205,6 +204,7 @@ class Prepared:
     view_start: float       # top of the frame, in verovio units
     view_end: float         # ... and its bottom
     duration: float         # seconds of video, including the tail past the last note
+    cuts: tuple = ()        # seconds where MuseScore's play order jumps elsewhere
 
     @property
     def layout(self):
@@ -250,22 +250,18 @@ def prepare(mscx_path: str, tmp: str, *, parts: Optional[Sequence[str]] = None,
     `tmp` is a directory the intermediate files are written into; it has to outlive
     the returned `Prepared`, whose `source` the audio mixes are rendered from.
 
+    A score with a D.C./D.S. jump has its timeline laid out in the bar order
+    MuseScore plays (`playorder`), and so does a score with repeats whose bars
+    verovio plays in another order; every other score keeps verovio's own.
+
     The refusals live here rather than in the renderer so that a preview fails the
-    same way a render would, before either has spent any time: a D.C./D.S. jump the
-    engraving cannot follow, margins that leave no picture, and — measured against
-    the audio itself — a timeline too far out of step to ship.
+    same way a render would, before either has spent any time: a jump whose bars
+    cannot be matched to the engraving, margins that leave no picture, and —
+    measured against the audio itself — a timeline too far out of step to ship.
     """
     # Validated on a unit page first, so bad margins fail before the minutes of
     # engraving rather than after them. Applied for real once the page is known.
     _margin_viewport(1.0, top_margin_percent, bottom_margin_percent)
-
-    jumps = unsupported_repeats(etree.parse(mscx_path).getroot())
-    if jumps:
-        raise NotImplementedError(
-            "This score uses " + ", ".join(sorted(set(jumps))) +
-            " (a D.C./D.S. jump): MuseScore's audio follows the jump and the engraving "
-            "does not, so the video would drift out of sync. Section repeats and voltas "
-            "are supported; write the jump out in full first.")
 
     source, dropped = score_mod.prepare(mscx_path, tmp, keep_silent=keep_silent,
                                         initial_bpm=initial_bpm)
@@ -313,11 +309,27 @@ def prepare(mscx_path: str, tmp: str, *, parts: Optional[Sequence[str]] = None,
             "highlighting every voice equally.")
 
     tempo = TempoMap.from_midi(midi)
-    notes = note_events(eng.timemap, tempo, eng.drawn_id)
-    rests = rest_events(eng.timemap, tempo, eng.drawn_id)
+    timemap, drawn_id, cuts = eng.timemap, eng.drawn_id, ()
+    source_root = etree.parse(source).getroot()
+    jumps = playorder.has_jumps(source_root)
+    if jumps or playorder.has_repeats(source_root):
+        count, order = playorder.played_measures(source, tmp)
+        # Repeats alone stay verovio's to expand while it agrees with MuseScore;
+        # an open "2." bracket from a scan stops it expanding at all (#374).
+        if jumps or order != playorder.verovio_order(
+                eng.timemap, eng.measures, eng.measure_of):
+            timemap, drawn_id, cut_qs = playorder.unrolled_timemap(
+                eng.timemap, eng.drawn_id, eng.measures, eng.measure_of, count, order)
+            cuts = tuple(tempo.seconds(q) for q in cut_qs)
+            what = "the D.C./D.S. jump" if jumps else "MuseScore's repeats"
+            log(f"Following {what}: {len(order)} bars played from {count} printed")
+    notes = note_events(timemap, tempo, drawn_id)
+    rests = rest_events(timemap, tempo, drawn_id)
     events = sorted([*notes, *rests], key=lambda event: (event.on, event.off))
-    anchors = scroll_anchors(eng.timemap, tempo, layout, eng.drawn_id,
+    anchors = scroll_anchors(timemap, tempo, layout, drawn_id,
                              staff_limit=singing_staves)
+    if cuts:
+        anchors = cut_anchors(*anchors, cuts)
     log(f"{len(notes)} notes, {len(rests)} rests, "
         f"{anchors[0][-1]:.1f}s on MuseScore's clock")
 
@@ -340,7 +352,7 @@ def prepare(mscx_path: str, tmp: str, *, parts: Optional[Sequence[str]] = None,
 
     if smooth_seconds:
         anchors = smooth_scroll(*anchors, fps=fps, seconds=smooth_seconds,
-                                page_width=layout.width)
+                                page_width=layout.width, cuts=cuts)
 
     return Prepared(
         source=source, musicxml=musicxml, midi=midi, engraving=eng, names=names,
@@ -349,7 +361,7 @@ def prepare(mscx_path: str, tmp: str, *, parts: Optional[Sequence[str]] = None,
         singing_staves=singing_staves, tempo=tempo, notes=notes, rests=rests,
         events=events, anchors=anchors, visible_height=visible,
         view_start=view_start, view_end=view_end,
-        duration=_duration(events, layout, singing_staves))
+        duration=_duration(events, layout, singing_staves), cuts=cuts)
 
 
 def _duration(events: Sequence, layout, staff_limit: int) -> float:
