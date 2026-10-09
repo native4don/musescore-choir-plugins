@@ -18,9 +18,18 @@ from fastapi.testclient import TestClient  # noqa: E402
 from src.song_app import free_videos, job_state, server, state  # noqa: E402
 
 PARTS = ["T1", "T2", "ALL"]
-LATER = (datetime.datetime.now(datetime.timezone.utc)
-         + datetime.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 EARLIER = "2020-01-01T00:00:00Z"
+
+
+def _later():
+    """A publish time after any file the test has just written.
+
+    Worked out when a test asks, not when this file is loaded: in a long run the
+    tests can start more than five minutes after collection, and a time fixed at
+    load would then be earlier than the files they write.
+    """
+    return (datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.fixture
@@ -53,7 +62,8 @@ def _song(parts=PARTS, uploaded=PARTS, stamped=True, name="Laulu"):
     return song
 
 
-def _youtube(parts=PARTS, published=LATER, processed=True):
+def _youtube(parts=PARTS, published=None, processed=True):
+    published = published or _later()
     answers = {f"vid{p}": {"processed": processed, "published_at": published} for p in parts}
     asked = []
 
