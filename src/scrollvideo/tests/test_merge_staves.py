@@ -279,3 +279,20 @@ def test_a_clef_change_reaches_the_engraving(tmp_path):
     signs = [(m.get("number"), c.findtext("sign"))
              for m in xml.iter("measure") for c in m.iter("clef")]
     assert signs == [("1", "G"), ("2", "F")]
+
+
+def _saved_by_musescore_4(root):
+    """The same score as MuseScore 4 writes it: a Part's staves carry no id."""
+    for stub in root.findall("Score/Part/Staff"):
+        del stub.attrib["id"]
+    return root
+
+
+def test_two_parts_saved_by_musescore_4_share_a_staff():
+    root = _saved_by_musescore_4(_four())
+    staff_of = score_mod.merge_staves(root, [("S1", "S2"), ("T", "B")])
+    assert staff_of == {"S1": 0, "S2": 0, "T": 1, "B": 1}
+    assert len(root.findall("Score/Part")) == 2
+    assert [s.get("id") for s in root.findall("Score/Staff")] == ["1", "2"]
+    assert _voices(root, "1")[0] == [[72, 74], [67, 69]]
+    assert _voices(root, "2")[1] == [[60, 62], []]   # the bass rests here

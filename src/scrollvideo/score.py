@@ -17,7 +17,7 @@ from lxml import etree
 
 from src.clean_score.utils.problem_marks import strip_marks, strip_red_notes
 from src.clean_score.utils.staff_display import fix_staff_display
-from src.clean_score.utils.utils import starts_new_system
+from src.clean_score.utils.utils import part_staff_ids, starts_new_system
 
 
 def has_opening_tempo(root: etree._Element) -> bool:
@@ -136,7 +136,16 @@ def _part_name(part: etree._Element, index: int) -> str:
 
 
 def _staff_ids(part: etree._Element) -> List[str]:
-    return [s.get("id") for s in part.findall("Staff") if s.get("id")]
+    """The ids of the staves of music this part owns.
+
+    Asked of the score as it stands now, so it stays right while parts and their
+    staves are being taken out: a score saved by MuseScore 4 matches them by
+    position (`part_staff_ids`), and a part and its staves always leave together.
+    """
+    score = part.getparent()
+    if score is None:
+        return [s.get("id") for s in part.findall("Staff") if s.get("id")]
+    return part_staff_ids(score)[score.findall("Part").index(part)]
 
 
 def system_starts(mscx_path: str) -> List[int]:

@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from lxml import etree
 
 from .utils.per_system import system_ranges
+from .utils.utils import part_staff_ids
 
 # --------------------------------------------------------------------------- #
 # What a caller gets back
@@ -473,11 +474,10 @@ def _read_part_name_map(score_root: etree._Element) -> Dict[str, int]:
     if score is None:
         return {}
     result: Dict[str, int] = {}
-    for part in score.findall("Part"):
+    for part, owned in zip(score.findall("Part"), part_staff_ids(score)):
         name = (part.findtext("trackName") or "").strip()
-        stub = part.find("Staff")
-        if name and stub is not None and stub.get("id"):
-            result[name.upper()] = int(stub.get("id"))
+        if name and owned:
+            result[name.upper()] = int(owned[0])
     return result
 
 
@@ -1426,9 +1426,8 @@ def lyric_parts(score_root: etree._Element) -> List[EditorPart]:
     if score is None:
         return []
     parts: List[EditorPart] = []
-    for p in score.findall("Part"):
-        st = p.find("Staff")
-        sid = int(st.get("id")) if st is not None and st.get("id") else 0
+    for p, owned in zip(score.findall("Part"), part_staff_ids(score)):
+        sid = int(owned[0]) if owned else 0
         name = (p.findtext("trackName") or p.findtext("Instrument/trackName") or "").strip()
         if any(w in name.lower() for w in _NON_LYRIC_PART_WORDS):
             continue
