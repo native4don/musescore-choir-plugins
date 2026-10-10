@@ -27,7 +27,15 @@ VOLUME_CTRL = "7"
 CLI_TIMEOUT = 600
 FOCUS_VOLUME = 127
 BACKGROUND_VOLUME = 36
-AUDIO_CACHE_VERSION = 1
+# MuseScore 4 ignores controller 7 in the score and takes each part's loudness
+# from audiosettings.json beside it, in decibels: 0 is full level. Both forms are
+# written every time, so each MuseScore reads the one it understands.
+FOCUS_DB = 0.0
+BACKGROUND_DB = -16.0
+SETTINGS_FILE = "audiosettings.json"
+# 2: mixes rendered before the settings file was written held every part at one
+# level on MuseScore 4, and must not be reused.
+AUDIO_CACHE_VERSION = 2
 
 
 def musescore_cli() -> str:
@@ -89,17 +97,71 @@ def set_mix(root: etree._Element, focus: Optional[str],
     return root
 
 
+def number_parts(root: etree._Element) -> List[str]:
+    """The number MuseScore 4 will know each part by, in score order.
+
+    MuseScore 4 keeps one mixer track per part number and instrument name, so
+    parts that share both share one loudness. A cleaned score can carry the same
+    number on every part. Numbers that are all present and all different are
+    kept. Numbers that repeat are rewritten 1, 2, 3... in the score. Where no
+    part has a number (the older format) the score is left alone and the parts
+    are counted from 1, which is how MuseScore 4 numbers them on opening.
+    """
+    parts = list(root.iter("Part"))
+    given = [part.get("id") for part in parts]
+    if all(given) and len(set(given)) == len(given):
+        return given
+    counted = [str(index + 1) for index in range(len(parts))]
+    if any(given):
+        for part, number in zip(parts, counted):
+            part.set("id", number)
+    return counted
+
+
+def mixer_settings(root: etree._Element, focus: Optional[str],
+                   focus_db: float = FOCUS_DB,
+                   background_db: float = BACKGROUND_DB) -> dict:
+    """What audiosettings.json holds so `focus` stands out on MuseScore 4.
+
+    One track per part. focus=None -> every track at the same level. The
+    instrument name is given when the score has one on the part; the older
+    format has none, and the track is then written without it.
+    """
+    numbers = number_parts(root)
+    tracks = []
+    for index, part in enumerate(root.iter("Part")):
+        loud = focus is None or part_name(part, index) == focus
+        track = {
+            "partId": numbers[index],
+            "out": {"volumeDb": focus_db if loud else background_db},
+            "soloMuteState": {"mute": False, "solo": False},
+        }
+        instrument = part.find("Instrument")
+        if instrument is not None and instrument.get("id"):
+            track["instrumentId"] = instrument.get("id")
+        tracks.append(track)
+    return {"tracks": tracks}
+
+
 def render_mix(mscx_path: str, focus: Optional[str], out_path: str, **volumes) -> str:
-    """Render `mscx_path` to audio (by out_path's extension) with `focus` boosted."""
+    """Render `mscx_path` to audio (by out_path's extension) with `focus` boosted.
+
+    The copy MuseScore renders sits in a folder of its own with audiosettings.json
+    beside it, because that is where MuseScore 4 looks for it.
+    """
     tree = etree.parse(mscx_path)
-    set_mix(tree.getroot(), focus, **volumes)
-    tmp = tempfile.NamedTemporaryFile(suffix=".mscx", delete=False)
+    root = tree.getroot()
+    set_mix(root, focus, **volumes)
+    settings = mixer_settings(root, focus)
+    folder = tempfile.mkdtemp(prefix="scrollvideo-mix-")
     try:
-        tree.write(tmp.name, encoding="UTF-8", xml_declaration=True)
-        tmp.close()
-        return run_musescore(tmp.name, out_path)
+        score = os.path.join(folder, "score.mscx")
+        tree.write(score, encoding="UTF-8", xml_declaration=True)
+        with open(os.path.join(folder, SETTINGS_FILE), "w", encoding="utf-8") as out:
+            json.dump(settings, out, indent=2)
+        return run_musescore(score, out_path)
     finally:
-        os.unlink(tmp.name)
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def _valid_wav(path: str) -> bool:
