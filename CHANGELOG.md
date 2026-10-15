@@ -7,6 +7,73 @@ developers are listed under *Behind the scenes*.
 
 ## Unreleased
 
+- Setting the app up on another computer is one script: `scripts/setup.sh`
+  makes the Python environment, finds MuseScore 3 or downloads it (Linux), writes
+  `.env`, and offers homr. `./song.py --check` then says, one line each, what this
+  computer has and lacks. SETUP.md is rewritten for someone starting from nothing.
+  (#408)
+- Publish offers the choirs of the site it publishes to, read from the site's
+  database, instead of a fixed list of three. A choir added on the site shows up
+  here by itself, and the choir is no longer guessed from the song's voicing:
+  pick it once and the song remembers it. (#408)
+- The site no longer draws tempo marks ("♩ = 72", "Tempo I"): they landed on the
+  words of the line above. Publish now sends them hidden (the speed still changes,
+  since the site plays the MIDI), and every song already on the site was given a
+  new version with them hidden. (#409)
+- The songs folder is backed up again: every night at 03:30 the app's machine
+  commits everything in `songs/` and pushes it to the private songs repo. Until
+  now it had been saved there once, by hand, on 23 August. (#406)
+- Publish: a **Part names** row lets you correct what the site calls each part,
+  top staff first. Cleaning names parts by guessing from pitch, so a women's choir
+  song could come out with tenors. The names are saved with the song's other
+  publish settings, so cleaning again keeps them; if a re-clean changes the number
+  of parts, Publish stops and asks you to check them. (#402)
+- A tempo change set on the Publish panel no longer wipes out the tempo words the
+  score prints at that bar ("Adagio", "Andante", "Tempo I"): the words stay and
+  only the speed changes. (#405)
+- A song now ends at **Publish**: the app no longer renders practice videos or
+  uploads to YouTube, and the Record and Upload stages are gone (a song that was on
+  either opens on Publish, keeping its tempo settings). Publishing sends the score's
+  MIDI along with the score and timing, and the composer, lyricist and arranger,
+  which the Publish panel lets you edit (prefilled from the score). Videos already
+  on YouTube and media files on disk are left alone. (#400)
+- Publish no longer renders an MP3 per part: the site plays the score's MIDI, so a
+  publish is now three quick MuseScore exports instead of 4–7 audio renders. Part
+  names still reach the site. (stemmanauhat-cf#36)
+- Lyrics: **Type by system** shows one printed system at a time, on a computer and a
+  phone. Each staff of the page is followed by the boxes for its parts, and
+  ← Previous / Next → import first (a warning keeps you on the system). Verse tabs
+  type verse 2 and up, a part's second voice gets its own box where it has notes,
+  and emptying a box takes its words out. Only the boxes you changed are imported;
+  everything else keeps its words. **Show what landed** draws this system's bars as
+  they are now. Held words keep joined: `e-lei- _ _ son`. (#397)
+- Lyrics: **Paste from AI** reads every verse (`"verse": n`) and second voices
+  (`"voice": 2`), and changes only what the pasted lines name instead of replacing
+  all of verse 1. Where a staff has words on two voices, the first voice's words
+  move above the staff so they no longer print on top of each other. (#397)
+- Review and Fix: **Check again** compares the notes with the scan, asks MuseScore 3
+  whether it opens the score, and checks health — on the cleaned score as it is now,
+  without cleaning. A score fixed by hand no longer shows those checks as stale. It
+  only reports; it changes nothing in the score. (#391)
+- Clean: **Undo last clean** puts back the cleaned score a clean replaced, with its
+  lyrics and checks. It is offered only until the score is worked on again (lyrics,
+  a fix, an upload), so it never throws that work away. The last 10 replaced scores
+  are kept in `backups/`. (#391)
+- Lyrics: importing the words no longer deletes verses 2 and up. They stay in
+  the score exactly as they were; the import still writes verse 1 only. (#392)
+- Record stage: **Tempo changes** — list the bars where the page changes speed,
+  each with its BPM or "back to start" (*Tempo I*). The videos, their audio, the
+  preview and Publish all follow them. They are kept with the Record settings, so
+  a re-clean leaves them alone; render again to hear them. (#387)
+- Publish: a song can now be in the public list and a choir's list at once.
+  Publishing to public no longer takes it off the choir's list, and publishing to
+  a choir no longer takes it off the public one; moving it between jm and
+  naiskuoro still moves it. The Upload panel lists every choir it is in. (#384)
+- Upload stage: **Publish** sends a song to the new Cloudflare stemmanauhat site
+  for one choir (jm, naiskuoro or the public demo): the score as MusicXML, one MP3
+  per part (each part on its own, from the same MuseScore as the videos) and a
+  timing file for the moving cursor. YouTube uploads are unchanged. Needs the
+  Cloudflare keys in `.env`; the formats are in `docs/stemmanauhat-site.md`. (#382)
 - Practice videos: a fermata now holds about one beat longer than written instead
   of three times its length, which kept a held dotted half going for six seconds
   (Jumalan kunnia luonnossa). Render a song again to get it; no re-clean needed. (#380)

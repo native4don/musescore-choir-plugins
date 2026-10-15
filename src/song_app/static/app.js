@@ -22,9 +22,7 @@ const getJSON = (p) => api(p);
 const postJSON = (p, body) =>
   api(p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
 
-const DEFAULT_TOP_MARGIN = 0;
-const DEFAULT_BOTTOM_MARGIN = 5;
-const STAGE_LABEL = { register: "Start", scan: "Scan", clean: "Clean", fix: "Fix", lyrics: "Lyrics", review: "Review", record: "Record", upload: "Upload" };
+const STAGE_LABEL = { register: "Start", scan: "Scan", clean: "Clean", fix: "Fix", lyrics: "Lyrics", review: "Review", publish: "Publish" };
 
 const stageMenu = document.getElementById("stagemenu");
 
@@ -91,14 +89,12 @@ async function renderLibrary() {
   songs.sort(SORTS[sortKey].fn);
   const cards = songs.map((s) => {
     const stageDone = (st, i) =>
-      i < s.stage_index || (st === "record" && s.recorded) || (st === "upload" && s.uploaded);
+      i < s.stage_index || (st === "publish" && s.published?.length);
     const rail = el("div", { className: "rail" },
       s.stages.map((st, i) =>
         el("span", { className: "dot " + (stageDone(st, i) ? "done" : i === s.stage_index ? "now" : "") })));
-    const badge = s.uploaded
-      ? el("span", { className: "badge good" }, "✓ Recorded & uploaded")
-      : s.recorded
-      ? el("span", { className: "badge good" }, "✓ Recorded")
+    const badge = s.published?.length
+      ? el("span", { className: "badge good" }, "✓ Published")
       : s.open_issues
       ? el("span", { className: "badge warn" }, `${s.open_issues} issue(s) to fix`)
       : el("span", { className: "badge" }, STAGE_LABEL[s.stage] || s.stage);
@@ -281,7 +277,6 @@ function newSongDialog() {
 // ---- workspace -----------------------------------------------------------
 let ws = null;
 let logBox = null;
-let lyricScroll = null; // carry the lyrics panel scroll across a re-import re-render
 
 async function renderWorkspace(slug) {
   if (ws) { ws.close(); ws = null; }
@@ -292,20 +287,18 @@ async function renderWorkspace(slug) {
   // the thing that must happen before anything else can, so it is the thing in
   // front of you (#103).
   const firstDoc = song.stage === "review" && song.lyrics
-    ? "cleaned" : song.stage === "record" ? "preview"
+    ? "cleaned"
     : song.stage === "scan" && song.has_pdf ? "systems"
     : song.has_pdf ? "pdf" : "original";
   const panes = [firstDoc]; // 1 or 2 docs shown side by side
   let viewFp = song.cleaned_fingerprint; // viewer is only rebuilt when this changes
   resetSysVersions(slug, song.cleaned_fingerprint);
-  let recordPreviewSettings = null;
 
   // Build the shell once. The viewer (and its rendered previews) is NOT recreated on
   // stage or panel changes, so the previews keep their loaded state and scroll position.
   const stagebarEl = el("div", { className: "stagebar" });
   const panelEl = el("div", { className: "panel" });
-  let viewerEl = viewer(song, slug, panes, rebuildViewer, view,
-    () => recordPreviewSettings);
+  let viewerEl = viewer(song, slug, panes, rebuildViewer, view);
   const wsGrid = el("div", { className: "ws" }, stagebarEl, panelEl, viewerEl);
   // Reviewing means reading two scores side by side; the rail and panel are just
   // in the way then. Remembered, because it is a mode you stay in.
@@ -329,7 +322,6 @@ async function renderWorkspace(slug) {
   const paneBtns = {};
   let pane = "panel";
   const showPane = (p) => {
-    if (p !== "viewer") viewerEl._pausePreview();
     pane = p;
     for (const k of ["panel", "viewer"]) wsGrid.classList.toggle("m-" + k, k === p);
     for (const k in paneBtns) paneBtns[k].className = "mtab" + (k === p ? " active" : "");
@@ -353,11 +345,8 @@ async function renderWorkspace(slug) {
   showPane("panel");
 
   function drawStagebar() {
-    const rec = song.record || {};
-    const recorded = !!(rec.outputs && rec.outputs.length);
-    const uploaded = !!song.upload_status?.complete;
-    const done = (st, i) =>
-      i < song.stage_index || (st === "record" && recorded) || (st === "upload" && uploaded);
+    const published = (song.published || []).length > 0;
+    const done = (st, i) => i < song.stage_index || (st === "publish" && published);
     stagebarEl.replaceChildren(...song.stages.map((st, i) => el("div", {
       className: "step " + (st === view ? "active " : "") + (done(st, i) ? "done" : ""),
       // Picking a stage on a phone means "take me to it", so the panel comes forward.
@@ -365,34 +354,25 @@ async function renderWorkspace(slug) {
     }, STAGE_LABEL[st] || st)));
     // The middle button names the stage it will show, so the bar says where you are.
     paneBtns.panel.textContent = STAGE_LABEL[view] || view;
-    paneBtns.viewer.textContent = view === "record" ? "Preview" : "Score";
   }
 
   function drawPanel() {
-    recordPreviewSettings = null;
     panelEl._keepPlace = null;
     panelEl._refreshInPlace = null;
+    wsGrid.classList.remove("lyricwide"); // the by-system lyric editor's own width
     panelEl.replaceChildren();
     renderPanel(panelEl, view, song, slug, refresh, {
       // Use the same click path as the rail so rendering_state.js remembers an
-      // action-driven Review → Record transition across reloads as well.
+      // action-driven Review → Publish transition across reloads as well.
       selectStage: (stage) => {
         const target = [...stagebarEl.querySelectorAll(".step")]
           .find((step) => step.textContent.trim() === (STAGE_LABEL[stage] || stage));
         if (target) target.click();
         else selectStage(stage);
       },
-      openPreview: ({ start } = {}) => {
-        viewerEl._showFirst("preview");
-        showPane("viewer");
-        if (start) viewerEl._startPreview();
-      },
       // The panel is a task screen and the score is a full-screen visual, so a
       // panel that says "look at this" has to be able to put it in front of you.
       openDoc: (doc) => { viewerEl._showFirst(doc); showPane("viewer"); },
-      pausePreview: () => viewerEl._pausePreview(),
-      previewInputsChanged: () => viewerEl._syncPreview(),
-      setPreviewSettings: (settings) => { recordPreviewSettings = settings; },
     });
   }
 
@@ -400,7 +380,6 @@ async function renderWorkspace(slug) {
     closeDrawer();
     view = stage;
     if (view === "review" && song.lyrics) panes[0] = "cleaned";
-    else if (view === "record") panes[0] = "preview";
     else if (view === "scan" && song.has_pdf) panes[0] = "systems";
     drawStagebar();
     drawPanel();
@@ -410,9 +389,7 @@ async function renderWorkspace(slug) {
   }
 
   function rebuildViewer() {
-    const next = viewer(song, slug, panes, rebuildViewer, view,
-      () => recordPreviewSettings);
-    viewerEl._destroyPreview();
+    const next = viewer(song, slug, panes, rebuildViewer, view);
     wsGrid.replaceChild(next, viewerEl);
     viewerEl = next;
     builtTabs = tabKeys();
@@ -448,7 +425,6 @@ async function renderWorkspace(slug) {
     } else {
       viewerEl._refreshScan();
     }
-    viewerEl._syncPreview();
   }
 
   drawStagebar();
@@ -482,7 +458,6 @@ function viewerTabs(song, view) {
     // Only once there are lyrics to see. Offering it beforehand renders a score
     // identical to the tab next to it, with nothing to say why.
     if (song.lyrics) tabs.push(["cleaned", "Cleaned MSCX with lyrics"]);
-    if (view === "record") tabs.push(["preview", "Preview"]);
   }
   return tabs;
 }
@@ -1251,7 +1226,7 @@ async function systemsEditor(view, slug) {
 // Each doc keeps its own scroll container mounted (lazily); switching a tab hides/shows
 // them (scroll preserved). `el._refreshFp(fp)` re-renders only the cleaned previews
 // after a re-clean, preserving their scroll position.
-function viewer(song, slug, panes, rebuild, stage, previewSettings) {
+function viewer(song, slug, panes, rebuild, stage) {
   const tabs = viewerTabs(song, stage);
   const keys = tabs.map(([k]) => k);
   for (let i = 0; i < panes.length; i++) if (!keys.includes(panes[i])) panes[i] = keys[0];
@@ -1259,10 +1234,6 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
   const scanRefreshers = [];
   const wakers = [];
   const selectors = [];
-  const previewPausers = [];
-  const previewDestroyers = [];
-  const previewSyncers = [];
-  const previewStarters = [];
 
   const slot = (i) => {
     const frames = {};                  // doc -> scrollable pdfview div (kept alive)
@@ -1282,8 +1253,6 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
       else if (v.offsetParent) requestAnimationFrame(() => ensureRendered(doc));
     };
     const show = (doc) => {
-      const previous = panes[i];
-      if (previous === "preview" && doc !== "preview") frames.preview?._pause?.();
       panes[i] = doc;
       if (!frames[doc]) {
         const v = el("div", { className: "pdfview" });
@@ -1321,20 +1290,6 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
               swapSystemImage(v._box, cleanedSystemSrc(slug, v._n), v._n);
           };
           v._setSystem(shownSystem[slug] || 1);
-        }
-        else if (doc === "preview") {
-          v._systems = true;
-          v.className = "pdfview recordpreview";
-          const P = `/api/songs/${encodeURIComponent(slug)}`;
-          const preview = window.scrollPreviewPanel(P, () => {
-            const settings = previewSettings();
-            return settings ? settings() : {};
-          }, () => song.cleaned_fingerprint);
-          v._pause = () => preview._pausePreview?.();
-          v._destroy = () => preview._stopPreview?.();
-          v._sync = () => preview._syncPreview?.();
-          v._start = () => preview._startPreview?.();
-          v.append(preview);
         }
         else {
           v._url = docUrl(slug, doc, song.cleaned_fingerprint);
@@ -1407,10 +1362,6 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
     const bar = el("div", { className: "viewtabs" }, ...tabRow, el("span", { className: "spacer" }), zoomBox, ctrl);
     show(panes[i]);
     selectors.push(show);
-    previewPausers.push(() => frames.preview?._pause?.());
-    previewDestroyers.push(() => frames.preview?._destroy?.());
-    previewSyncers.push(() => frames.preview?._sync?.());
-    previewStarters.push(() => frames.preview?._start?.());
     wakers.push(() => ensureRendered(panes[i]));
     scanRefreshers.push(() => { if (frames.scanned) scannedView(frames.scanned, song, slug); });
     // Re-render only the cleaned previews; their scroll is preserved by renderPdf.
@@ -1437,12 +1388,6 @@ function viewer(song, slug, panes, rebuild, stage, previewSettings) {
   };
   root._refreshFp = (fp) => refreshers.forEach((f) => f(fp));
   root._wake = () => wakers.forEach((f) => f());
-  root._pausePreview = () => previewPausers.forEach((pause) => pause());
-  root._destroyPreview = () => previewDestroyers.forEach((destroy) => destroy());
-  root._syncPreview = () => previewSyncers.forEach((sync) => sync());
-  // Only the first pane: it is the one the panel's Preview button brings forward,
-  // and a split showing the preview twice should not prepare it twice.
-  root._startPreview = () => previewStarters[0]?.();
   root._showFirst = (doc) => {
     if (keys.includes(doc) && selectors[0]) selectors[0](doc);
   };
@@ -1455,7 +1400,7 @@ function appendLog(line, isErr) {
   logBox.scrollTop = logBox.scrollHeight;
 }
 
-// Live-updating line for upload percentage: rewrite the last row if it's a
+// Live-updating progress line: rewrite the last row if it's a
 // progress line, otherwise start a new one (so 0→100% doesn't spam the log).
 function updateProgress(line) {
   if (!logBox) return;
@@ -1463,6 +1408,12 @@ function updateProgress(line) {
   if (last && last.classList.contains("progress")) last.textContent = line;
   else logBox.append(el("div", { className: "progress" }, line));
   logBox.scrollTop = logBox.scrollHeight;
+}
+
+// The most recently started of these jobs: one panel log shows whichever ran last.
+function latestJob(jobs, kinds) {
+  return kinds.map((kind) => jobs?.[kind]).filter(Boolean)
+    .sort((a, b) => (b.started_at || 0) - (a.started_at || 0))[0];
 }
 
 function makeLog(job) {
@@ -1480,10 +1431,6 @@ function verificationView(summary) {
   const icon = { passed: "✓", warning: "⚠", stale: "⚠", not_checked: "—" };
   const row = (name, result) => el("li", { className: `check ${result?.status || "not_checked"}` },
     `${icon[result?.status] || "—"} ${name}: ${result?.detail || "Not checked."}`);
-  const media = summary.media || {};
-  const files = Object.entries(media.files || {}).map(([part, result]) =>
-    el("li", { className: `check file ${result.status || "not_checked"}` },
-      `${icon[result.status] || "—"} ${part}: ${result.detail}`));
   return el("div", { className: "verify" },
     el("h3", {}, "Verification"),
     el("p", { className: "hint" },
@@ -1493,10 +1440,7 @@ function verificationView(summary) {
       row("Health", summary.health),
       row("Source notes", summary.notes),
       row("Opens in MuseScore", summary.musescore),
-      row("Lyrics", summary.lyrics),
-      row("Rendered files", media),
-      ...files),
-    summary.render_error ? el("div", { className: "banner err" }, "Render error: " + summary.render_error) : "");
+      row("Lyrics", summary.lyrics)));
 }
 
 const CHECK_ICON = { passed: "✓", warning: "⚠", stale: "⚠", not_checked: "—" };
@@ -1512,12 +1456,10 @@ function compactCheck(name, result) {
 function reviewReadiness(summary) {
   if (!summary) return { tone: "attention", title: "Needs attention" };
   const core = [summary.notes, summary.lyrics, summary.health];
-  const media = summary.media;
   if (core.some((result) => ["stale", "not_checked"].includes(result?.status))) {
     return { tone: "attention", title: "Needs attention" };
   }
-  if (core.some((result) => result?.status === "warning")
-      || ["warning", "stale"].includes(media?.status)) {
+  if (core.some((result) => result?.status === "warning")) {
     return { tone: "recommended", title: "Review recommended" };
   }
   return { tone: "ready", title: "Ready to approve" };
@@ -1531,8 +1473,7 @@ function compactReview(summary) {
       compactCheck("Notes", summary?.notes),
       compactCheck("MuseScore", summary?.musescore),
       compactCheck("Lyrics", summary?.lyrics),
-      compactCheck("Health", summary?.health),
-      compactCheck("Videos", summary?.media)));
+      compactCheck("Health", summary?.health)));
 }
 
 // ---- per-stage panels ----------------------------------------------------
@@ -1545,8 +1486,7 @@ function renderPanel(panel, view, song, slug, refresh, actions) {
   if (view === "fix") return panelFix(panel, song, P, refresh);
   if (view === "lyrics") return panelLyrics(panel, song, P, refresh);
   if (view === "review") return panelReview(panel, song, P, refresh, actions);
-  if (view === "record") return panelRecord(panel, song, P, refresh, actions);
-  if (view === "upload") return panelUpload(panel, song, P, refresh);
+  if (view === "publish") return panelPublish(panel, song, P, refresh, actions);
 }
 
 // The Scan panel. It has one job the other panels do not: it has to stop a parse
@@ -1737,13 +1677,12 @@ function scanDone(st, actions) {
 }
 
 function panelRegister(panel, song, P, refresh) {
-  const uploaded = !!(song.record?.uploads?.length);
   const nameInput = el("input", { value: song.name, style: "width:100%" });
   const saveBtn = el("button", { className: "primary", onclick: async () => {
     const name = nameInput.value.trim();
     if (!name || name === song.name) return;
     saveBtn.disabled = true;
-    appendLog("Renaming…" + (uploaded ? " (updating YouTube titles in background)" : ""));
+    appendLog("Renaming…");
     try {
       const fresh = await postJSON(`${P}/rename`, { name });
       Object.assign(song, fresh);
@@ -1758,8 +1697,8 @@ function panelRegister(panel, song, P, refresh) {
     el("label", {}, "Display name"),
     nameInput,
     el("div", { className: "row" }, saveBtn,
-      el("span", { className: "hint" }, uploaded
-        ? "Already on YouTube — titles will be updated too."
+      el("span", { className: "hint" }, song.published?.length
+        ? "The folder name stays the same. Publish again to show the new name on the site."
         : "The folder name stays the same.")),
     el("p", { className: "sub", style: "margin-top:16px" }, "Sources for this song."),
     el("p", {}, `Score: ${song.sources?.xml || "—"}`),
@@ -1937,6 +1876,24 @@ async function panelClean(panel, song, slug, P, refresh) {
     panel.append(el("div", { className: "banner" }, "● Cleaning… recent messages are saved below."));
   else if (cleanJob?.status === "failed")
     panel.append(el("div", { className: "banner err" }, "Last clean failed: " + cleanJob.error));
+  if (song.clean_backup?.changed && cleanJob?.status !== "running") {
+    // Worked on since the clean (lyrics, a fix, an upload): undoing would lose it.
+    panel.append(el("p", { className: "hint undoclean-off" },
+      "Undo last clean is not offered: the score has changed since that clean, "
+      + "and undoing would throw those changes away."));
+  } else if (song.clean_backup && cleanJob?.status !== "running") {
+    const when = song.clean_backup.saved_at
+      ? new Date(song.clean_backup.saved_at * 1000).toLocaleString() : "before the last clean";
+    const undoBtn = el("button", { className: "undoclean", onclick: async () => {
+      if (!confirm(`Put back the cleaned score as it was on ${when}, with its lyrics and checks?\n\n`
+          + "What the last clean made is thrown away.")) return;
+      undoBtn.disabled = true;
+      try { await postJSON(`${P}/undo-clean`, {}); refresh(); }
+      catch (e) { undoBtn.disabled = false; appendLog(e.message, true); }
+    } }, "Undo last clean");
+    panel.append(el("div", { className: "row" }, undoBtn,
+      el("span", { className: "hint" }, `Puts back the score from ${when}.`)));
+  }
   panel.append(makeLog(cleanJob));
   if (song.has_cleaned) appendLog("A cleaned score exists. Re-cleaning will overwrite it.");
 }
@@ -1964,13 +1921,42 @@ function sysBlock(sys) {
       rows));
 }
 
+// Run the clean's own checks again -- notes against the scan, MuseScore 3's check,
+// health -- on the cleaned score as it is now, without cleaning (#391). A score fixed
+// by hand showed them as stale, and a re-clean would have thrown the fixes away.
+function checkAgainButton(song, P) {
+  const running = song.jobs?.check?.status === "running";
+  const btn = el("button", { disabled: running, title:
+      "Compare the notes with the scan, ask MuseScore 3 whether it opens the score, "
+      + "and check health -- on the score as it is now. Changes nothing in the score.",
+    onclick: async () => {
+      btn.disabled = true;
+      try { await postJSON(`${P}/recheck`, {}); }
+      catch (e) { btn.disabled = false; alert(e.message); }
+    } }, running ? "Checking…" : "Check again");
+  return btn;
+}
+
+function checkAgainStatus(song) {
+  const job = song.jobs?.check;
+  if (!job) return "";
+  const head = job.status === "running" ? el("div", { className: "banner" }, "● Checking the current score…")
+    : job.status === "failed" ? el("div", { className: "banner err" }, "Last check failed: " + job.error)
+    : "";
+  // A finished check's messages fold away; the check rows above already say the result.
+  if (job.status === "succeeded")
+    return el("details", { className: "checkagain" }, el("summary", {}, "Last check's messages"), makeLog(job));
+  return el("div", { className: "checkagain" }, head, makeLog(job));
+}
+
 function panelFix(panel, song, P, refresh) {
   panel.append(el("h2", {}, "Fix"),
     el("p", { className: "sub" }, "OCR damage the auto-fixers couldn't repair. Fix in MuseScore, save, and it re-checks automatically."));
   problemList(panel, song, P, refresh);
   panel.append(el("div", { className: "row" },
     el("button", { className: "primary", onclick: () => postJSON(`${P}/open-score`) }, "Open in MuseScore"),
-    el("button", { onclick: async () => { await postJSON(`${P}/rescan`); refresh(); } }, "Re-check now")));
+    checkAgainButton(song, P)));
+  panel.append(checkAgainStatus(song));
   panel.append(scoreFileTransfer(song, P, refresh));
   slurRecorder(panel, song, P, refresh);
 }
@@ -2435,6 +2421,7 @@ async function panelLyrics(panel, song, P, refresh) {
   const swap = (m) => {
     localStorage.setItem("lyricMode", m);
     panel._refreshInPlace = null;
+    panel.closest(".ws")?.classList.remove("lyricwide");
     panel.replaceChildren();
     panelLyrics(panel, song, P, refresh);
   };
@@ -2542,167 +2529,257 @@ async function lyricsPaste(panel, song, P, refresh) {
   panel.append(makeLog());
 }
 
+// ---- Type by system: one printed system per screen (#393, #397) ---------------
+// Each staff of the page picture is followed by the boxes for the parts printed on
+// it. One box is one verse x one system x one part x one voice; an import sends
+// only the boxes changed, and an emptied box takes its words out. ← Previous and
+// Next → import first, and stay put when the import gives a warning.
+const lyricPlace = (slug) => {
+  try { return JSON.parse(localStorage.getItem(`lyricPlace:${slug}`)) || {}; } catch { return {}; }
+};
+
 async function lyricsManual(panel, song, P, refresh) {
-  panel.append(el("p", { className: "sub" }, "Type the lyrics for each part, per system. Hyphenate syllables (e.g. \"lau-lun ai-ka\")."));
-  const toggle = el("button", { className: "vtab" }, "");
-  toggle.onclick = () => {
-    showScore = !showScore;
-    localStorage.setItem("lyricScore", showScore ? "1" : "0");
-    lyricScroll = panel.scrollTop;
-    panel._refreshInPlace = null; // this one does want the panel drawn again
-    refresh();
-  };
-  panel.append(toggle);
-  const holder = el("div", {}, el("p", { className: "hint" }, "Loading…"));
-  panel.append(holder, makeLog());
+  const wsEl = panel.closest(".ws");
+  wsEl?.classList.add("lyricwide");
+  const holder = el("div", { className: "lyed" }, el("p", { className: "hint" }, "Loading…"));
+  panel.append(holder);
 
   let grid;
   try { grid = await getJSON(`${P}/lyric-grid`); }
   catch (e) { holder.replaceChildren(el("p", { className: "err" }, e.message)); return; }
+  if (!grid.systems.length) {
+    holder.replaceChildren(el("p", { className: "hint" }, "This score has no systems to type into."));
+    return;
+  }
 
-  // The printed system, cropped from the scan, shown beside the cells for it.
-  // Typing lyrics against a whole page is the resolution problem all over again:
-  // a slur or a lyric line under the lower staff is not legible at page scale.
-  // Matched by measure range, not by position, so a bounds file that disagrees
-  // with the score attaches nothing rather than the wrong picture.
-  let byStart = {};
-  try {
-    const b = await getJSON(`${P}/bounds`);
-    for (const s of b.systems || []) if (s.measure_start) byStart[s.measure_start] = s.index;
-  } catch { /* no PDF, or none stored yet — the cells work regardless */ }
-  // Off by default now that focusing a cell shows the system in the viewer.
-  let showScore = localStorage.getItem("lyricScore") === "1";
-  const { parts, systems, cells, capacities } = grid;
-  const cellText = (si, name) => (cells?.[si]?.[name]) || "";
-  // Attach a mismatch to the system where its line STARTS (a line can span several
-  // systems if the part is blank in later ones); show the full measure range.
-  const cellWarns = (sys, p) => lyricMismatches(song).filter((w) =>
-    (w.staff_ids || []).includes(p.id) && w.measure_start >= sys.start && w.measure_start <= sys.end);
-  const warnLines = (sys, p) => cellWarns(sys, p).map((w) => el("div", { className: "lyerr" },
-    `⚠ m${w.measure_start}–${w.measure_end}`
-    + `${w.measure_end > sys.end ? " (spans later systems)" : ""}: `
-    + `${w.message.split("): ").pop()}`));
-  const warnBoxes = [];
-  let typingIn = null; // the box last typed in, given back its focus after an import
-
-  const scoreFor = (sys) => {
-    const idx = byStart[sys.start];
-    if (!idx || !showScore) return [];
-    return [el("a", { className: "syspeek", href: `${P}/system/${idx}?dpi=400`,
-                      target: "_blank", title: "open at full resolution" },
-      el("img", { src: `${P}/system/${idx}?dpi=200`, loading: "lazy",
-                  alt: `system ${idx}` }))];
+  const saved = lyricPlace(song.slug);
+  const S = {
+    n: Math.min(Math.max(0, saved.n | 0), grid.systems.length - 1),
+    verse: Math.max(1, saved.verse | 0 || 1),
+    verses: Math.max(grid.verses.length, saved.verse | 0 || 1),
+    landed: false,
+    armed: false,            // an import just warned: the next press moves on
+    typed: {},               // `${verse}|${system}|${key}` -> text not yet imported
+    status: "",
   };
-
-  holder.replaceChildren(...systems.map((sys) =>
-    el("div", { className: "sysblock" },
-      el("h4", {}, `System ${sys.index + 1} — measures ${sys.start}–${sys.end}`),
-      ...scoreFor(sys),
-      ...parts.map((p) => {
-        const ta = el("textarea", { rows: 1, value: cellText(sys.index, p.name),
-          "data-sys": sys.index, "data-part": p.name });
-        ta.oninput = () => autoGrow(ta);
-        const shown = byStart[sys.start];
-        ta.onfocus = () => { typingIn = ta; if (shown) showSystem(shown); };
-        const errs = el("div", { className: "lyerrs" }, ...warnLines(sys, p));
-        warnBoxes.push([errs, sys, p]);
-        return el("div", { className: "lyrow" },
-          el("label", {}, `${p.name} · ${capacities?.[sys.index]?.[p.name] ?? 0} lyric slots`), ta, errs);
-      }))));
-  toggle.textContent = Object.keys(byStart).length
-    ? (showScore ? "Hide the score" : "Show the score")
-    : "";
-  toggle.style.display = Object.keys(byStart).length ? "" : "none";
-  holder.querySelectorAll("textarea").forEach(autoGrow); // size to content (no scroll)
-  if (lyricScroll != null) { panel.scrollTop = lyricScroll; lyricScroll = null; } // restore after "Show the score"
-
-  // The warnings are the only thing an import changes in this panel, so they are
-  // the only thing redrawn: the boxes, the one being typed in and the scroll stay.
-  const drawWarns = () => {
-    for (const [errs, sys, p] of warnBoxes) errs.replaceChildren(...warnLines(sys, p));
-  };
-  const live = lyricsInPlace(panel, song, drawWarns);
-  const readCells = () => {
-    const map = {};
-    panel.querySelectorAll("textarea[data-sys]").forEach((t) => {
-      (map[t.dataset.sys] ||= {})[t.dataset.part] = t.value.trim();
-    });
-    return map;
-  };
-  let imported = readCells(); // what the score holds now, to tell what an import changes
-
-  // After an import each box shows what actually landed -- the words, and a `_` for
-  // every slot left without one -- written into the boxes already there. The box
-  // being typed in keeps its caret, and whatever is in view stays where it is on
-  // screen even when a box above it grows.
-  const showLanded = async () => {
-    let fresh;
-    try { fresh = await getJSON(`${P}/lyric-grid`); } catch { return; }
-    const boxes = [...panel.querySelectorAll("textarea[data-sys]")];
-    const anchor = (typingIn?.isConnected && typingIn)
-      || boxes.find((t) => t.getBoundingClientRect().bottom > panel.getBoundingClientRect().top);
-    const y = anchor?.getBoundingClientRect().top;
-    for (const t of boxes) {
-      const text = fresh.cells?.[t.dataset.sys]?.[t.dataset.part] || "";
-      if (t.value === text) continue;
-      const caret = t === typingIn ? t.selectionStart : null;
-      t.value = text;
-      autoGrow(t);
-      if (caret != null) t.setSelectionRange(caret, caret);
-    }
-    if (anchor) panel.scrollTop += anchor.getBoundingClientRect().top - y;
-    imported = readCells();
-  };
-
-  // The printed systems an import touches: each one where a part's text differs
-  // from what was imported last, and the systems after it where that part is left
-  // blank, because a blank box carries the line on and the words spill into them.
-  const changedSystems = (now) => {
-    const touched = new Set();
-    for (const p of parts) {
-      let carrying = false;
-      for (const sys of systems) {
-        const text = now[sys.index]?.[p.name] || "";
-        const before = imported[sys.index]?.[p.name] || "";
-        if (text !== before) { touched.add(sys); carrying = true; }
-        else if (text) carrying = false;
-        else if (carrying) touched.add(sys);
+  const staves = {};         // system -> what /lyric-staves said
+  const remember = () => localStorage.setItem(`lyricPlace:${song.slug}`,
+    JSON.stringify({ n: S.n, verse: S.verse }));
+  const sys = () => grid.systems[S.n];
+  const boxesOf = (n) => grid.boxes?.[n] || grid.boxes?.[String(n)] || [];
+  const original = (b, verse = S.verse) => b.text?.[verse] || "";
+  const tkey = (verse, n, b) => `${verse}|${n}|${b.key}`;
+  const current = (b, verse = S.verse, n = S.n) => S.typed[tkey(verse, n, b)] ?? original(b, verse);
+  const label = (b) => b.voice > 1 ? `${b.part} · voice ${b.voice}` : b.part;
+  // Every verse's boxes changed on this system and not imported yet.
+  const pending = () => {
+    const out = {};
+    for (let v = 1; v <= S.verses; v++) {
+      for (const b of boxesOf(S.n)) {
+        if (current(b, v) !== original(b, v)) (out[v] ||= {})[b.key] = current(b, v);
       }
     }
-    const printed = [...touched].map((sys) => byStart[sys.start]);
-    return printed.every(Boolean) ? printed.sort((a, b) => a - b) : "all";
+    return out;
   };
 
-  const doImport = async (btn) => {
-    const map = readCells();
-    if (!Object.values(map).some((row) => Object.values(row).some((t) => t))) {
-      appendLog("Nothing typed yet.", true); return;
-    }
-    btn.disabled = true;
-    live.busy = lyricImporting = true;
-    appendLog("Importing lyrics…");
-    try {
-      const fresh = await postJSON(`${P}/lyrics`, { cells: map });
-      Object.assign(song, fresh);
-      live.fp = song.cleaned_fingerprint;
-      drawWarns();
-      const w = song.lyrics?.warnings || [];
-      appendLog(w.length ? `Imported with ${w.length} warning(s).` : "Imported cleanly. Ready for review.");
-      cleanedSystemsChanged(song.slug, song.cleaned_fingerprint, changedSystems(map));
-      imported = map;
-      await showLanded();
-    } catch (e) { appendLog(e.message, true); }
-    live.busy = lyricImporting = false;
-    btn.disabled = false;
-    // Pressing the button took the focus (and disabling it dropped it on the page);
-    // give it back to the box being typed in, without scrolling to it.
-    const away = document.activeElement;
-    if (typingIn?.isConnected && (away === btn || away === document.body || !away))
-      typingIn.focus({ preventScroll: true });
-    refresh(); // the stage rail and the viewer; this panel only updates its warnings
+  const warnsFor = (b) => lyricMismatches(song).filter((w) =>
+    (w.verse || 1) === S.verse && (w.voice || 1) === b.voice
+    && (w.staff_ids || []).includes(b.id)
+    && w.measure_start >= sys().start && w.measure_start <= sys().end);
+  const warnRows = [];
+  const warnLines = (b) => warnsFor(b).map((w) => el("div", { className: "lyerr" },
+    `⚠ m${w.measure_start}–${w.measure_end}`
+    + `${w.measure_end > sys().end ? " (runs into the next system)" : ""}: `
+    + `${w.message.split("): ").pop()}`));
+  const drawWarns = () => { for (const [box, b] of warnRows) box.replaceChildren(...warnLines(b)); };
+
+  const statusEl = el("span", { className: "lyedstatus" });
+  const showStatus = () => {
+    const p = pending();
+    const names = Object.fromEntries(boxesOf(S.n).map((b) => [b.key, label(b)]));
+    const changed = Object.entries(p).map(([v, keys]) =>
+      `${S.verses > 1 ? `verse ${v}: ` : ""}${Object.keys(keys).map((k) => names[k] || k).join(", ")}`);
+    statusEl.textContent = S.status || (changed.length ? `Not imported — ${changed.join("; ")}` : "");
   };
-  const importBtn = el("button", { className: "primary", onclick: () => doImport(importBtn) }, "Import lyrics");
-  panel.append(el("div", { className: "floatbar" }, importBtn));
+
+  const boxEl = (b) => {
+    const ta = el("textarea", { rows: 1, value: current(b), spellcheck: false,
+      "data-box": b.key, "aria-label": `${label(b)}, verse ${S.verse}` });
+    const mark = () => ta.classList.toggle("changed", ta.value !== original(b));
+    ta.oninput = () => {
+      S.typed[tkey(S.verse, S.n, b)] = ta.value;
+      S.armed = false; S.status = "";
+      mark(); autoGrow(ta); showStatus();
+    };
+    mark();
+    const errs = el("div", { className: "lyerrs" }, ...warnLines(b));
+    warnRows.push([errs, b]);
+    return el("div", { className: b.voice > 1 ? "lyrow v2" : "lyrow" },
+      el("label", {}, `${label(b)} · ${b.slots} slot${b.slots === 1 ? "" : "s"}`), ta, errs);
+  };
+
+  const pictureSrc = (crop) => `${P}/system/${crop}?dpi=200`;
+  // The picture as a list: the whole system (the page, or what landed), boxes under it.
+  const listView = (boxes, note) => {
+    const crop = sys().crop;
+    const out = [];
+    if (S.landed) {
+      // This system's bars drawn on their own, so they are these bars even where a
+      // render of the whole score lays its systems out differently from the page.
+      const box = el("div", { className: "lyedpic landed" });
+      swapSystemImage(box, `${P}/landed/${S.n}?v=${encodeURIComponent(song.cleaned_fingerprint || "")}`,
+        S.n + 1);
+      out.push(box);
+    } else if (crop != null) {
+      out.push(el("div", { className: "lyedpic" },
+        el("img", { src: pictureSrc(crop), alt: `printed system ${S.n + 1}` })));
+    }
+    if (note) out.push(el("p", { className: "hint" }, note));
+    out.push(...boxes.map(boxEl));
+    return out;
+  };
+  // Layout B: the picture cut just above each staff, that staff's boxes under it.
+  const staffView = (boxes, found) => {
+    const out = [];
+    const src = pictureSrc(found.crop);
+    found.rows.forEach((row, i) => {
+      const span = Math.max(1e-6, row.bottom - row.top);
+      out.push(el("div", { className: "lyedslice",
+        style: `aspect-ratio: ${found.aspect} / ${span}` },
+        el("img", { src, alt: `staff ${found.printed[i]} of printed system ${S.n + 1}`,
+          style: `top: ${(-row.top / span) * 100}%; height: ${100 / span}%` })));
+      out.push(...boxes.filter((b) => b.printed === found.printed[i]).map(boxEl));
+    });
+    return out;
+  };
+
+  const body = el("div", { className: "lyedbody" });
+  const tabs = el("div", { className: "lyedtabs", role: "tablist" });
+  const where = el("span", { className: "lyedwhere" });
+  const landedBtn = el("button", { onclick: () => { S.landed = !S.landed; drawBody(); } });
+  const prevBtn = el("button", { onclick: () => go(-1) }, "← Previous");
+  const nextBtn = el("button", { onclick: () => go(1) }, "Next →");
+  const importBtn = el("button", { className: "primary", onclick: () => doImport() }, "Import");
+
+  const drawTabs = () => {
+    const unsent = pending();
+    tabs.replaceChildren(
+      ...Array.from({ length: S.verses }, (_, i) => i + 1).map((v) =>
+        el("button", { className: v === S.verse ? "vtab active" : "vtab", role: "tab",
+          "aria-selected": v === S.verse ? "true" : "false",
+          onclick: () => { S.verse = v; S.status = ""; remember(); drawAll(); } },
+          `Verse ${v}${unsent[v] ? " •" : ""}`)),
+      el("button", { className: "vtab", title: "type another verse",
+        onclick: () => { S.verses += 1; S.verse = S.verses; S.status = ""; remember(); drawAll(); } },
+        "+ verse"));
+  };
+
+  let drawn = 0;
+  async function drawBody() {
+    const ticket = ++drawn;
+    const s = sys();
+    where.textContent = `System ${S.n + 1} of ${grid.systems.length} · bars ${s.start}–${s.end}`;
+    prevBtn.disabled = S.n === 0;
+    nextBtn.disabled = S.n + 1 >= grid.systems.length;
+    landedBtn.textContent = S.landed ? "Show the page" : "Show what landed";
+    warnRows.length = 0;
+    const boxes = boxesOf(S.n);
+    if (!boxes.length) {
+      body.replaceChildren(...listView([], "No part sings in this system."));
+      return;
+    }
+    let found = staves[S.n];
+    if (s.crop != null && !S.landed && !found) {
+      body.replaceChildren(busyNote("Finding the staves…", "busynote small"));
+      try { found = staves[S.n] = await getJSON(`${P}/lyric-staves/${S.n}`); }
+      catch { found = staves[S.n] = { rows: [], printed: null }; }
+      if (ticket !== drawn) return;
+    }
+    // Under a staff only when every box has its staff in the picture: a box never
+    // lands under the wrong one.
+    const matched = !!(found && !S.landed && found.printed && found.rows?.length
+      && found.printed.length === found.rows.length
+      && boxes.every((b) => found.printed.includes(b.printed)));
+    const focusKey = document.activeElement?.dataset?.box;
+    warnRows.length = 0;
+    body.replaceChildren(...(matched ? staffView(boxes, found)
+      : listView(boxes, s.crop != null && !S.landed
+        ? "The staves in this picture could not be matched to the parts, so the boxes are listed under it." : "")));
+    body.querySelectorAll("textarea").forEach(autoGrow);
+    if (focusKey) body.querySelector(`textarea[data-box="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });
+  }
+  function drawAll() { drawTabs(); drawBody(); showStatus(); }
+
+  const live = lyricsInPlace(panel, song, drawWarns);
+
+  // Import every verse changed on this system. True when it went in with no warning.
+  async function doImport() {
+    const unsent = pending();
+    if (!Object.keys(unsent).length) { S.status = "Nothing changed on this system."; showStatus(); return true; }
+    for (const b of [importBtn, prevBtn, nextBtn]) b.disabled = true;
+    live.busy = lyricImporting = true;
+    S.status = "Importing…"; showStatus();
+    let warned = 0;
+    let failed = false;
+    const n = S.n;
+    const written = [];
+    try {
+      for (const [verse, boxes] of Object.entries(unsent)) {
+        const fresh = await postJSON(`${P}/lyrics`, { verse: +verse, boxes: { [n]: boxes } });
+        Object.assign(song, fresh);
+        live.fp = song.cleaned_fingerprint;
+        warned += (fresh.imported || []).length;
+        written.push(...(fresh.written || []));
+        for (const key of Object.keys(boxes)) delete S.typed[`${verse}|${n}|${key}`];
+      }
+      // The boxes show what landed: the words, and `_` for every note left without one.
+      grid = await getJSON(`${P}/lyric-grid`);
+      S.verses = Math.max(S.verses, grid.verses.length);
+      // Every system the import wrote on: a long or hyphen-ended line runs on into
+      // the next system when that one's box is empty.
+      const touched = grid.systems.filter((s) =>
+        written.some((w) => w.start <= s.end && w.end >= s.start));
+      const crops = touched.map((s) => s.crop);
+      cleanedSystemsChanged(song.slug, song.cleaned_fingerprint,
+        crops.length && crops.every((c) => c != null) ? crops : "all");
+      S.status = warned ? `Imported with ${warned} warning${warned === 1 ? "" : "s"} — see the boxes.`
+        : "Imported.";
+    } catch (e) {
+      failed = true;
+      S.status = `Import failed: ${e.message}`;
+    }
+    live.busy = lyricImporting = false;
+    importBtn.disabled = false;
+    drawAll();
+    refresh(); // the stage rail; this panel keeps itself
+    return !failed && !warned;
+  }
+
+  // Moving imports what was typed first; a warning keeps you on the system to see it,
+  // and pressing again moves on.
+  async function go(step) {
+    const to = S.n + step;
+    if (to < 0 || to >= grid.systems.length) return;
+    if (!S.armed && Object.keys(pending()).length) {
+      const clean = await doImport();
+      if (!clean) { S.armed = true; S.status += " Press again to move on."; showStatus(); return; }
+    }
+    S.armed = false; S.status = "";
+    S.n = to; remember();
+    drawAll();
+    panel.scrollTop = 0;
+  }
+
+  holder.replaceChildren(
+    el("div", { className: "lyedhead" }, tabs, where),
+    el("p", { className: "hint lyedhint" },
+      "_ is a note with no new syllable: after a word ending in - it holds that word "
+      + "(e-lei- _ _ son). A word ending in - carries on into the next system. "
+      + "Empty a box and import to take its words out."),
+    body,
+    el("div", { className: "lyedbar" }, prevBtn, importBtn, statusEl, landedBtn, nextBtn),
+    makeLog());
+  drawAll();
 }
 
 function panelReview(panel, song, P, refresh, actions) {
@@ -2712,446 +2789,228 @@ function panelReview(panel, song, P, refresh, actions) {
       Object.assign(song, await postJSON(`${P}/approve-review`, {
         cleaned_fingerprint: song.verification_summary?.cleaned_fingerprint,
       }));
-      actions.selectStage("record");
+      actions.selectStage("publish");
     } catch (error) {
       approve.disabled = false;
       alert(error.message);
     }
-  } }, "✓ Approve → Record");
+  } }, "✓ Approve → Publish");
   panel.append(el("section", { className: "review-panel" },
     el("h2", {}, "Review"),
-    el("p", { className: "sub" }, "Final check before recording."),
+    el("p", { className: "sub" }, "Final check before publishing."),
     compactReview(song.verification_summary),
     el("div", { className: "review-full" }, verificationView(song.verification_summary)),
     el("div", { className: "review-secondary row" },
-      el("button", { onclick: async () => {
-        Object.assign(song, await postJSON(`${P}/rescan`));
-        refresh();
-      } }, "Re-run health check"),
+      checkAgainButton(song, P),
       el("button", { onclick: () => postJSON(`${P}/open-score`) }, "Open in MuseScore")),
+    checkAgainStatus(song),
     scoreFileTransfer(song, P, refresh),
     el("div", { className: "review-actions" }, approve)));
 }
 
-function panelRecord(panel, song, P, refresh, actions) {
-  const rec = song.record || {};
-  const recording = song.recording;
-  const recorded = !!(rec.outputs && rec.outputs.length);
+// The last stage (#400): the score, its MIDI and the timing go to the stemmanauhat
+// site, which draws the score and plays the MIDI itself, and the song is listed for
+// one choir. The tempo the site plays at and the credits it shows are set here and
+// saved with the song, so publishing again sends the same. The choirs are the
+// site's own, read from its database (#408, GET /api/choirs).
+const CREDITS = [["composer", "Composer"], ["lyricist", "Lyricist"], ["arranger", "Arranger"]];
+
+function panelPublish(panel, song, P, refresh, actions) {
+  const pub = song.publish || {};
   const summary = song.verification_summary || {};
   const parts = summary.expected_parts || [];
   const approvedAgainst = song.review?.approved_against;
-  const currentScore = summary.cleaned_fingerprint;
-  const approved = !!approvedAgainst && approvedAgainst === currentScore;
-  const approvalStale = !!approvedAgainst && approvedAgainst !== currentScore;
-  // Two ways to make the videos. The scrolling renderer draws them from the score
-  // and is the default; the screen recorder drives MuseScore and needs macOS.
-  let renderer = rec.renderer || "scroll";
+  const approved = !!approvedAgainst && approvedAgainst === summary.cleaned_fingerprint;
+  const approvalStale = !!approvedAgainst && !approved;
 
-  panel.append(el("h2", {}, "Record"));
-  const sub = el("p", { className: "sub" }, "");
-  panel.append(sub);
+  panel.append(
+    el("h2", {}, "Publish"),
+    el("p", { className: "sub" },
+      "Sends the score, its MIDI and the timing to the stemmanauhat site and lists the song for a choir."),
+    el("div", { className: `approval-summary ${approved ? "approved" : "attention"}` },
+      el("strong", {}, approved ? "✓ Score approved" : approvalStale ? "⚠ Score changed after approval" : "⚠ Review not approved"),
+      el("span", {}, approved
+        ? `${parts.length} part${parts.length === 1 ? "" : "s"} · ${summary.lyrics?.status === "passed" ? "Lyrics ready" : "Check lyric status"}`
+        : approvalStale ? "Return to Review before publishing the changed score." : "Approve the score in Review before publishing."),
+      approved ? "" : el("button", { onclick: () => actions.selectStage("review") }, "Back to Review")));
 
-  const approval = el("div", { className: `approval-summary ${approved ? "approved" : "attention"}` },
-    el("strong", {}, approved ? "✓ Score approved" : approvalStale ? "⚠ Score changed after approval" : "⚠ Review not approved"),
-    el("span", {}, approved
-      ? `${parts.length} part${parts.length === 1 ? "" : "s"} · ${summary.lyrics?.status === "passed" ? "Lyrics ready" : "Check lyric status"}`
-      : approvalStale ? "Return to Review before rendering the changed score." : "Approve the score in Review before rendering."),
-    approved ? "" : el("button", { onclick: () => actions.selectStage("review") }, "Back to Review"));
-  panel.append(approval);
-
-  if (recording) {
-    panel.append(el("div", { className: "banner" }, "● Rendering… leave this running."));
-  } else if (recorded) {
-    panel.append(el("div", { className: "banner good" },
-      "✓ Ready" + (rec.renderer === "screen" ? " (screen recording)." : ".")));
-  }
-  if (rec.error) {
-    panel.append(el("div", { className: "banner err" }, "Last run failed: " + rec.error));
-  } else if (song.jobs?.render?.status === "failed") {
-    panel.append(el("div", { className: "banner err" },
-      "Last render failed: " + song.jobs.render.error));
-  }
-
-  const scrollRadio = el("input", { type: "radio", name: "renderer", checked: renderer === "scroll" });
-  const screenRadio = el("input", { type: "radio", name: "renderer", checked: renderer === "screen" });
-  const quality = el("select", {},
-    el("option", { value: "4k", selected: (rec.quality || "4k") === "4k" }, "4K, 60fps"),
-    el("option", { value: "1080p", selected: rec.quality === "1080p" }, "1080p, 30fps (faster)"),
-    el("option", { value: "720p", selected: rec.quality === "720p" }, "720p, 30fps (test)"));
-  // What a song that has never been asked starts at. The server prefills the same
-  // numbers (DEFAULT_TOP/BOTTOM_MARGIN_PERCENT); keep the two in step. A little
-  // white space under the bottom staff keeps its lyrics off the frame edge.
-  const topMargin = el("input", {
-    type: "number", value: rec.top_margin ?? DEFAULT_TOP_MARGIN, min: -40, max: 100, step: 1,
-    style: "width:100px", "data-video-margin": "top"
-  });
-  const bottomMargin = el("input", {
-    type: "number", value: rec.bottom_margin ?? DEFAULT_BOTTOM_MARGIN, min: -40, max: 100, step: 1,
-    style: "width:100px", "data-video-margin": "bottom"
-  });
-  // Parts that share a staff in the picture (#246): "S1+S2, A1+A2" draws four
-  // parts on two staves. The videos and their mixes stay one per part.
-  const staffGroups = el("input", {
-    type: "text", value: rec.staff_groups ?? "", placeholder: "e.g. S1+S2, A1+A2",
-    style: "width:220px", "data-staff-groups": ""
-  });
-  const hardwareEncoding = el("input", {
-    type: "checkbox", checked: rec.hardware_encoding !== false, "data-hardware-encoding": ""
-  });
-  const bpm = el("input", {
-    type: "number", value: rec.bpm ?? 80, min: 20, max: 300, step: 1,
-    style: "width:120px"
-  });
-  const delay = el("input", { type: "number", value: rec.audio_delay_ms ?? 1300, step: 50, style: "width:120px" });
-  const redoMp3 = el("input", { type: "checkbox" });
-  const redoVideo = el("input", { type: "checkbox" });
-
-  const post = async (extra, msg) => {
-    appendLog(msg);
-    try {
-      await postJSON(`${P}/record`, { renderer, ...extra });
-      refresh();
-    } catch (e) { appendLog(e.message, true); }
+  const saveNote = el("span", { className: "hint save-note", "data-save-note": "" }, "");
+  const changed = () => {
+    saveNote.className = "hint save-note";
+    saveNote.textContent = "Unsaved changes";
   };
 
-  const runBtn = el("button", { className: "primary", disabled: recording || !approved, onclick: () =>
-    renderer === "scroll"
-      ? post({ quality: quality.value, hardware_encoding: hardwareEncoding.checked,
-               top_margin: Number(topMargin.value) || 0,
-               bottom_margin: Number(bottomMargin.value) || 0,
-               staff_groups: staffGroups.value.trim(),
-               ...(song.needs_initial_bpm ? { bpm: Number(bpm.value) } : {}) },
-             "Rendering the scrolling video…")
-      : post({ audio_delay_ms: Number(delay.value) || 1300,
-               redo_mp3: redoMp3.checked, redo_video: redoVideo.checked }, "Starting…") }, "");
-  const remergeBtn = el("button", { disabled: recording, onclick: () =>
-    post({ merge_only: true, audio_delay_ms: Number(delay.value) || 1300 },
-         "Re-merging with new offset…") }, "Re-merge only (apply offset)");
+  // The opening tempo, only for a score that carries none of its own.
+  const bpm = el("input", { type: "number", value: pub.bpm ?? 80, min: 20, max: 300, step: 1,
+    style: "width:120px", "data-publish-bpm": "" });
+  bpm.addEventListener("input", changed);
+  // Tempo changes printed in the score (#387): from a bar on, play at another BPM,
+  // or back at the opening one ("Tempo I"). Cleaning keeps no tempo marks, so the
+  // publish puts these back.
+  const tempoRows = el("div", { className: "tempo-changes", "data-tempo-changes": "" });
+  const addTempoRow = (change = {}) => {
+    const start = change.bpm === "start";
+    const bar = el("input", { type: "number", min: 2, step: 1, value: change.measure ?? "",
+      placeholder: "bar", style: "width:64px", "data-tempo-bar": "" });
+    const speed = el("input", { type: "number", min: 20, max: 300, step: 1,
+      value: start ? "" : (change.bpm ?? ""), disabled: start, placeholder: "BPM",
+      style: "width:72px", "data-tempo-bpm": "" });
+    const back = el("input", { type: "checkbox", checked: start, "data-tempo-start": "" });
+    const row = el("div", { className: "row tempo-row" },
+      el("span", {}, "Bar"), bar, speed,
+      el("label", { className: "tempo-start" }, back, " back to start"),
+      el("button", { title: "Remove this tempo change", onclick: () => { row.remove(); changed(); } }, "✕"));
+    back.addEventListener("input", () => { speed.disabled = back.checked; });
+    for (const control of [bar, speed, back]) control.addEventListener("input", changed);
+    tempoRows.append(row);
+    return row;
+  };
+  for (const change of pub.tempo_changes || []) addTempoRow(change);
+  const tempoChanges = () => [...tempoRows.querySelectorAll(".tempo-row")]
+    .map((row) => ({
+      measure: Number(row.querySelector("[data-tempo-bar]").value),
+      start: row.querySelector("[data-tempo-start]").checked,
+      bpm: Number(row.querySelector("[data-tempo-bpm]").value),
+    }))
+    .filter((c) => c.measure)
+    .map((c) => ({ measure: c.measure, bpm: c.start ? "start" : c.bpm }));
+  const addTempo = el("button", { onclick: () => { addTempoRow().querySelector("input").focus(); } },
+    "+ Add tempo change");
 
-  const scrollCommon = el("div", { className: "record-common" },
-    el("label", {}, "Output"),
-    el("div", { className: "row output-row" }, quality,
-      el("span", { className: "hint" }, "4K keeps panning smooth and text sharp")),
-    ...(song.needs_initial_bpm ? [
-      el("label", {}, "Tempo (BPM)"),
-      el("div", { className: "row" }, bpm,
-        el("span", { className: "hint" }, "this score has no opening tempo marking"))
-    ] : []));
-  const scrollAdvanced = el("div", {},
-    el("label", {}, "Vertical margins"),
-    el("div", { className: "row" },
-      el("span", {}, "Top margin"), topMargin, el("span", {}, "%")),
-    el("div", { className: "row" },
-      el("span", {}, "Bottom margin"), bottomMargin, el("span", {}, "%")),
-    el("p", { className: "hint" }, "0 = current layout; positive adds white space; negative crops that edge"),
-    el("label", {}, "Shared staves"),
-    el("div", { className: "row" }, staffGroups),
-    el("p", { className: "hint" },
-      "Two parts on one staff, upper part first; blank = one staff per part. Still one video per part."
-      + (parts.length ? ` Parts: ${parts.join(" ")}` : "")),
-    el("div", { className: "row" }, hardwareEncoding,
-      el("span", {}, "Use NVIDIA hardware encoding when available")));
-  const screenAdvanced = el("div", {},
-    el("label", {}, "Audio sync offset (ms)"),
-    el("div", { className: "row" }, delay,
-      el("span", { className: "hint" }, "shift audio vs. video; re-merge to apply")),
-    el("div", { className: "row" }, redoMp3, el("span", {}, "Re-export MP3")),
-    el("div", { className: "row" }, redoVideo, el("span", {}, "Re-record video")),
-    el("div", { className: "row" }, remergeBtn));
+  // Who wrote it, as the site shows it. Until someone saves their own, the names
+  // the score itself carries are offered.
+  const credited = pub.credits || song.score_credits || {};
+  const credits = Object.fromEntries(CREDITS.map(([key, label]) => {
+    const input = el("input", { type: "text", value: credited[key] || "", maxLength: 200,
+      placeholder: label, "data-credit": key, style: "width:100%" });
+    input.addEventListener("input", changed);
+    return [key, input];
+  }));
 
-  const scrollCard = el("label", { className: "renderer-card" }, scrollRadio,
-    el("span", {}, el("strong", {}, "Scrolling score"),
-      el("small", {}, "Unattended · recommended")));
-  const screenCard = el("label", { className: "renderer-card" }, screenRadio,
-    el("span", {}, el("strong", {}, "Screen recording"),
-      el("small", {}, "MuseScore + QuickRecorder · macOS")));
-  const advanced = el("details", { className: "record-advanced" },
-    el("summary", {}, "Framing & advanced settings"),
-    scrollAdvanced, screenAdvanced);
-  const previewSettings = () => ({
-    quality: quality.value,
-    top_margin: Number(topMargin.value) || 0,
-    bottom_margin: Number(bottomMargin.value) || 0,
-    staff_groups: staffGroups.value.trim(),
+  // What the singers see each part called (#402). Cleaning names parts by guessing
+  // from pitch, so a women's choir can come out with tenors; the names typed here
+  // go into the published score, its MIDI and the site, and survive a re-clean.
+  const publishParts = song.publish_parts || { names: [] };
+  const partNames = publishParts.names.map((name, i) => {
+    const input = el("input", { type: "text", value: name, maxLength: 40,
+      placeholder: `Part ${i + 1}`, "data-part-name": String(i), style: "width:96px" });
+    input.addEventListener("input", changed);
+    return input;
+  });
+
+  const settings = () => ({
+    tempo_changes: tempoChanges(),
+    ...(partNames.length ? { part_names: partNames.map((input) => input.value.trim()) } : {}),
+    credits: Object.fromEntries(CREDITS.map(([key]) => [key, credits[key].value.trim()])),
     ...(song.needs_initial_bpm ? { bpm: Number(bpm.value) } : {}),
   });
-  // Saved on Preview and on Save settings (#301), not only once a preview or a
-  // render has come out: opening the preview is when the choice is made, and a
-  // preview nobody pressed "Preview scroll" for used to keep nothing.
-  const saveNote = el("span", { className: "hint save-note", "data-save-note": "" }, "");
-  const saveSettings = async () => {
+  const saveBtn = el("button", { className: "publish-save", onclick: async () => {
     try {
-      const saved = await postJSON(`${P}/record-settings`,
-        { ...previewSettings(), hardware_encoding: hardwareEncoding.checked });
-      Object.assign(rec, saved.record || {});
-      song.record = rec;
+      Object.assign(song, await postJSON(`${P}/publish-settings`, settings()));
       saveNote.className = "hint save-note";
       saveNote.textContent = "Saved";
-      return true;
     } catch (e) {
       // Said beside the button that was pressed: the log is below the fold.
       saveNote.className = "hint save-note err";
       saveNote.textContent = e.message;
-      return false;
     }
-  };
-  const saveBtn = el("button", { onclick: saveSettings }, "Save settings");
-  const previewBtn = el("button", { className: "preview-action", onclick: async () => {
-    if (await saveSettings()) actions.openPreview({ start: true });
-  } }, "Preview");
-
-  actions.setPreviewSettings(previewSettings);
-  for (const control of [quality, topMargin, bottomMargin, bpm, staffGroups]) {
-    control.addEventListener("input", actions.previewInputsChanged);
-  }
-  for (const control of [quality, topMargin, bottomMargin, bpm, staffGroups, hardwareEncoding]) {
-    control.addEventListener("input", () => {
-      saveNote.className = "hint save-note";
-      saveNote.textContent = "Unsaved changes";
-    });
-  }
-
-  const applyRenderer = () => {
-    scrollRadio.checked = renderer === "scroll";
-    screenRadio.checked = renderer === "screen";
-    scrollCard.classList.toggle("selected", renderer === "scroll");
-    screenCard.classList.toggle("selected", renderer === "screen");
-    scrollCommon.style.display = renderer === "scroll" ? "" : "none";
-    scrollAdvanced.style.display = renderer === "scroll" ? "" : "none";
-    screenAdvanced.style.display = renderer === "screen" ? "" : "none";
-    previewBtn.style.display = renderer === "scroll" ? "" : "none";
-    saveBtn.style.display = renderer === "scroll" ? "" : "none";
-    saveNote.style.display = renderer === "scroll" ? "" : "none";
-    if (renderer === "screen") actions.pausePreview();
-    previewBtn.parentElement?.classList.toggle("screen", renderer === "screen");
-    const count = parts.length ? ` all ${parts.length} parts` : " videos";
-    runBtn.textContent = renderer === "scroll" ? `Render${count}` : `Record${count}`;
-    sub.textContent = renderer === "scroll"
-      ? "Draw the scrolling score straight from the notes — nothing on screen, runs unattended."
-      : "Export per-voice audio, record + merge the play-along video. macOS only.";
-  };
-  const choose = (which) => { renderer = which; applyRenderer(); };
+  } }, "Save settings");
 
   panel.append(
-    el("label", {}, "Video style"),
-    el("div", { className: "renderer-choices" }, scrollCard, screenCard),
-    scrollCommon,
-    advanced,
-    el("div", { className: "record-actions" }, saveBtn, previewBtn, runBtn),
-    saveNote,
-    makeLog(song.jobs?.render));
-
-  scrollRadio.onclick = () => choose("scroll");
-  screenRadio.onclick = () => choose("screen");
-  applyRenderer();
-
-  // --- results review ---
-  const merged = (song.media || []).filter((m) => m.merged);
-  if (song.media && song.media.length) {
-    panel.append(
-      el("h3", {}, "Results"),
-      el("div", { className: "row" },
-        el("button", { onclick: () => postJSON(`${P}/reveal-media`) }, "Reveal in Finder"),
-        recorded ? el("button", { onclick: async () => { await postJSON(`${P}/stage/upload`); refresh(); } }, "→ Upload to YouTube") : ""),
-      ...(merged.length ? merged : song.media).map((m) =>
-        el("div", { className: "result" },
-          el("div", { className: "rlabel" }, m.label),
-          el("video", { src: m.url, controls: true, preload: "metadata" }))));
-  }
+    ...(song.needs_initial_bpm ? [
+      el("label", {}, "Tempo (BPM)"),
+      el("div", { className: "row" }, bpm,
+        el("span", { className: "hint" }, "this score has no opening tempo marking")),
+    ] : []),
+    el("label", {}, "Tempo changes"),
+    tempoRows,
+    el("div", { className: "row" }, addTempo,
+      el("span", { className: "hint" }, "where the page changes speed; bars counted from 1")),
+    el("div", { className: "credits" },
+      ...CREDITS.flatMap(([key, label]) => [el("label", {}, label), credits[key]])),
+    ...(partNames.length ? [
+      el("label", {}, "Part names"),
+      el("div", { className: "row part-names", "data-part-names": "" }, ...partNames),
+      el("span", { className: `part-names-note hint${publishParts.stale ? " err" : ""}` },
+        publishParts.stale ? publishParts.message : "as the singers see them, top staff first"),
+    ] : []),
+    el("div", { className: "row" }, saveBtn, saveNote),
+    publishSection(P, song, refresh, settings, saveNote),
+    makeLog(song.jobs?.publish));
 }
 
-function panelUpload(panel, song, P, refresh) {
-  panel.append(el("h2", {}, "Upload"),
-    el("p", { className: "sub" }, "Upload the recorded videos to YouTube and (optionally) add them to a playlist."),
-    verificationView(song.verification_summary));
-
-  const rec = song.record || {};
-  const recording = song.recording;
-  const recorded = !!(rec.outputs && rec.outputs.length);
-  const uploads = rec.uploads || [];
-  const ups = song.upload_status || { videos: [], local_count: 0 };
-  const onDisk = ups.local_count > 0;
-
-  if (recording) {
-    panel.append(el("div", { className: "banner" }, "● Working… leave this running."));
-  } else if (ups.complete) {
-    panel.append(el("div", { className: "banner good" }, "✓ Uploaded to YouTube."));
-  } else if (uploads.length) {
-    panel.append(el("div", { className: "banner" }, "Only some of the videos are on YouTube."));
+function publishSection(P, song, refresh, settings, saveNote) {
+  const pub = song.publish || {};
+  // One record per choir (#384); a song published before that kept one, as `site`.
+  const sites = pub.sites || (pub.site ? { [pub.site.choir]: pub.site } : {});
+  const listed = Object.keys(sites);
+  const site = sites[pub.choir] || sites[listed[0]];
+  const job = song.jobs?.publish;
+  const running = job?.status === "running";
+  const names = {};
+  const choirName = (c) => names[c] ? `${names[c]} (${c})` : c;
+  const choir = el("select", { className: "publish-choir" },
+    el("option", { value: "" }, "— choir —"));
+  const choirNote = el("p", { className: "hint publish-choirs" });
+  if (song.publish_configured) {
+    getJSON("/api/choirs").then((reply) => {
+      for (const c of reply.choirs) {
+        names[c.id] = c.name;
+        choir.append(el("option", { value: c.id }, c.public ? `${c.name} (${c.id}, open to all)` : `${c.name} (${c.id})`));
+      }
+      choir.value = pub.choir || "";
+      if (reply.error) {
+        choirNote.className = "hint publish-choirs err";
+        choirNote.textContent = `Could not read the site's choirs: ${reply.error}`
+          + (reply.saved_at ? ` — showing the list read on ${new Date(reply.saved_at * 1000).toLocaleString()}.` : "");
+      } else if (!reply.choirs.length) {
+        choirNote.textContent = "The site has no choirs yet: add one with its scripts/add-choir.sh.";
+      }
+      if (site && !running && !pub.error) status.textContent = publishedText();
+    }).catch((e) => { choirNote.className = "hint publish-choirs err"; choirNote.textContent = e.message; });
   }
-  if (rec.error) {
-    panel.append(el("div", { className: "banner err" }, "Last run failed: " + rec.error));
-  } else if (song.jobs?.upload?.status === "failed") {
-    panel.append(el("div", { className: "banner err" },
-      "Last upload failed: " + song.jobs.upload.error));
+  const status = el("p", { className: "hint publish-status" });
+  const publishedText = () => listed.map((c) => {
+    const s = sites[c];
+    const against = s.published_against || pub.published_against;
+    const stale = against && song.cleaned_fingerprint && against !== song.cleaned_fingerprint;
+    return `Published to ${choirName(c)} on `
+      + `${new Date(s.at * 1000).toLocaleString()} — ${s.parts.length} part(s).`
+      + (stale ? " The score has changed since; publish again to update it." : "");
+  }).join(" ");
+  if (!song.publish_configured) {
+    status.textContent = "Publishing is off on this host: the Cloudflare keys are not in .env.";
+  } else if (running) {
+    status.textContent = "Publishing… the log below shows how far it is.";
+  } else if (pub.error) {
+    status.className = "hint publish-status err";
+    status.textContent = "Last publish failed: " + pub.error;
+  } else if (site) {
+    status.textContent = publishedText();
+  } else {
+    status.textContent = "Not published yet.";
   }
-  if (!recorded) {
-    panel.append(el("p", { className: "hint" }, "Nothing to upload yet — record the videos first."));
-  } else if (!onDisk) {
-    panel.append(el("p", { className: "hint" }, rec.freed
-      ? "The local videos were freed after the upload. Record again to make them."
-      : "The videos are not on disk. Record again to make them."));
-  }
-
-  // playlist picker
-  const pl = el("input", { placeholder: "YouTube playlist id (optional)" });
-  const plPick = el("select", {}, el("option", { value: "" }, "— previous playlists —"));
-  let plTitle = "";
-  getJSON("/api/playlists").then((lists) => {
-    for (const l of lists) plPick.append(el("option", { value: l.id }, l.title || l.id));
-    plPick.onchange = () => {
-      if (!plPick.value) return;
-      pl.value = plPick.value;
-      plTitle = plPick.options[plPick.selectedIndex].textContent;
-    };
-  }).catch(() => {});
-
-  const uploadBtn = el("button", { className: "primary", disabled: recording || !recorded || !onDisk,
+  const btn = el("button", { className: "primary publish-btn",
+    disabled: !song.publish_configured || running,
     onclick: async () => {
-      appendLog("Uploading to YouTube…");
-      try {
-        await postJSON(`${P}/record`, {
-          upload_only: true, playlist: pl.value.trim() || null, playlist_title: plTitle || null,
-        });
-        refresh();
-      } catch (e) { appendLog(e.message, true); }
-    } }, uploads.length ? "Re-upload to YouTube" : "Upload to YouTube");
-
-  panel.append(
-    el("label", {}, "Playlist"),
-    el("div", { className: "row" }, plPick),
-    pl,
-    el("div", { className: "row" }, uploadBtn),
-    makeLog(song.jobs?.upload || song.jobs?.render));
-
-  if (uploads.length) {
-    panel.append(
-      el("h3", {}, "Uploaded videos"),
-      el("ul", { className: "uploads" }, uploads.map((u) =>
-        el("li", {}, el("a", { href: u.url, target: "_blank", rel: "noopener" }, u.title || u.url)))),
-      freeSpaceSection(P, song, ups, recording, refresh),
-      el("div", { className: "row" },
-        el("button", { disabled: recording, onclick: async () => {
-          if (!confirm("Delete these videos from YouTube? You can then re-upload.")) return;
-          appendLog("Deleting from YouTube…");
-          try { await postJSON(`${P}/youtube-delete`); appendLog("Deleted."); refresh(); }
-          catch (e) { appendLog(e.message, true); }
-        }}, "Delete from YouTube")),
-      playlistSection(P, recording));
-  }
-}
-
-// The local videos are a cache once YouTube has them (#371): 4K, ~150 MB a
-// voice. Freeing asks YouTube first and deletes nothing unless every video is
-// there; the server says which one is missing when it refuses.
-const VIDEO_STATE = { uploaded: "on YouTube", changed: "rendered again since the upload",
-  not_uploaded: "not uploaded" };
-
-function freeSpaceSection(P, song, ups, recording, refresh) {
-  const gb = (bytes) => (bytes / 2 ** 30).toFixed(2) + " GB";
-  const rows = el("ul", { className: "videostate" }, ups.videos.map((v) =>
-    el("li", { className: v.state },
-      el("b", {}, v.part), " — ", VIDEO_STATE[v.state] || v.state,
-      v.local ? ` · on disk (${(v.size / 2 ** 20).toFixed(0)} MB)` : " · not on disk")));
-  const note = el("p", { className: "hint free-note" });
-  const freed = song.record?.freed;
-  if (freed && !ups.local_count) {
-    note.textContent = `Freed ${gb(freed.bytes)} on ${new Date(freed.at * 1000).toLocaleDateString()}. `
-      + "Recording again renders the videos afresh.";
-  } else if (ups.local_count && !ups.complete) {
-    note.textContent = "Every video has to be on YouTube before the local copies can go.";
-  }
-  const btn = el("button", { className: "free-videos", disabled: recording || !ups.can_free,
-    onclick: async () => {
-      if (!confirm(`Delete the ${ups.local_count} local video(s), ${gb(ups.local_bytes)}? `
-        + "YouTube is checked first; recording again makes them back.")) return;
+      if (!choir.value) { status.className = "hint publish-status err"; status.textContent = "Choose a choir first."; return; }
       btn.disabled = true;
-      note.className = "hint free-note";
-      note.textContent = "Checking YouTube…";
-      try { await postJSON(`${P}/free-videos`); refresh(); }
-      catch (e) {
-        note.className = "hint free-note err";
-        note.textContent = e.message;
+      appendLog("Publishing…");
+      try {
+        // The settings on screen are saved with it, so what goes up is what is shown.
+        await postJSON(`${P}/publish`, { choir: choir.value, settings: settings() });
+        saveNote.textContent = "";
+        refresh();
+      } catch (e) {
+        status.className = "hint publish-status err";
+        status.textContent = e.message;
         btn.disabled = false;
       }
-    } }, ups.local_count ? `Free space (${gb(ups.local_bytes)})` : "Free space");
-  return el("div", { className: "free-section" },
-    el("h3", {}, "Local videos"), rows, el("div", { className: "row" }, btn), note);
-}
-
-// Which of the choir's playlists hold this song (#338). Read from YouTube each
-// time the panel opens: the app keeps no record of it, and a playlist can be
-// edited in YouTube's own app. A tick means every video of the song is in it.
-function playlistSection(P, recording) {
-  const box = el("div", { className: "playlists" });
-  const section = el("div", { className: "playlist-section" },
-    el("h3", {}, "Playlists"),
-    el("p", { className: "hint" }, "Tick a playlist to put this song's videos in it; untick to take them out."),
-    box);
-
-  const load = async () => {
-    box.replaceChildren(el("p", { className: "hint" }, "Reading playlists from YouTube…"));
-    let data;
-    try { data = await getJSON(`${P}/playlists`); }
-    catch (e) { box.replaceChildren(el("p", { className: "banner err" }, e.message)); return; }
-    box.replaceChildren(...data.playlists.map(row), addAnother(data.playlists));
-  };
-
-  const row = (p) => {
-    const tick = el("input", { type: "checkbox", disabled: recording || !!p.error });
-    tick.checked = p.total > 0 && p.count >= p.total;
-    tick.indeterminate = p.count > 0 && p.count < p.total;
-    const note = el("span", { className: "plnote" },
-      p.error || (tick.indeterminate ? `${p.count} of ${p.total}` : ""));
-    const line = el("div", { className: "plrow", "data-playlist": p.id },
-      el("label", {}, tick, " ", p.title || p.id, " ", note),
-      el("button", { className: "plhide", title: "Stop offering this playlist (nothing changes on YouTube)",
-        onclick: async () => {
-          try { await api(`/api/playlists/${encodeURIComponent(p.id)}`, { method: "DELETE" }); load(); }
-          catch (e) { appendLog(e.message, true); }
-        } }, "Hide"));
-    tick.onchange = async () => {
-      const member = tick.checked;
-      tick.disabled = true;
-      note.textContent = member ? "Adding…" : "Removing…";
-      try {
-        const now = await postJSON(`${P}/playlists`, { playlist_id: p.id, member, title: p.title });
-        line.replaceWith(row(now));
-      } catch (e) {
-        appendLog(e.message, true);
-        note.textContent = e.message;
-        tick.checked = !member;
-        tick.disabled = false;
-      }
-    };
-    return line;
-  };
-
-  const addAnother = (shown) => {
-    const pick = el("select", {}, el("option", { value: "" }, "Add another playlist…"));
-    let loaded = false;
-    const fill = async () => {
-      if (loaded) return;
-      loaded = true;
-      try {
-        const all = await getJSON("/api/youtube-playlists");
-        const have = new Set(shown.map((p) => p.id));
-        for (const p of all) if (!have.has(p.id)) pick.append(el("option", { value: p.id }, p.title));
-      } catch (e) { appendLog(e.message, true); loaded = false; }
-    };
-    pick.onfocus = fill;
-    pick.onpointerdown = fill;
-    pick.onchange = async () => {
-      if (!pick.value) return;
-      try {
-        await postJSON("/api/playlists", { playlist_id: pick.value,
-          title: pick.options[pick.selectedIndex].textContent });
-        load();
-      } catch (e) { appendLog(e.message, true); }
-    };
-    return el("div", { className: "row" }, pick);
-  };
-
-  load();
-  return section;
+    } }, site ? "Publish again" : "Publish");
+  return el("div", { className: "publish-section" },
+    el("h3", {}, "Stemmanauhat site"),
+    el("label", {}, "Choir"),
+    el("div", { className: "row" }, choir, btn),
+    choirNote,
+    status);
 }

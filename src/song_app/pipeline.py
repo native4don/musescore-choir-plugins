@@ -32,7 +32,6 @@ from src.clean_score.utils.score_fixes import (FixError, after_moves, apply_fixe
                                                 bar_moves, bar_tokens, free_text, read_bar)
 from src.clean_score.utils.staff_display import fix_staff_display
 from src.clean_score.utils.utils import starts_new_system
-from src.media_root import media_dir
 
 MUSESCORE_EXTS = (".mscz", ".mscx", ".musicxml", ".xml")
 Logger = Callable[[str], None]
@@ -76,7 +75,7 @@ def convert_to_mscx(input_path: str, out_dir: str, log: Logger = _noop) -> str:
 
     # MusicXML -> MuseScore CLI
     log(f"Converting {os.path.basename(input_path)} with MuseScore CLI")
-    cli = os.getenv("MUSESCORE_CLI_PATH", "musescore3")
+    cli = (os.getenv("MUSESCORE_CLI_PATH") or "musescore3")
     result = musescore_cli.run([cli, input_path, "-o", target], target)
     if not musescore_cli.ok(result, log):
         raise RuntimeError(
@@ -347,7 +346,7 @@ def musescore_check(mscx_path: str) -> Optional[List[Dict]]:
     counts (staff = position in the score, measure = every bar from the top). None
     when no MuseScore answered -- which is "not checked", never "fine".
     """
-    cli = os.getenv("MUSESCORE_CLI_PATH", "musescore3")
+    cli = (os.getenv("MUSESCORE_CLI_PATH") or "musescore3")
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "check.mlog")
         # MuseScore reads the format off the extension, and a clean checks the file
@@ -809,18 +808,6 @@ def line_break_measures(mscx_path: str) -> List[int]:
     return []
 
 
-def printed_system_starts(mscx_path: str) -> List[int]:
-    """0-based measures that *begin* a printed system, from a score with breaks.
-
-    A line break sits on the last bar of its system, so the next bar opens the
-    following one. Empty when the score has no breaks. The scrolling video numbers
-    these bars: it has no systems of its own, so the page's grouping is the only
-    one a singer can recognise.
-    """
-    breaks = line_break_measures(mscx_path)
-    return [0] + [i + 1 for i in breaks] if breaks else []
-
-
 def cleaned_line_breaks(song_dir: str, input_mscx: str) -> List[int]:
     """The printed line breaks, in the cleaned score's bar numbering (#354).
 
@@ -853,12 +840,6 @@ def moved_breaks(breaks: List[int], moves) -> List[int]:
         if moved is not None and moved - 1 not in out:
             out.append(moved - 1)
     return sorted(out)
-
-
-def cleaned_system_starts(song_dir: str, input_mscx: str) -> List[int]:
-    """`printed_system_starts`, in the cleaned score's bar numbering."""
-    breaks = cleaned_line_breaks(song_dir, input_mscx)
-    return [0] + [i + 1 for i in breaks] if breaks else []
 
 
 def _apply_line_breaks(root: etree._Element, indices: List[int]) -> int:
@@ -1106,7 +1087,7 @@ def scan_system_render(song_dir: str, musicxml_path: str, dpi: int = 200) -> str
     out = os.path.join(cache, f"{stem}@{dpi}.png")
     if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(musicxml_path):
         return out
-    cli = os.getenv("MUSESCORE_CLI_PATH", "musescore3")
+    cli = (os.getenv("MUSESCORE_CLI_PATH") or "musescore3")
     result = musescore_cli.run(
         [cli, "-T", "10", "-r", str(dpi), musicxml_path, "-o", out], out,
         timeout=MUSESCORE_TIMEOUT)
@@ -1164,7 +1145,7 @@ def render_score_pdf(mscx_path: str, breaks: Optional[List[int]] = None,
                     return out
         except OSError:
             pass
-    cli = os.getenv("MUSESCORE_CLI_PATH", "musescore3")
+    cli = (os.getenv("MUSESCORE_CLI_PATH") or "musescore3")
 
     # Without breaks there is one render at the configured scale. With them, the
     # scale has to be one the score actually fits at: at full size a wide system
@@ -1196,7 +1177,7 @@ def render_score_pdf(mscx_path: str, breaks: Optional[List[int]] = None,
     with open(key_path, "w", encoding="utf-8") as f:
         f.write(key)
     return out
-    cli = os.getenv("MUSESCORE_CLI_PATH", "musescore3")
+    cli = (os.getenv("MUSESCORE_CLI_PATH") or "musescore3")
     src = _scaled_staff_mscx(mscx_path, breaks) or mscx_path
     try:
         result = subprocess.run([cli, src, "-o", out], capture_output=True, text=True)
@@ -1227,9 +1208,20 @@ def _printed_systems(song_dir: str) -> Optional[List[Tuple[int, int]]]:
 
 
 def lyric_grid(mscx_path: str, song_dir: str = "") -> Dict:
-    """The manual editor's projection of a score: parts x printed systems, prefilled."""
+    """The manual editor's projection of a score: parts x printed systems, prefilled.
+
+    Each system also carries `crop`, the printed system's number in `.systems.json`
+    (the picture `/system/{crop}` and `/cleaned-system/{crop}` serve), or None when
+    the song has no marked systems and the systems are the score's own line breaks.
+    """
     root = etree.parse(mscx_path).getroot()
-    return lyric_txt.editor_grid(root, systems=_printed_systems(song_dir)).to_dict()
+    grid = lyric_txt.editor_grid(root, systems=_printed_systems(song_dir)).to_dict()
+    crops = [b.index for b in pdf_systems.load_bounds(song_dir) if b.measure_start] \
+        if song_dir else []
+    for system in grid["systems"]:
+        i = system["index"]
+        system["crop"] = crops[i] if len(crops) == len(grid["systems"]) else None
+    return grid
 
 
 def lyric_blocks(mscx_path: str, cells: Dict, song_dir: str = "") -> List[Dict]:
@@ -1239,247 +1231,187 @@ def lyric_blocks(mscx_path: str, cells: Dict, song_dir: str = "") -> List[Dict]:
     return lyric_txt.blocks_from_cells(grid, cells)
 
 
-# Scrolling-video sizes offered by the Record stage. 4K60 is the default because
-# the picture pans sideways the whole time, which is what judders at 30fps; the
-# smaller preset trades that for roughly a quarter of the render time.
-SCROLL_QUALITY = {
-    "4k": (3840, 2160, 60),
-    "1080p": (1920, 1080, 30),
-    "720p": (1280, 720, 30),
-}
+def lyric_box_blocks(mscx_path: str, verse: int, boxes: Dict, song_dir: str = "") -> List[Dict]:
+    """The by-system editor's changed boxes of one verse as lyric JSON blocks (#397)."""
+    root = etree.parse(mscx_path).getroot()
+    grid = lyric_txt.editor_grid(root, systems=_printed_systems(song_dir))
+    return lyric_txt.blocks_from_boxes(grid, verse, boxes)
+
+
+# The staves of a printed system are found at the Systems editor's dpi: the finder
+# is tuned there (`system_finder.QUICK_DPI`), and the positions are fractions anyway.
+LYRIC_STAFF_DPI = system_finder.QUICK_DPI
+# Found again when this changes, as when the crop does.
+LYRIC_STAFF_VERSION = 2
+
+
+def _cut_above(ink, upper: tuple, lower: tuple) -> float:
+    """The pixel row to cut a system's picture at, just above the lower of two staves.
+
+    A staff's own ink reaches above it — high notes, ledger lines, stems — so the cut
+    is the first blank row going up from the staff, a little way into the white. A
+    row counts as blank by the columns that are not ink from one staff to the other:
+    a barline drawn through the gap would otherwise leave no blank row at all. When
+    nothing between them is blank, the cut is a fixed distance above the staff.
+    """
+    space = lower[2]
+    fallback = max(upper[1], lower[0] - 1.5 * space)
+    a, b = int(upper[1]) + 1, int(lower[0] - 0.4 * space)
+    if b - a < 2:
+        return fallback
+    region = ink[a:b, int(ink.shape[1] * 0.08):]
+    through = region.all(axis=0)
+    counts = region[:, ~through].sum(axis=1)
+    limit = max(1, int(0.003 * region.shape[1]))
+    y = len(counts) - 1
+    while y >= 0 and counts[y] > limit:
+        y -= 1
+    if y < 0:
+        return fallback
+    top = y
+    while top > 0 and counts[top - 1] <= limit and y - top < space:
+        top -= 1
+    return a + (top + y) / 2
+
+
+def _found_staves(song_dir: str, pdf_path: str, crop: int) -> Tuple[List[Dict], float]:
+    """The staves in one printed system's crop, as fractions of its height, and the
+    crop's width over its height.
+
+    Kept per system in the page cache and found again only when the crop changes:
+    the crop's file name carries its band and its page (`pdf_systems.crop_systems`).
+    """
+    import numpy as np
+    from PIL import Image
+
+    path = system_crop(song_dir, pdf_path, crop, LYRIC_STAFF_DPI)
+    stamp = os.path.basename(path)
+    store = os.path.join(_page_cache(song_dir), "lyric-staves.json")
+    try:
+        with open(store, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    hit = saved.get(str(crop))
+    if (isinstance(hit, dict) and hit.get("crop") == stamp
+            and hit.get("version") == LYRIC_STAFF_VERSION):
+        return hit.get("staves") or [], hit["aspect"]
+    with Image.open(path) as image:
+        ink = np.asarray(image.convert("L")) < system_finder._INK
+    height, width = ink.shape
+    found = system_finder._staves(ink)
+    staves = [{"top": t / height, "bottom": b / height, "space": s / height,
+               "cut": 0.0 if i == 0 else _cut_above(ink, found[i - 1], (t, b, s)) / height}
+              for i, (t, b, s) in enumerate(found)]
+    aspect = width / height
+    saved[str(crop)] = {"crop": stamp, "version": LYRIC_STAFF_VERSION,
+                        "staves": staves, "aspect": aspect}
+    os.makedirs(os.path.dirname(store), exist_ok=True)
+    tmp = store + f".{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(saved, f)
+    os.replace(tmp, store)
+    return staves, aspect
+
+
+def lyric_staves(song_dir: str, pdf_path: str, mscx_path: str, system_index: int) -> Dict:
+    """Where each staff of one printed system is, and which printed staff it is (#397).
+
+    `{"crop", "aspect", "rows": [{"top", "bottom"}], "printed": [n per row] | None}`,
+    `aspect` being the crop's width over its height. A row runs
+    from just above its staff's own ink to just above the next one's, so the editor can cut
+    the picture there and put each staff's boxes under it. The staves found in the
+    picture are paired with the printed staves the cleaned score records for the
+    system — every one of them, or the ones that sing there, since a page leaves out
+    a resting part's staff — and `printed` is None when neither count matches: then
+    no box may be placed under a staff, because it could be the wrong one.
+    """
+    grid = lyric_grid(mscx_path, song_dir)
+    systems = grid["systems"]
+    if not 0 <= system_index < len(systems):
+        raise ValueError(f"there is no system {system_index + 1}")
+    system = systems[system_index]
+    crop = system.get("crop")
+    if crop is None or not pdf_path:
+        return {"crop": crop, "rows": [], "printed": None}
+    staves, aspect = _found_staves(song_dir, pdf_path, crop)
+    rows = [{"top": st["cut"], "staff": st["top"]} for st in staves]
+    for i, row in enumerate(rows):
+        row["bottom"] = rows[i + 1]["top"] if i + 1 < len(rows) else 1.0
+    root = etree.parse(mscx_path).getroot()
+    every, singing = lyric_txt.printed_staves(root, system["start"], system["end"])
+    printed = (every if every and len(every) == len(rows)
+               else singing if singing and len(singing) == len(rows) else None)
+    return {"crop": crop, "aspect": aspect, "rows": rows, "printed": printed}
+
+
+_LANDED_LOCK = threading.Lock()
+
+
+def landed_system_svg(song_dir: str, mscx_path: str, start: int, end: int) -> str:
+    """Bars `start`-`end` of the cleaned score as they are now, words included (#397).
+
+    What the lyric editor's "Show what landed" shows. Drawn from those bars alone —
+    MuseScore exports the score, verovio engraves just that range — rather than cut
+    out of a render of the whole score, because a render's systems need not be the
+    page's: on a hand-rewritten score (Kevät) the render has 18 systems for the
+    page's 13, and "the ninth" is another part of the song. Cached by the score's
+    content; an older score's files go when a newer one is drawn.
+    """
+    import verovio
+
+    from src.score_export import engraving, musescore
+
+    with open(mscx_path, "rb") as f:
+        stamp = hashlib.sha1(f.read()).hexdigest()[:12]
+    cache = os.path.join(_page_cache(song_dir), "landed")
+    out = os.path.join(cache, f"{stamp}-{start}-{end}.svg")
+    if os.path.exists(out):
+        return out
+    with _LANDED_LOCK:
+        os.makedirs(cache, exist_ok=True)
+        xml = os.path.join(cache, f"{stamp}.musicxml")
+        if not os.path.exists(xml):
+            for old in os.listdir(cache):
+                if not old.startswith(stamp):
+                    os.remove(os.path.join(cache, old))
+            musescore.run_musescore(mscx_path, xml)
+        tk = verovio.toolkit(False)
+        tk.setResourcePath(engraving.RESOURCE_PATH)
+        tk.setOptions({"pageWidth": 2400, "pageHeight": 60000, "adjustPageHeight": True,
+                       "header": "none", "footer": "none", "breaks": "auto", "scale": 45,
+                       "xmlIdSeed": engraving.XML_ID_SEED})
+        if not tk.loadFile(xml):
+            raise RuntimeError("verovio could not read the score")
+        tk.select({"measureRange": f"{start}-{end}"})
+        tk.redoLayout()
+        tmp = out + f".{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(tk.renderToSVG(1))
+        os.replace(tmp, out)
+    return out
+
+
+def bar_count(mscx_path: str) -> int:
+    """How many bars the score has, counted on its first staff."""
+    staff = etree.parse(mscx_path).getroot().find("Score/Staff")
+    return len(staff.findall("Measure")) if staff is not None else 0
 
 
 def has_opening_tempo(mscx_path: str) -> bool:
     """Whether the score supplies its own tempo at the opening."""
-    from src.scrollvideo.score import has_opening_tempo as score_has_opening_tempo
+    from src.score_export.score import has_opening_tempo as score_has_opening_tempo
 
     return score_has_opening_tempo(etree.parse(mscx_path).getroot())
 
 
-def staff_groups(cleaned_path: str, text: Optional[str]) -> List[Tuple[str, str]]:
-    """Read a staff grouping ("S1+S2, A1+A2") and check it against this score.
-
-    Checked against the parts the video will actually have — silent ones such as
-    a click staff are left out of it — so a typo is refused when it is typed
-    rather than after the engraving. Raises `ValueError` with a sentence to show.
-    """
-    from src.scrollvideo import score as score_mod
-    from src.scrollvideo.audio import part_names
-
-    groups = score_mod.parse_groups(text)
-    if groups:
-        root = etree.parse(cleaned_path).getroot()
-        silent = score_mod.silent_parts(root)
-        names = [n for n in part_names(root) if n not in silent]
-        score_mod.validate_groups(groups, names, silent)
-    return groups
-
-
-def _staves_setting(groups) -> Dict:
-    """The preview-key entry for a grouping; nothing at all when there is none,
-    so a song that never shared a staff keeps the previews it already has."""
-    return {"staves": [list(g) for g in groups]} if groups else {}
-
-
-def run_scroll_video(song_dir: str, cleaned_path: str, name: str, *,
-                     quality: str = "4k", hardware_encoding: bool = True,
-                     initial_bpm: Optional[int] = None,
-                     top_margin_percent: float = 0.0,
-                     bottom_margin_percent: float = 0.0,
-                     system_starts: Optional[List[int]] = None,
-                     staff_groups: Optional[List[Tuple[str, str]]] = None,
-                     log: Logger = _noop,
-                     progress: Logger = _noop) -> List[str]:
-    """Render one scrolling practice video per voice into media/video.
-
-    Files are named "<name> <part>.mp4" — the same shape `record_stemmanauha`
-    produces — so the review and upload stages find them without knowing which
-    renderer made them.
-    """
-    from src.scrollvideo import build_videos
-
-    width, height, fps = SCROLL_QUALITY.get(quality, SCROLL_QUALITY["4k"])
-    out_dir = os.path.join(media_dir(song_dir), "video")
-    audio_cache_dir = os.path.join(media_dir(song_dir), ".scrollvideo-audio")
-    return build_videos(cleaned_path, out_dir, basename=name,
-                        width=width, height=height, fps=fps, log=log,
-                        progress=progress, hardware_encoding=hardware_encoding,
-                        initial_bpm=initial_bpm,
-                        top_margin_percent=top_margin_percent,
-                        bottom_margin_percent=bottom_margin_percent,
-                        system_starts=system_starts,
-                        staff_groups=staff_groups or None,
-                        audio_cache_dir=audio_cache_dir)
-
-
-# The prepared preview, cached beside the song: a folder, because the preview is
-# now pictures — the renderer's own strip as PNG tiles — and not only numbers.
-# Everything that could change what those tiles show goes into the key, so the
-# folder holds the current score under the current settings or it is not used.
-PREVIEW_CACHE = ".scroll-preview"
-PREVIEW_PAYLOAD = "preview.json"
-
-
-def _preview_key(cleaned_path: str, settings: Dict) -> str:
-    """What a cached preview is a preview *of*: this score, under these settings."""
-    from . import state
-    from src.scrollvideo.audio import musescore_identity
-    from src.scrollvideo.score import FERMATA_HOLD
-
-    return json.dumps({"score": state.file_fingerprint(cleaned_path),
-                       "musescore": musescore_identity(),
-                       "fermata": FERMATA_HOLD, **settings}, sort_keys=True)
-
-
-def _preview_revision(key: str) -> str:
-    """Opaque identity the browser returns when asking for matching audio."""
-    return hashlib.sha256(key.encode()).hexdigest()
-
-
-def scroll_preview(song_dir: str, cleaned_path: str, *, quality: str = "4k",
-                   initial_bpm: Optional[int] = None,
-                   top_margin_percent: float = 0.0,
-                   bottom_margin_percent: float = 0.0,
-                   system_starts: Optional[List[int]] = None,
-                   staff_groups: Optional[List[Tuple[str, str]]] = None,
-                   log: Logger = _noop) -> Dict:
-    """The scrolling render as pictures a browser can play, without rendering it.
-
-    Preparing it costs a MuseScore conversion, an engraving and a rasterisation —
-    seconds, not the minutes a render costs, but far too long to repeat every time
-    someone presses play. So it is cached beside the song under a key naming the
-    score and every setting that moves anything on screen. A score edited in
-    MuseScore, a margin nudged or a different size chosen all change the key, and a
-    preview is never shown for a score that is no longer the one on disk.
-
-    Rebuilding empties the folder first. Tile names are positional (`strip-3.png`),
-    so a shorter score would otherwise be played against the tail of a longer one.
-    """
-    from src.scrollvideo import spacing as spacing_mod
-    from src.scrollvideo.preview import AUDIO_SOURCE, preview
-
-    width, height, fps = SCROLL_QUALITY.get(quality, SCROLL_QUALITY["4k"])
-    settings = {"quality": quality, "width": width, "height": height, "fps": fps,
-                "bpm": initial_bpm, "top": top_margin_percent,
-                "bottom": bottom_margin_percent,
-                "systems": list(system_starts or []),
-                "ratio": spacing_mod.DEFAULT_MAX_RATIO,
-                **_staves_setting(staff_groups)}
-    key = _preview_key(cleaned_path, settings)
-    cache_dir = os.path.join(song_dir, PREVIEW_CACHE)
-    path = os.path.join(cache_dir, PREVIEW_PAYLOAD)
-
-    try:
-        with open(path) as fh:
-            cached = json.load(fh)
-        if (cached.get("key") == key
-                and os.path.isfile(os.path.join(cache_dir, AUDIO_SOURCE))):
-            return cached["preview"]
-    except (OSError, ValueError, KeyError):
-        pass
-
-    shutil.rmtree(cache_dir, ignore_errors=True)
-    payload = preview(cleaned_path, cache_dir, width=width, height=height, fps=fps,
-                      initial_bpm=initial_bpm,
-                      spacing_ratio=settings["ratio"],
-                      top_margin_percent=top_margin_percent,
-                      bottom_margin_percent=bottom_margin_percent,
-                      system_starts=system_starts,
-                      staff_groups=staff_groups or None, log=log)
-    payload["revision"] = _preview_revision(key)
-    os.makedirs(cache_dir, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump({"key": key, "preview": payload}, fh)
-    os.replace(tmp, path)
-    return payload
-
-
-def scroll_preview_audio(song_dir: str, cleaned_path: str, mix: str, revision: str, *,
-                         quality: str = "4k", initial_bpm: Optional[int] = None,
-                         top_margin_percent: float = 0.0,
-                         bottom_margin_percent: float = 0.0,
-                         system_starts: Optional[List[int]] = None,
-                         staff_groups: Optional[List[Tuple[str, str]]] = None,
-                         log: Logger = _noop) -> Tuple[str, bool]:
-    """Return one lazy preview WAV made from the final renderer's prepared score.
-
-    The caller supplies the revision of the picture it already has. It must match
-    the current score, settings and persisted source; this refuses an edited score
-    rather than silently pairing new sound with old pixels. The audio cache is the
-    final renderer's cache, so a mix prepared here is reused by a later MP4 render
-    and vice versa.
-    """
-    from src.scrollvideo.audio import render_mix_cached
-    from src.scrollvideo.build import COMBINED
-    from src.scrollvideo import spacing as spacing_mod
-    from src.scrollvideo.preview import AUDIO_SOURCE
-
-    width, height, fps = SCROLL_QUALITY.get(quality, SCROLL_QUALITY["4k"])
-    settings = {"quality": quality, "width": width, "height": height, "fps": fps,
-                "bpm": initial_bpm, "top": top_margin_percent,
-                "bottom": bottom_margin_percent,
-                "systems": list(system_starts or []),
-                "ratio": spacing_mod.DEFAULT_MAX_RATIO,
-                **_staves_setting(staff_groups)}
-    key = _preview_key(cleaned_path, settings)
-    cache_dir = os.path.join(song_dir, PREVIEW_CACHE)
-    source = os.path.join(cache_dir, AUDIO_SOURCE)
-    try:
-        with open(os.path.join(cache_dir, PREVIEW_PAYLOAD)) as fh:
-            cached = json.load(fh)
-        payload = cached["preview"]
-    except (OSError, ValueError, KeyError):
-        raise ValueError("The preview is no longer available — reopen it.") from None
-    if (not revision or revision != _preview_revision(key)
-            or cached.get("key") != key or not os.path.isfile(source)):
-        raise ValueError("The score or preview settings changed — reopen the preview.")
-    parts = payload.get("parts", [])
-    dropped = payload.get("dropped", [])
-    if mix != COMBINED and mix not in parts:
-        available = ", ".join([COMBINED, *parts])
-        detail = f"No such preview mix: {mix}. Available: {available}"
-        if dropped:
-            detail += f" (left out because silent: {', '.join(dropped)})"
-        raise ValueError(detail)
-
-    audio_cache = os.path.join(media_dir(song_dir), ".scrollvideo-audio")
-    result = render_mix_cached(source, None if mix == COMBINED else mix, audio_cache)
-
-    # MuseScore export can take minutes. Refuse the completed old mix if the score,
-    # settings or renderer changed while it was being made; the content-addressed
-    # WAV may remain cached, but it is never attached to the newer picture.
-    if _preview_key(cleaned_path, settings) != key:
-        raise ValueError("The score or preview settings changed — reopen the preview.")
-    try:
-        with open(os.path.join(cache_dir, PREVIEW_PAYLOAD)) as fh:
-            current = json.load(fh)
-    except (OSError, ValueError):
-        raise ValueError("The preview changed while audio was prepared — reopen it.") from None
-    if current.get("key") != key or current.get("preview", {}).get("revision") != revision:
-        raise ValueError("The preview changed while audio was prepared — reopen it.")
-    return result
-
-
-def scroll_preview_tile(song_dir: str, name: str) -> Optional[str]:
-    """One prepared preview tile by name, or None if it is not one of ours.
-
-    The name comes off the wire, so it is matched against the folder's own listing
-    rather than joined onto a path — a preview must not be a way to read a file
-    somewhere else on the host.
-    """
-    cache_dir = os.path.join(song_dir, PREVIEW_CACHE)
-    try:
-        listing = os.listdir(cache_dir)
-    except OSError:
-        return None
-    if name not in listing or not name.endswith(".png"):
-        return None
-    return os.path.join(cache_dir, name)
-
-
 def run_lyric_import(
-    json_path: str, cleaned_path: str, replace: bool = True
+    json_path: str, cleaned_path: str, replace: bool = False, song_dir: str = ""
 ) -> LyricImport:
-    """Import lyric JSON in place into the cleaned score; return the placement result."""
-    return import_file(json_path, cleaned_path, cleaned_path, replace=replace)
+    """Import lyric JSON in place into the cleaned score; return the placement result.
+
+    Not a full replace any more (#397): only the parts, voices, verses and systems the
+    JSON names change. The printed systems decide how far a line may run on.
+    """
+    return import_file(json_path, cleaned_path, cleaned_path, replace=replace,
+                       systems=_printed_systems(song_dir))
