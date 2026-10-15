@@ -225,6 +225,7 @@ def _png(path: str) -> bool:
 
 _CHECKS: Dict[str, Callable[[str], bool]] = {
     ".musicxml": _xml, ".xml": _xml, ".mscx": _xml, ".mei": _xml, ".svg": _xml,
+    ".mpos": _xml,
     ".mscz": _zip, ".mxl": _zip,
     ".mid": _midi, ".midi": _midi,
     ".wav": _wav,

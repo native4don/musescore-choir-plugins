@@ -41,7 +41,7 @@ import pytest
 SIGNATURE = ("libc++abi: terminating due to uncaught exception of type "
              "std::__1::system_error: mutex lock failed: Invalid argument\n")
 
-EXTS = [".musicxml", ".mscx", ".mid", ".wav", ".pdf", ".png"]
+EXTS = [".musicxml", ".mscx", ".mid", ".wav", ".pdf", ".png", ".mpos"]
 
 
 def _png() -> bytes:
@@ -77,6 +77,11 @@ def _samples() -> dict:
         ".wav": _wav(),
         ".pdf": b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n",
         ".png": _png(),
+        # Publish's play order (score.mpos): an XML list of where each bar sits.
+        ".mpos": (b'<?xml version="1.0" encoding="UTF-8"?>'
+                  b'<score><elements><element id="0" x="0" y="0" sx="100" sy="100" '
+                  b'page="0"/></elements><events><event elid="0" position="0"/>'
+                  b'</events></score>'),
     }
 
 
@@ -91,6 +96,11 @@ out = argv[argv.index("-o") + 1]
 ext = os.path.splitext(out)[1]
 with open(os.path.join(samples, "sample" + ext), "rb") as source:
     data = source.read()
+
+if mode == "hang":
+    import time
+    time.sleep(30)
+    sys.exit(0)
 
 if mode in ("ok", "crash", "crash_nosig", "exit1"):
     with open(out, "wb") as target:
@@ -249,17 +259,27 @@ def _musicxml(tmp_path, name="song.musicxml") -> str:
 
 
 def test_run_musescore_gets_past_the_crash(fake, tmp_path):
-    from src.scrollvideo import audio
+    """Publish's exports (MusicXML, play order, MIDI) go through run_musescore."""
+    from src.score_export import musescore
     fake("crash")
     out = str(tmp_path / "score.musicxml")
-    assert audio.run_musescore(_mscx(tmp_path), out, timeout=60) == out
+    assert musescore.run_musescore(_mscx(tmp_path), out, timeout=60) == out
 
 
 def test_run_musescore_still_fails_when_nothing_was_written(fake, tmp_path):
-    from src.scrollvideo import audio
+    from src.score_export import musescore
     fake("crash_nofile")
     with pytest.raises(RuntimeError, match="MuseScore CLI failed writing"):
-        audio.run_musescore(_mscx(tmp_path), str(tmp_path / "score.musicxml"), timeout=60)
+        musescore.run_musescore(_mscx(tmp_path), str(tmp_path / "score.musicxml"),
+                                timeout=60)
+
+
+def test_run_musescore_that_never_finishes_says_so(fake, tmp_path):
+    """His message for a stuck MuseScore is kept when the helper decides."""
+    from src.score_export import musescore
+    fake("hang")
+    with pytest.raises(RuntimeError, match=r"did not finish within 1s writing score\.mpos"):
+        musescore.run_musescore(_mscx(tmp_path), str(tmp_path / "score.mpos"), timeout=1)
 
 
 def test_convert_to_mscx_gets_past_the_crash(fake, tmp_path):
