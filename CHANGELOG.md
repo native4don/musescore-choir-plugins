@@ -7,6 +7,83 @@ developers are listed under *Behind the scenes*.
 
 ## Unreleased
 
+- The song list says which songs still need a re-sing with the current singer, and in which
+  choirs, and how each `sing_song.py` run is going: waiting, singing part 2 of 4, publishing,
+  done (with the time) or failed (with the reason). `sing_song.py --publish` can be given once per
+  choir, records the singer version it sang with, and `--waiting` marks a song before its run is
+  queued, and `--remote-only` sings every line on the remote runner (eero-pc's GPU) and none
+  on this machine. (#453)
+- Publishing a song to one choir no longer takes it off the other choirs' lists, so a song
+  shared by `joy` and `joy-alumnit` can be published to both. Publishing to a choir still
+  takes it off the test list. (#451)
+- A sung short Finnish vowel closed by a consonant on a note of a beat or less is sung 0.25 s: "tip"
+  and "tap" then fall silent after the p, "var-joon" and "sil-lan" hold the r or l to the next
+  syllable (at most 0.25 s; on a slow beat the vowel takes the rest), "huk-kuu" is silent until the k (at most 0.25 s of silence; the vowel takes the rest), and a stop inside a word before another consonant
+  ("pit-kin") holds the vowel 85% of the note and sings the t with the k. Before, the vowel was held to the end of the
+  note and sounded long ("tiip", "vaar-joon"). Long notes still hold the vowel. (#451)
+- A syllable with no vowel and nothing to hum or hiss ("kk") is sung as the consonant and a
+  0.25 s "uh" (#451) instead of the consonant and silence, and `sing_song.py` stops before singing
+  when a note would still be sung as no sound at all, listing each one by part and bar
+  (`--allow-silent` sings anyway). (#449)
+- The lyric import and the by-system editor cut the printed systems at the right bars after a
+  `delbar` or `insbar` fix. Before, every system after the moved bar was counted against the
+  scan's bar numbers, so its words landed on the wrong bars (#446).
+- A scan that gives up on a system sent to the remote runner now asks the runner to stop
+  and waits up to 30 s before killing it, so homr does not keep running on the other
+  machine's card. (#443)
+- A sung part holds the last syllable over any number of notes without words, instead of
+  singing it again from the third note on; after a rest it is sung once again and then held.
+  (#442)
+- Heavy work can run on another machine with one setting, `REMOTE_RUNNER` in `.env`, which
+  replaces `HOMR_REMOTE_READER`: a scan hands it each system and `sing_song.py` shares the
+  lines with it, and whatever it cannot do runs here. The runner for a GPU in a Kubernetes
+  cluster ships in `src/kube_runner/`. (#439)
+- A song's parts can be sung and made into a practice track from this repository:
+  `sing_song.py <slug>` writes one sung MP3 per part with the score and its MIDI, and
+  `--publish <choir>` puts it on the site with the sung parts. `scripts/install-singer.sh`
+  installs the singer (on an NVIDIA card when there is one), and `docs/pdf-to-practice-track.md`
+  walks an agent from a PDF to the finished track. (#439)
+- A scan can hand each system to another machine first (`HOMR_REMOTE_READER` in `.env`),
+  so several songs scanning at once need not wait in one queue on this host; when that
+  machine cannot read it, the system is read here as before. (#438)
+- A part's second line can hold a note across a barline: `tie` and `untie` entries in
+  `fixes.json` take `"voice": 2`, and the held note is sung once, not again with a
+  word of its own. (#434)
+- A part that splits on the page for a bar or two keeps both lines: a `voice2` entry in a
+  song's `fixes.json` writes the second line into that bar of the part, with its own words
+  from the lyric editor's voice-2 box, and the site gets both lines. (#431)
+- A song can be deleted: **Delete song** on its Start page, after a confirmation that
+  names it and says whether it is on the site. The folder moves to `songs/.trash/`,
+  so moving it back undoes it, and the site keeps its copy. Refused while a scan,
+  clean, check or publish runs. (#428)
+- The Publish panel asks where each part name the stemmanauhat site does not know
+  yet goes in its voice tree: another name for a voice it has, a new voice under
+  one, or no voice (a solo, a trio). Publish writes that to the site first, so a
+  singer's part carries over from song to song; it refuses while a new name has
+  no answer. A site without the voice tree is published to as before. Needs the
+  site's matching change (eerovil/stemmanauhat-cf#108). (#430)
+- homr can read on this host's GTX 970: `scripts/onnxruntime-sm52/build.sh` builds an
+  onnxruntime the card can run, and `HOMR_ORT_WHEEL=<wheel> scripts/install-homr.sh`
+  installs it. A system then reads in about 9 seconds instead of 14 and leaves most of
+  the CPU free. The notes can differ slightly from a CPU read, always in a bar marked
+  ⚠. Without the wheel nothing changes. (#418)
+- Publishing a song to the site's test list ("Testilista") no longer takes it off
+  the choir's list it is already on; publishing it to a choir still takes it off
+  the test list. The Publish panel marks the test list "test". Needs the site's
+  matching change (eerovil/stemmanauhat-cf#73). (#422)
+- A song with more than five parts is drawn on the stemmanauhat site with its
+  parts back on the staves the PDF prints them on, two to a staff (S1 and S1b on
+  one staff, as voice 1 and voice 2). The sound, the mix and the part list stay one
+  per part. The Publish panel shows the pairing, says when it was guessed from the
+  part names, and lets you change it or empty it. Needs the site's matching change
+  (eerovil/stemmanauhat-cf). (#420)
+- The app works with MuseScore 4 as well as MuseScore 3: set `MUSESCORE_CLI_PATH`
+  to either. A score opened and saved in MuseScore 4 keeps its parts. One thing is
+  MuseScore 3 only: the check that a cleaned score would open without being called
+  corrupted says "not checked" with MuseScore 4. (#414, #416)
+- The nightly songs backup runs on macOS as well as Linux. Two runs that both find
+  a lock left by a killed run no longer both go ahead, a lock older than 30 minutes
+  is taken over, and a skipped run says which lock to delete. (#415, #416)
 - Setting the app up on another computer is one script: `scripts/setup.sh`
   makes the Python environment, finds MuseScore 3 or downloads it (Linux), writes
   `.env`, and offers homr. `./song.py --check` then says, one line each, what this

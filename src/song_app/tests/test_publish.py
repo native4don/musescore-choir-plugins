@@ -35,6 +35,8 @@ SITE_SONGS = """CREATE TABLE songs (
 # The site's choirs table and the rows its migration 0001 seeds on the live copy.
 SITE_CHOIRS = """CREATE TABLE choirs (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, public INTEGER NOT NULL DEFAULT 0)"""
+# Migration 0007 (stemmanauhat-cf#73): the test list.
+SITE_STAGING = "ALTER TABLE choirs ADD COLUMN staging INTEGER NOT NULL DEFAULT 0"
 SEEDED = [("jm", "Joensuun Mieslaulajat", 0), ("naiskuoro", "Naiskuoro", 0),
           ("public", "Esittely", 1)]
 
@@ -50,7 +52,7 @@ class _Reply(io.BytesIO):
 class FakeCloudflare:
     """Cloudflare's REST API as a publish uses it: R2 objects and D1 queries."""
 
-    def __init__(self, fail_on=None, choirs=SEEDED):
+    def __init__(self, fail_on=None, choirs=SEEDED, staging=True):
         self.objects = {}
         self.types = {}
         self.db = sqlite3.connect(":memory:", check_same_thread=False)
@@ -58,7 +60,12 @@ class FakeCloudflare:
         # site owns the table, and a publish no longer creates it.
         self.db.execute(SITE_SONGS)
         self.db.execute(SITE_CHOIRS)
-        self.db.executemany("INSERT INTO choirs VALUES (?, ?, ?)", choirs)
+        self.db.executemany("INSERT INTO choirs (id, name, public) VALUES (?, ?, ?)",
+                            [c[:3] for c in choirs])
+        if staging:
+            self.db.execute(SITE_STAGING)
+            self.db.executemany("UPDATE choirs SET staging = 1 WHERE id = ?",
+                                [c[:1] for c in choirs if c[3:] == (1,)])
         self.calls = []
         self.fail_on = fail_on
 
@@ -101,7 +108,12 @@ class FakeCloudflare:
             }).encode())
         if path == "/d1/database/db1/query" and method == "POST":
             body = json.loads(request.data)
-            rows = self.db.execute(body["sql"], body["params"]).fetchall()
+            try:
+                rows = self.db.execute(body["sql"], body["params"]).fetchall()
+            except sqlite3.OperationalError as exc:
+                raise urllib.error.HTTPError(
+                    request.full_url, 400, "Bad Request", {}, io.BytesIO(json.dumps(
+                        {"errors": [{"message": f"{exc}: SQLITE_ERROR"}]}).encode()))
             self.db.commit()
             return _Reply(json.dumps({"success": True,
                                       "result": [{"results": rows}]}).encode())
@@ -183,7 +195,7 @@ def test_score_credits_reads_the_metatags_that_are_set(tmp_path):
     assert publish.score_credits(str(tmp_path / "missing.mscx")) == {}
 
 
-def test_publishing_again_replaces_the_old_version_and_a_new_choir_moves_the_song(tmp_path):
+def test_publishing_to_another_choir_keeps_the_first_choirs_listing(tmp_path):
     cf = FakeCloudflare()
     client = publish.Cloudflare(CONFIG, cf)
     first = publish.publish(slug="laulu", title="Laulu", choir="jm",
@@ -193,11 +205,28 @@ def test_publishing_again_replaces_the_old_version_and_a_new_choir_moves_the_son
                              bundle=_bundle(tmp_path, parts=("S1", "S2", "A1")),
                              client=client, published={"jm": first})
 
-    assert cf.listed("jm") == []
+    # #450: a song in two choirs' lists (joy and joy-alumnit) stays in both
+    [(_slug, _title, prefix, _parts)] = cf.listed("jm")
+    assert prefix == first["prefix"]
     [(_slug, _title, prefix, parts)] = cf.listed("naiskuoro")
     assert prefix == second["prefix"] and len(json.loads(parts)) == 3
-    assert sorted(cf.objects) == sorted(second["files"])
-    assert publish.replaced("naiskuoro", {"jm": first}) == ["jm"]
+    assert sorted(cf.objects) == sorted(first["files"] + second["files"])
+    assert publish.replaced("naiskuoro", {"jm": first}) == []
+
+
+def test_publishing_to_a_choir_again_replaces_only_that_choirs_version(tmp_path):
+    cf = FakeCloudflare()
+    client = publish.Cloudflare(CONFIG, cf)
+    jm = publish.publish(slug="laulu", title="Laulu", choir="jm",
+                         bundle=_bundle(tmp_path), client=client)
+    nais = publish.publish(slug="laulu", title="Laulu", choir="naiskuoro",
+                           bundle=_bundle(tmp_path), client=client, published={"jm": jm})
+    time.sleep(1.1)
+    jm2 = publish.publish(slug="laulu", title="Laulu", choir="jm", bundle=_bundle(tmp_path),
+                          client=client, published={"jm": jm, "naiskuoro": nais})
+    assert cf.listed("jm")[0][2] == jm2["prefix"]
+    assert cf.listed("naiskuoro")[0][2] == nais["prefix"]
+    assert sorted(cf.objects) == sorted(jm2["files"] + nais["files"])
 
 
 def test_a_song_can_be_in_the_public_list_and_a_choirs_list_at_once(tmp_path):
@@ -224,7 +253,7 @@ def test_a_song_can_be_in_the_public_list_and_a_choirs_list_at_once(tmp_path):
     assert sorted(cf.objects) == sorted(jm2["files"] + public["files"])
 
 
-def test_a_move_between_choirs_keeps_the_public_listing_and_drops_an_unrecorded_choir(tmp_path):
+def test_another_choirs_publish_keeps_an_unrecorded_choir_and_the_public_listing(tmp_path):
     cf = FakeCloudflare()
     client = publish.Cloudflare(CONFIG, cf)
     jm = publish.publish(slug="maamme", title="Maamme", choir="jm",
@@ -236,12 +265,11 @@ def test_a_move_between_choirs_keeps_the_public_listing_and_drops_an_unrecorded_
     nais = publish.publish(slug="maamme", title="Maamme", choir="naiskuoro",
                            bundle=_bundle(tmp_path), client=client,
                            published={"public": public}, log=log.append)
-    # jm was not in the record handed in (published by hand, say): its row goes
-    # anyway, as the site's own script does, and public stays.
-    assert cf.listed("jm") == []
+    # jm was not in the record handed in (published by hand, say): it stays (#450)
+    assert [r[0] for r in cf.listed("jm")] == ["maamme"]
     assert [r[0] for r in cf.listed("naiskuoro")] == ["maamme"]
     assert [r[0] for r in cf.listed("public")] == ["maamme"]
-    assert "Removed it from the jm list." in log
+    assert not any("Removed it" in line for line in log)
     assert set(public["files"]) <= set(cf.objects) and set(nais["files"]) <= set(cf.objects)
 
 
@@ -362,6 +390,140 @@ def test_the_names_given_are_the_bundles_parts_and_its_midi_tracks(tmp_path):
     assert "<part-name>Sopraano</part-name>" in open(bundle.musicxml).read()
 
 
+SIX = ["S1", "S1b", "S2", "S2b", "A1", "A2"]
+
+
+def _six_parts(tmp_path):
+    """repeat.mscx with its two parts copied into six, and no record of the page,
+    so the pairs come from the part names: S1+S1b, S2+S2b, A1+A2 (#420)."""
+    import copy
+    from lxml import etree
+    from src.score_export import score
+    tree = etree.parse(os.path.join(FIXTURES, "repeat.mscx"))
+    root = tree.getroot()
+    sc = root.find("Score")
+    for tag in sc.findall("metaTag[@name='lyricsStaffMap']"):
+        sc.remove(tag)
+    (s_part, a_part), (s_staff, a_staff) = sc.findall("Part"), sc.findall("Staff")
+    anchor = a_staff
+    for element in (s_part, a_part, s_staff, a_staff):
+        sc.remove(element)
+    parts, staves = [], []
+    for number, name in enumerate(SIX, 1):
+        part = copy.deepcopy(s_part if name.startswith("S") else a_part)
+        staff = copy.deepcopy(s_staff if name.startswith("S") else a_staff)
+        part.find("Staff").set("id", str(number))
+        staff.set("id", str(number))
+        parts.append(part)
+        staves.append(staff)
+    for element in parts + staves:
+        sc.append(element)
+    score.rename_parts(root, SIX)
+    path = tmp_path / "six.mscx"
+    tree.write(str(path), encoding="UTF-8", xml_declaration=True)
+    return str(path)
+
+
+def test_the_published_parts_say_which_staff_and_voices_each_is_drawn_on(tmp_path):
+    cf = FakeCloudflare()
+    bundle = _bundle(tmp_path)
+    bundle.layout = {"S1": {"staff": 0, "voices": [1]}, "A1": {"staff": 0, "voices": [2]}}
+    record = publish.publish(slug="laulu", title="Laulu", choir="jm", bundle=bundle,
+                             client=publish.Cloudflare(CONFIG, cf))
+    [(_slug, _title, prefix, parts)] = cf.listed("jm")
+    expected = [{"name": "S1", "staff": 0, "voices": [1]},
+                {"name": "A1", "staff": 0, "voices": [2]}]
+    assert json.loads(parts) == expected
+    assert json.loads(cf.objects[prefix + "manifest.json"])["parts"] == expected
+    assert record["parts"] == ["S1", "A1"]
+
+
+def test_sung_parts_go_up_with_their_mp3_and_voice(tmp_path):
+    """#439: sing_song.py --publish sends each part's sung MP3, as the site's own script did."""
+    cf = FakeCloudflare()
+    bundle = _bundle(tmp_path)
+    for name, voice in (("S1", "LYSE"), ("A1", "LYSE")):
+        (tmp_path / f"{name}.mp3").write_bytes(b"ID3-" + name.encode())
+    bundle.sung = {"S1": {"mp3": str(tmp_path / "S1.mp3"), "voice": "LYSE"},
+                   "A1": {"mp3": str(tmp_path / "A1.mp3"), "voice": "LYSE"}}
+    record = publish.publish(slug="laulu", title="Laulu", choir="jm", bundle=bundle,
+                             client=publish.Cloudflare(CONFIG, cf))
+    [(_slug, _title, prefix, parts)] = cf.listed("jm")
+    expected = [{"name": "S1", "file": "parts/1-S1.mp3", "sung": True, "voice": "LYSE"},
+                {"name": "A1", "file": "parts/2-A1.mp3", "sung": True, "voice": "LYSE"}]
+    assert json.loads(parts) == expected
+    assert json.loads(cf.objects[prefix + "manifest.json"])["parts"] == expected
+    assert cf.objects[prefix + "parts/2-A1.mp3"] == b"ID3-A1"
+    assert cf.types[prefix + "parts/1-S1.mp3"] == "audio/mpeg"
+    # the next publish takes them away with the rest of this version
+    assert prefix + "parts/1-S1.mp3" in record["files"]
+
+
+def test_a_sung_bundle_sends_its_words_and_a_piano_one_does_not(tmp_path):
+    """eeron-omat-taskit#110: words.json goes up beside the sung MP3s, for the site's unisons."""
+    words = tmp_path / "words.json"
+    words.write_text('{"version":1,"parts":[[],[]]}')
+    cf = FakeCloudflare()
+    piano = _bundle(tmp_path)
+    piano.words = str(words)
+    publish.publish(slug="piano", title="Piano", choir="jm", bundle=piano, client=publish.Cloudflare(CONFIG, cf))
+    assert not [k for k in cf.objects if k.endswith("words.json")]
+    sung = _bundle(tmp_path)
+    for name in ("S1", "A1"):
+        (tmp_path / f"{name}.mp3").write_bytes(b"ID3")
+    sung.sung = {n: {"mp3": str(tmp_path / f"{n}.mp3"), "voice": "LYSE"} for n in ("S1", "A1")}
+    sung.words = str(words)
+    publish.publish(slug="laulu", title="Laulu", choir="jm", bundle=sung, client=publish.Cloudflare(CONFIG, cf))
+    [prefix] = [row[2] for row in cf.listed("jm") if row[0] == "laulu"]
+    assert cf.objects[prefix + "words.json"] == words.read_bytes()
+    assert cf.types[prefix + "words.json"] == "application/json"
+
+
+def test_a_bundle_with_some_parts_sung_is_refused(tmp_path):
+    cf = FakeCloudflare()
+    bundle = _bundle(tmp_path)
+    (tmp_path / "S1.mp3").write_bytes(b"ID3")
+    bundle.sung = {"S1": {"mp3": str(tmp_path / "S1.mp3"), "voice": "LYSE"}}
+    with pytest.raises(publish.PublishError, match="A1"):
+        publish.publish(slug="laulu", title="Laulu", choir="jm", bundle=bundle,
+                        client=publish.Cloudflare(CONFIG, cf))
+    assert cf.objects == {}
+
+
+def test_six_parts_are_paired_the_way_the_page_prints_them(tmp_path):
+    proposal = publish.staff_group_proposal(_six_parts(tmp_path))
+    assert proposal["groups"] == [["S1", "S1b"], ["S2", "S2b"], ["A1", "A2"]]
+    assert proposal["source"] == "part names" and proposal["parts"] == 6
+
+
+def test_a_hand_set_pairing_the_score_cannot_draw_is_refused(tmp_path):
+    with pytest.raises(publish.PublishError, match="No such part: T1"):
+        publish.build_bundle(_six_parts(tmp_path), str(tmp_path), staff_groups=[["S1", "T1"]])
+
+
+@needs_musescore
+def test_more_than_five_parts_share_staves_in_the_picture_and_not_in_the_sound(tmp_path):
+    """#420: the MusicXML draws six parts on three staves; the MIDI the site mixes
+    still has a track per part, and the timing is the same either way."""
+    six = _six_parts(tmp_path)
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "apart").mkdir()
+    shared = publish.build_bundle(six, str(tmp_path / "shared"))
+    from lxml import etree
+    xml = etree.parse(shared.musicxml).getroot()
+    assert [p.text for p in xml.iter("part-name")] == ["S1/S1b", "S2/S2b", "A1/A2"]
+    assert shared.parts == SIX
+    assert shared.layout["S2b"] == {"staff": 1, "voices": [2]}
+    assert shared.layout["A1"] == {"staff": 2, "voices": [1]}
+    tracks = [t.name.rstrip("\x00") for t in mido.MidiFile(shared.midi).tracks if t.name]
+    assert tracks == SIX
+
+    apart = publish.build_bundle(six, str(tmp_path / "apart"), staff_groups=[])
+    assert len(etree.parse(apart.musicxml).getroot().findall("part")) == 6
+    assert apart.layout == {}
+    assert apart.timing == shared.timing
+
+
 def test_a_score_cleaned_into_another_number_of_parts_is_refused(tmp_path):
     with pytest.raises(publish.PublishError,
                        match="The score now has 2 parts; check the part names"):
@@ -404,10 +566,14 @@ def _publish_client(monkeypatch, tmp_path):
     seen = {}
 
     def fake_bundle(cleaned, out_dir, *, initial_bpm=None, tempo_changes=None,
-                    part_names=None, log=lambda m: None):
+                    part_names=None, staff_groups=None, log=lambda m: None):
         seen.update(cleaned=cleaned, initial_bpm=initial_bpm, tempo_changes=tempo_changes)
         return _bundle(tmp_path)
     monkeypatch.setattr(publish, "build_bundle", fake_bundle)
+    # No deck to queue at: a publish asks the host's AgentDeck for a heavy slot, and run
+    # inside a deck test job (which holds the slot) it waited 30 minutes and timed out (#426)
+    from src.song_app import heavy_slot
+    monkeypatch.setattr(heavy_slot, "_api_base", lambda: "")
     return TestClient(server.app), cf, seen
 
 
@@ -443,12 +609,12 @@ def test_publishing_from_the_app_lists_the_song_for_its_choir(app_song, monkeypa
     assert sorted(data["publish"]["sites"]) == ["jm", "public"]
     assert cf.listed("jm") and cf.listed("public")
 
-    # ... and a move to naiskuoro drops jm and keeps public.
+    # ... and so does publishing to naiskuoro too (#450): the song is in all three.
     assert client.post(f"/api/songs/{app_song.slug}/publish",
                        json={"choir": "naiskuoro"}).status_code == 200
     data = _job_done(client, app_song.slug)
-    assert sorted(data["publish"]["sites"]) == ["naiskuoro", "public"]
-    assert cf.listed("jm") == [] and cf.listed("public")
+    assert sorted(data["publish"]["sites"]) == ["jm", "naiskuoro", "public"]
+    assert cf.listed("jm") and cf.listed("naiskuoro") and cf.listed("public")
 
 
 def test_publish_refuses_an_unapproved_score_an_unknown_choir_and_no_keys(
@@ -603,3 +769,43 @@ def test_the_published_score_carries_its_tempo_marks_unprinted(tmp_path):
     marks = list(root.iter("metronome"))
     assert all(m.get("print-object") == "no" for m in marks), "no tempo mark is drawn"
     assert [s.get("tempo") for s in root.iter("sound") if s.get("tempo")][:2] == ["84", "72"]
+
+
+def test_a_publish_whose_song_was_replaced_meanwhile_touches_neither(app_song, monkeypatch,
+                                                                      tmp_path):
+    """#428: the old request loaded song A and waited on the site's choir list; A was
+    deleted and B created under the same slug. It must not publish B or save onto it."""
+    from src.song_app import job_state, state
+    client, cf, seen = _publish_client(monkeypatch, tmp_path)
+    real_choirs = publish.choirs
+    replaced = {}
+
+    def choirs_then_replace(*args, **kwargs):
+        listing = real_choirs(*args, **kwargs)
+        state.trash(app_song.slug)
+        replaced["b"] = state.create("Hanget soi", per_system=False)
+        return listing
+
+    monkeypatch.setattr(publish, "choirs", choirs_then_replace)
+    reply = client.post(f"/api/songs/{app_song.slug}/publish", json={"choir": "jm"})
+    assert reply.status_code == 404, reply.text
+    b = replaced["b"]
+    assert b.slug == app_song.slug
+    assert job_state.load(b.dir) == {}                 # no job started on B
+    assert state.load(b.slug).data == b.data           # and B's state untouched
+    assert "cleaned" not in seen
+
+
+def test_a_part_name_with_a_slash_goes_up_under_a_safe_file_name(tmp_path):
+    """#439 review: the Publish panel takes "S/A"; its MP3 must not become a folder."""
+    assert publish.sung_file(1, "S/A") == "parts/1-S_A.mp3"
+    assert publish.sung_file(2, "Ääni 1") == "parts/2-Ääni 1.mp3"   # names that were fine stay
+    cf = FakeCloudflare()
+    bundle = _bundle(tmp_path)
+    bundle.parts = ["S/A", "A1"]
+    (tmp_path / "x.mp3").write_bytes(b"ID3")
+    bundle.sung = {name: {"mp3": str(tmp_path / "x.mp3")} for name in bundle.parts}
+    publish.publish(slug="laulu", title="Laulu", choir="jm", bundle=bundle, client=publish.Cloudflare(CONFIG, cf))
+    [(_slug, _title, prefix, parts)] = cf.listed("jm")
+    assert json.loads(parts)[0] == {"name": "S/A", "file": "parts/1-S_A.mp3", "sung": True}
+    assert prefix + "parts/1-S_A.mp3" in cf.objects

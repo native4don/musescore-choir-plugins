@@ -56,7 +56,7 @@ ABORTED = (-6, 134)
 
 #: The application "Open in MuseScore" asks macOS for, unless MUSESCORE_APP says
 #: otherwise.
-DEFAULT_APP = "MuseScore 4"
+DEFAULT_APP = "MuseScore 3"
 
 
 class MuseScoreError(RuntimeError):

@@ -13,7 +13,8 @@ needs from here is:
 - the **credits**: composer, lyricist and arranger, when they are known.
 
 No audio is rendered here (stemmanauhat-cf#36), and nothing goes to YouTube any
-more (#400).
+more (#400). ``sing_song.py --publish`` sends each part's sung MP3 along too
+(``Bundle.sung``, #439); the app's own Publish button stays piano only.
 
 All of it is made off one prepared copy of the cleaned score
 (`score_export.score.prepare`: silent parts dropped, red marks stripped, the
@@ -36,6 +37,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -70,6 +72,16 @@ UPSERT = ("INSERT INTO songs (choir, slug, title, prefix, parts, duration, publi
           "duration = excluded.duration, published_at = excluded.published_at, "
           "composer = excluded.composer, lyricist = excluded.lyricist, "
           "arranger = excluded.arranger")
+
+
+UNSAFE_IN_FILE = re.compile(r"[/\\?#%]")
+
+
+def sung_file(index: int, name: str) -> str:
+    """parts/<n>-<Name>.mp3, the sung MP3 of part `index` (from 1): a part name may hold a
+    character a file name or a URL cannot (``S/A``), which becomes ``_``. The site reads the
+    name off the manifest's ``file``, and sing_song writes its MP3 under the same one."""
+    return f"parts/{index}-{UNSAFE_IN_FILE.sub('_', name)}.mp3"
 
 
 def _noop(_msg: str) -> None:
@@ -176,6 +188,15 @@ class Bundle:
     timing: Dict
     parts: List[str] = field(default_factory=list)  # part names, in score order
     midi: str = ""
+    # Where each part is drawn when some share a staff (#420): name -> {"staff":
+    # 0-based MusicXML part, "voices": [MusicXML voice numbers]}. Empty: one each.
+    layout: Dict[str, Dict] = field(default_factory=dict)
+    # The sung MP3 of each part, when sing_song sang them (#439): name -> {"mp3":
+    # path here, "voice": the voice credited on the site}. Empty: piano only.
+    sung: Dict[str, Dict] = field(default_factory=dict)
+    # words.json beside the sung MP3s (sing_song, eeron-omat-taskit#110): each part's notes with
+    # the syllable sung on each, so the site sings a shared note once only on the same syllable.
+    words: str = ""
 
 
 def score_credits(mscx_path: str) -> Dict[str, str]:
@@ -204,15 +225,67 @@ def part_count_message(count: int) -> str:
     return f"The score now has {count} parts; check the part names on the Publish panel."
 
 
+def _published_root(cleaned_path: str, part_names: Optional[List[str]]) -> etree._Element:
+    """The score as a publish names it: silent parts out, the saved names on."""
+    from src.score_export import score
+    root = etree.parse(cleaned_path).getroot()
+    score.drop_parts(root, score.silent_parts(root))
+    if part_names is not None and len(part_names) == len(score.singing_part_names(root)):
+        score.rename_parts(root, part_names)
+    return root
+
+
+def staff_group_proposal(cleaned_path: str,
+                         part_names: Optional[List[str]] = None) -> Dict:
+    """The parts that would share a staff on the site, worked out from the page
+    (#420): {"groups": [[upper, lower], ...], "source": ..., "parts": n}. A pair
+    whose parts sing too many voices between them to share a staff is left out
+    and named under "skipped"."""
+    from src.score_export import score, staff_groups
+    try:
+        root = _published_root(cleaned_path, part_names)
+    except (OSError, etree.XMLSyntaxError):
+        return {"groups": [], "source": "", "parts": 0, "skipped": []}
+    groups, source = staff_groups.proposal(root)
+    fits = [list(g) for g in groups if score.can_share(root, *g)]
+    return {"groups": fits, "source": source,
+            "parts": len(score.singing_part_names(root)),
+            "skipped": [list(g) for g in groups if list(g) not in fits]}
+
+
+def check_staff_groups(cleaned_path: str, groups: Sequence[Sequence[str]],
+                       part_names: Optional[List[str]] = None) -> None:
+    """Refuse a hand-set pairing the score cannot draw: a part it does not have,
+    one named twice, or two parts singing more voices than one staff holds."""
+    from src.score_export import score, staff_groups
+    root = _published_root(cleaned_path, part_names)
+    names = score.singing_part_names(root)
+    try:
+        staff_groups.validate_groups(groups, names)
+    except ValueError as exc:
+        raise PublishError(f"Shared staves: {exc}") from None
+    for upper, lower in groups:
+        if not score.can_share(root, upper, lower):
+            raise PublishError(
+                f"Shared staves: {upper} and {lower} sing two voices of their own "
+                "somewhere, more than one staff can hold for both.")
+
+
 def build_bundle(cleaned_path: str, out_dir: str, *, initial_bpm: Optional[int] = None,
                  tempo_changes: Optional[List[Dict]] = None,
                  part_names: Optional[List[str]] = None,
+                 staff_groups: Optional[Sequence[Sequence[str]]] = None,
                  log: Logger = _noop) -> Bundle:
     """MusicXML, MIDI, the timing and the part names, made off one prepared score.
 
     `part_names` are the names saved on the Publish panel, by position (#402). A
     score that has since been cleaned into another number of parts is refused
     rather than named by guesswork.
+
+    `staff_groups` are the parts that share a staff in the MusicXML (#420); None
+    works them out from the page when there are more than five singing parts, and
+    an empty list shares none. Only the picture changes: the MIDI and the timing
+    come off the unmerged copy, so the site still mixes one track per part.
     """
     from src.score_export import musescore, score
 
@@ -225,8 +298,26 @@ def build_bundle(cleaned_path: str, out_dir: str, *, initial_bpm: Optional[int] 
     if dropped:
         log(f"Leaving out {', '.join(dropped)} (no notes to sing)")
     names = musescore.part_names(etree.parse(source).getroot())
+
+    if staff_groups is None:
+        proposal = staff_group_proposal(source)
+        groups = proposal["groups"]
+        for upper, lower in proposal["skipped"]:
+            log(f"{upper} and {lower} keep a staff each: between them they sing more "
+                "voices than one staff holds.")
+        how = {"page": "from the page", "page, per system": "from the page",
+               "part names": "guessed from the part names"}.get(proposal["source"], "")
+    else:
+        groups = [list(g) for g in staff_groups]
+        check_staff_groups(source, groups)
+        how = "as set on the Publish panel"
+    picture, layout = source, {}
+    if groups:
+        log("Shared staves: " + ", ".join("/".join(g) for g in groups) + f" ({how})")
+        picture, layout = score.merged_copy(source, out_dir, groups)
+
     log("Exporting the score (MusicXML), its play order and its clock (MuseScore CLI)")
-    musicxml = musescore.run_musescore(source, os.path.join(out_dir, "score.musicxml"))
+    musicxml = musescore.run_musescore(picture, os.path.join(out_dir, "score.musicxml"))
     with open(musicxml, "rb") as f:
         hidden, count = hide_tempo_marks(f.read())
     if count:
@@ -236,7 +327,18 @@ def build_bundle(cleaned_path: str, out_dir: str, *, initial_bpm: Optional[int] 
     mpos = musescore.run_musescore(source, os.path.join(out_dir, "score.mpos"))
     midi = musescore.run_musescore(source, os.path.join(out_dir, "score.mid"))
     clock = timing(source, mpos, midi)
-    return Bundle(musicxml=musicxml, timing=clock, parts=list(names), midi=midi)
+    if groups:
+        bars = _musicxml_bars(musicxml)
+        if bars != len(bar_lengths(source)):
+            raise PublishError(f"The score with shared staves has {bars} bars and the "
+                               f"score it was made from {len(bar_lengths(source))}.")
+    return Bundle(musicxml=musicxml, timing=clock, parts=list(names), midi=midi,
+                  layout=layout)
+
+
+def _musicxml_bars(path: str) -> int:
+    part = etree.parse(path).getroot().find("part")
+    return len(part.findall("measure")) if part is not None else 0
 
 
 # ---------------------------------------------------------------------------
@@ -387,15 +489,26 @@ CHOIRS_FILE = ".choirs.json"
 
 
 def site_choirs(client: "Cloudflare") -> List[Dict]:
-    """The site's choirs, ``[{"id", "name", "public"}]``, the private ones first."""
-    result = client.query("SELECT id, name, public FROM choirs ORDER BY public, name")
+    """The site's choirs, ``[{"id", "name", "public", "staging"}]``, the private ones first.
+
+    ``staging`` marks the site's test list (stemmanauhat-cf#73): a song is tried
+    out there before it moves to a choir. A site older than that column has none.
+    """
+    try:
+        result = client.query("SELECT id, name, public, staging FROM choirs "
+                              "ORDER BY public, name")
+    except PublishError as exc:
+        if "staging" not in str(exc):
+            raise
+        result = client.query("SELECT id, name, public, 0 FROM choirs ORDER BY public, name")
     choirs = []
     for part in result:
         for row in part.get("results") or []:
             if isinstance(row, dict):
-                row = (row.get("id"), row.get("name"), row.get("public"))
-            choir, name, public = row
-            choirs.append({"id": choir, "name": name or choir, "public": bool(public)})
+                row = tuple(row.values())
+            choir, name, public, staging = row
+            choirs.append({"id": choir, "name": name or choir, "public": bool(public),
+                           "staging": bool(staging)})
     return choirs
 
 
@@ -431,6 +544,162 @@ def choirs(config: Optional[Config], songs_dir: str,
 
 
 # ---------------------------------------------------------------------------
+# The site's voice tree (stemmanauhat-cf#107)
+# ---------------------------------------------------------------------------
+# The site carries a singer's part from song to song with a tree of voices in
+# D1: `voices` (id, parent, name_fi, name_en, names) up to four levels deep, and
+# `unplaced_parts`, names in no place on purpose (a solo, a trio). A part name
+# in neither is refused before anything goes up, and the person publishing says
+# where it goes (#430): where a part belongs is their call, never a guess. The
+# rules are the site's own (`knowsName`, `treePlan` in its publish-songs.mjs).
+MAX_DEPTH = 4
+NO_PLACE = "-"
+
+
+def _norm(name: str) -> str:
+    """Names are the same when they differ only in letter case and spaces."""
+    return re.sub(r"\s+", "", name).lower()
+
+
+@dataclass
+class VoiceTree:
+    voices: List[Dict]   # {"id", "parent", "name", "names"}, in the site's order
+    unplaced: List[str]
+
+
+def _rows(result: List[Dict], columns: Sequence[str]) -> List[Dict]:
+    rows = []
+    for part in result:
+        for row in part.get("results") or []:
+            rows.append(dict(row) if isinstance(row, dict) else dict(zip(columns, row)))
+    return rows
+
+
+def voice_tree(client: "Cloudflare") -> Optional[VoiceTree]:
+    """The site's voice tree, or None for a site that has none yet (before its migration 0009)."""
+    try:
+        voices = _rows(client.query("SELECT id, parent, name_fi, names FROM voices"),
+                       ("id", "parent", "name_fi", "names"))
+        unplaced = _rows(client.query("SELECT name FROM unplaced_parts"), ("name",))
+    except PublishError as exc:
+        if "no such table" in str(exc):
+            return None
+        raise
+    return VoiceTree(
+        voices=[{"id": v["id"], "parent": v["parent"], "name": v["name_fi"],
+                 "names": json.loads(v["names"] or "[]")} for v in voices],
+        unplaced=[r["name"] for r in unplaced])
+
+
+def _depth(voices: Sequence[Dict], vid: str) -> float:
+    """How many levels down `vid` is (1 at the top); infinite when its parents are missing or loop."""
+    by_id = {v["id"]: v for v in voices}
+    seen = set()
+    voice = by_id.get(vid)
+    while voice:
+        if voice["id"] in seen:
+            return float("inf")
+        seen.add(voice["id"])
+        if voice["parent"] is None:
+            return len(seen)
+        voice = by_id.get(voice["parent"])
+    return float("inf")
+
+
+def knows_name(tree: VoiceTree, name: str) -> bool:
+    """Whether the site can place `name`: a place's name, a name in no place, or a
+    split part ("S1b") of a name above the fourth level."""
+    key = _norm(name)
+
+    def at(k):
+        return next((v for v in tree.voices if any(_norm(n) == k for n in v["names"])), None)
+    if at(key) or any(_norm(n) == key for n in tree.unplaced):
+        return True
+    above = at(key[:-1]) if len(key) > 1 and key.endswith("b") else None
+    return above is not None and _depth(tree.voices, above["id"]) < MAX_DEPTH
+
+
+def unknown_names(tree: VoiceTree, names: Sequence[str]) -> List[str]:
+    """The part names the tree does not know, once each, as the song spells them."""
+    out: List[str] = []
+    for name in names:
+        if not knows_name(tree, name) and _norm(name) not in {_norm(n) for n in out}:
+            out.append(name)
+    return out
+
+
+def tree_places(tree: VoiceTree) -> List[Dict]:
+    """The places for the Publish panel to offer, each under its parent, with its depth."""
+    children: Dict[Optional[str], List[Dict]] = {}
+    ids = {v["id"] for v in tree.voices}
+    for voice in tree.voices:
+        children.setdefault(voice["parent"] if voice["parent"] in ids else None, []).append(voice)
+    out: List[Dict] = []
+
+    def walk(parent, depth):
+        for voice in children.get(parent, []):
+            if any(o["id"] == voice["id"] for o in out):
+                continue  # a loop in hand-edited rows
+            out.append({"id": voice["id"], "name": voice["name"], "depth": depth,
+                        "can_hold": depth < MAX_DEPTH})
+            walk(voice["id"], depth + 1)
+    walk(None, 1)
+    return out
+
+
+def _said(place: Dict) -> str:
+    """One place choice in words, for the publish log."""
+    if place.get("id") == NO_PLACE:
+        return f"{place['name']} in no place"
+    if place.get("parent") is not None:
+        return f"{place['name']} a new place under {place['parent']}"
+    return f"{place['name']} → {place.get('id')}"
+
+
+def place_statements(tree: VoiceTree, names: Sequence[str],
+                     places: Sequence[Dict]) -> List[Tuple[str, List]]:
+    """The D1 statements that put every unknown part name where the person
+    publishing said, in order. `places` is ``[{"name", "id"}]`` for a name of an
+    existing place, ``[{"name", "parent"}]`` for a new place under one, or
+    ``[{"name", "id": "-"}]`` for no place. Refuses, naming them, when an unknown
+    name has no place given or a place cannot be used.
+    """
+    unknown = {_norm(n): n for n in unknown_names(tree, names)}
+    ids = {v["id"] for v in tree.voices}
+    statements: List[Tuple[str, List]] = []
+    for place in places or []:
+        name = str(place.get("name") or "").strip()
+        if _norm(name) not in unknown:
+            continue  # a choice kept from before, for a name the tree knows now or the song lost
+        del unknown[_norm(name)]
+        vid, parent = place.get("id"), place.get("parent")
+        if vid == NO_PLACE:
+            statements.append(("INSERT OR IGNORE INTO unplaced_parts (name) VALUES (?)", [name]))
+        elif parent is not None:
+            if parent not in ids or _depth(tree.voices, parent) >= MAX_DEPTH:
+                raise PublishError(f"Part {name}: there is no place {parent} to put a new "
+                                   "place under, or it is at the fourth level.")
+            # The new place's id is the name it is made for, made unique; it shows
+            # as that name in both languages until renamed on the site.
+            new_id, n = name, 2
+            while new_id in ids:
+                new_id, n = f"{name} {n}", n + 1
+            ids.add(new_id)
+            statements.append(("INSERT INTO voices (id, parent, name_fi, name_en, names) "
+                               "VALUES (?, ?, ?, ?, ?)",
+                               [new_id, parent, name, name, json.dumps([name], ensure_ascii=False)]))
+        elif vid in ids:
+            statements.append(("UPDATE voices SET names = json_insert(names, '$[#]', ?) "
+                               "WHERE id = ?", [name, vid]))
+        else:
+            raise PublishError(f"Part {name}: the site has no place {vid}.")
+    if unknown:
+        raise PublishError("Say where each new part name goes on the site: "
+                           + ", ".join(unknown.values()) + ".")
+    return statements
+
+
+# ---------------------------------------------------------------------------
 # Publishing
 # ---------------------------------------------------------------------------
 
@@ -447,40 +716,62 @@ def records(state: Optional[Dict]) -> Dict[str, Dict]:
     return {site["choir"]: site} if site and site.get("choir") else {}
 
 
-def replaced(choir: str, published: Dict[str, Dict]) -> List[str]:
+def replaced(choir: str, published: Dict[str, Dict],
+             staging: Sequence[str] = ()) -> List[str]:
     """The choirs whose listing a publish for `choir` takes away.
 
-    A song may be in the public list and one choir's list at once, so
-    publishing to ``public`` takes nothing away and publishing to a choir takes
-    away only the other private choirs: a move between two choirs stays a move.
+    A song may be in any number of lists at once (#450: Eero's mixed choirs share
+    songs, and the one-private-choir rule of #384 took a song off ``joy`` when it
+    was published to ``joy-alumnit``), so publishing takes away only the test list
+    (`staging`, #422): a fix tried out there leaves the song on its choirs' lists,
+    and publishing to a choir takes it off the test list, since it is done.
+    Taking a song off a choir is done on the site.
     """
-    if choir == PUBLIC:
+    if choir == PUBLIC or choir in staging:
         return []
-    return [c for c in published if c not in (choir, PUBLIC)]
+    return [c for c in published if c in staging and c != choir]
 
 
 def publish(*, slug: str, title: str, choir: str, bundle: Bundle, client: Cloudflare,
             credits: Optional[Dict[str, str]] = None,
             published: Optional[Dict[str, Dict]] = None,
-            choirs: Optional[Sequence[str]] = None, log: Logger = _noop) -> Dict:
+            choirs: Optional[Sequence[Dict]] = None, places: Sequence[Dict] = (),
+            log: Logger = _noop) -> Dict:
     """Upload `bundle` and register it for `choir`. Returns the record to keep.
 
     The files go under a fresh version prefix first; the D1 row is pointed at
     them last, so the site shows either the old version or the whole new one.
     `published` is the record each choir's last publish returned
     (``records``). What this choir's last publish left is taken away
-    afterwards, and so is the song in any other private choir — rows and files
-    — while its public listing stays (``replaced``). `credits` names the
-    composer, lyricist and arranger; an empty or missing one is left out.
-    `choirs` is the site's choir ids when the caller has just read them; without
-    it they are read here (``site_choirs``).
+    afterwards, and so is the song on the test list, row and files
+    (``replaced``); every other choir's listing stays (#450), and publishing to
+    a test list takes nothing away. `credits` names the composer, lyricist and arranger; an
+    empty or missing one is left out. `choirs` is the site's choirs
+    (``site_choirs``) when the caller has just read them; without it they are
+    read here. `places` says where each part name the site's voice tree does
+    not know goes (``place_statements``); those rows are written before
+    anything goes up, as the site's own publish script does.
     """
-    known = list(choirs) if choirs is not None else [c["id"] for c in site_choirs(client)]
+    listed = list(choirs) if choirs is not None else site_choirs(client)
+    known = [c["id"] for c in listed]
+    staging = [c["id"] for c in listed if c.get("staging")]
     if choir not in known:
         raise PublishError(f"Unknown choir {choir!r}; the site has {', '.join(known) or 'none'}.")
     version = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     prefix = f"songs/{choir}/{slug}/{version}/"
-    parts = [{"name": name} for name in bundle.parts]
+    parts = [{"name": name, **bundle.layout.get(name, {})} for name in bundle.parts]
+    if bundle.sung and set(bundle.sung) != set(bundle.parts):
+        raise PublishError("Every part needs its sung MP3, or none: "
+                           + ", ".join(n for n in bundle.parts if n not in bundle.sung) + ".")
+    sung_files = []
+    for index, part in enumerate(parts, 1):
+        if bundle.sung:
+            # The site plays parts/<n>-<Name>.mp3 as the part's "Laulu" (stemmanauhat-cf#36).
+            name = sung_file(index, part["name"])
+            sung_files.append((name, bundle.sung[part["name"]]["mp3"]))
+            part.update(file=name, sung=True)
+            if bundle.sung[part["name"]].get("voice"):
+                part["voice"] = bundle.sung[part["name"]]["voice"]
     duration = bundle.timing.get("duration", 0.0)
     named = {name: (credits or {}).get(name, "").strip() for name in CREDITS}
     named = {name: text for name, text in named.items() if text}
@@ -488,12 +779,27 @@ def publish(*, slug: str, title: str, choir: str, bundle: Bundle, client: Cloudf
                 "score": "score.musicxml", "timing": "timing.json", "midi": "score.mid",
                 "parts": parts, "duration": duration, **named}
 
+    tree = voice_tree(client)
+    if tree is not None:
+        unknown = {_norm(n) for n in unknown_names(tree, bundle.parts)}
+        for sql, params in place_statements(tree, bundle.parts, places):
+            client.query(sql, params)
+        if unknown:
+            log("Voice tree: " + ", ".join(_said(p) for p in places
+                                           if _norm(str(p.get("name") or "")) in unknown))
+
     uploads: List[Tuple[str, bytes, str]] = []
     with open(bundle.musicxml, "rb") as f:
         uploads.append(("score.musicxml", f.read(), "application/vnd.recordare.musicxml+xml"))
     with open(bundle.midi, "rb") as f:
         uploads.append(("score.mid", f.read(), "audio/midi"))
     uploads.append(("timing.json", json.dumps(bundle.timing).encode(), "application/json"))
+    for name, path in sung_files:
+        with open(path, "rb") as f:
+            uploads.append((name, f.read(), "audio/mpeg"))
+    if bundle.sung and bundle.words:
+        with open(bundle.words, "rb") as f:
+            uploads.append(("words.json", f.read(), "application/json"))
     uploads.append(("manifest.json", json.dumps(manifest, ensure_ascii=False).encode(),
                     "application/json"))
 
@@ -509,25 +815,26 @@ def publish(*, slug: str, title: str, choir: str, bundle: Bundle, client: Cloudf
     record = {"choir": choir, "slug": slug, "version": version, "prefix": prefix, "at": time.time(),
               "files": [prefix + name for name, _data, _kind in uploads],
               "parts": [p["name"] for p in parts], "duration": duration, "credits": named}
-    _clean_up(published or {}, record, client, log)
+    _clean_up(published or {}, record, client, log, staging)
     log(f"Published to the {choir} list.")
     return record
 
 
 def _clean_up(published: Dict[str, Dict], current: Dict, client: Cloudflare,
-              log: Logger) -> None:
+              log: Logger, staging: Sequence[str] = ()) -> None:
     """Take away what this publish replaces. A failure here costs storage, not the song."""
     try:
-        if current["choir"] != PUBLIC:
-            # The site's own rule (stemmanauhat-cf#20): a song is in at most one
-            # private choir, and a hand-published row we hold no record of goes too.
-            gone = client.query("DELETE FROM songs WHERE slug = ? AND choir NOT IN (?, ?) "
-                                "RETURNING choir", [current["slug"], current["choir"], PUBLIC])
+        tests = [c for c in staging if c != current["choir"]]
+        if current["choir"] != PUBLIC and current["choir"] not in staging and tests:
+            # A choir's publish takes the song off the test list (#422), a row we hold
+            # no record of too; every other choir's row stays (#450).
+            gone = client.query("DELETE FROM songs WHERE slug = ? AND choir IN (%s) RETURNING choir"
+                                % ", ".join("?" * len(tests)), [current["slug"], *tests])
             for choir in sorted({row[0] if isinstance(row, (list, tuple)) else row.get("choir")
                                  for result in gone for row in result.get("results") or []}):
                 log(f"Removed it from the {choir} list.")
         stale = [published.get(current["choir"])]
-        stale += [published[c] for c in replaced(current["choir"], published)]
+        stale += [published[c] for c in replaced(current["choir"], published, staging)]
         for record in stale:
             for key in (record or {}).get("files") or []:
                 if key not in current["files"]:

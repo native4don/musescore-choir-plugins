@@ -352,14 +352,14 @@ def test_scan_system_render_does_not_pass_off_the_previous_picture(fake, tmp_pat
 # --- opening the score in MuseScore ----------------------------------------
 
 
-def test_the_application_to_open_scores_in_defaults_to_musescore_4(ms, monkeypatch):
+def test_the_application_to_open_scores_in_defaults_to_musescore_3(ms, monkeypatch):
     monkeypatch.delenv("MUSESCORE_APP", raising=False)
-    assert ms.app_name() == "MuseScore 4"
+    assert ms.app_name() == "MuseScore 3"
 
 
 def test_the_application_to_open_scores_in_is_a_setting(ms, monkeypatch):
-    monkeypatch.setenv("MUSESCORE_APP", "MuseScore 3")
-    assert ms.app_name() == "MuseScore 3"
+    monkeypatch.setenv("MUSESCORE_APP", "MuseScore 4")
+    assert ms.app_name() == "MuseScore 4"
 
 
 def test_open_score_asks_macos_for_the_configured_application(ms, monkeypatch):
@@ -367,7 +367,7 @@ def test_open_score_asks_macos_for_the_configured_application(ms, monkeypatch):
     asked = []
     monkeypatch.setattr(ms.subprocess, "Popen", lambda argv, *a, **k: asked.append(argv))
     ms.open_score("/somewhere/song_cleaned.mscx")
-    assert asked == [["open", "-a", "MuseScore 4", "/somewhere/song_cleaned.mscx"]]
+    assert asked == [["open", "-a", "MuseScore 3", "/somewhere/song_cleaned.mscx"]]
 
 
 def test_the_server_no_longer_names_musescore_3_when_opening_a_score():

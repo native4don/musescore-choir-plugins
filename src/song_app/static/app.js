@@ -98,9 +98,23 @@ async function renderLibrary() {
       : s.open_issues
       ? el("span", { className: "badge warn" }, `${s.open_issues} issue(s) to fix`)
       : el("span", { className: "badge" }, STAGE_LABEL[s.stage] || s.stage);
-    return el("a", { className: "card", href: `#/song/${encodeURIComponent(s.slug)}` },
-      el("h3", {}, s.name), rail, badge);
+    const sing = el("div", { className: "sing", hidden: true });
+    const card = el("a", { className: "card", href: `#/song/${encodeURIComponent(s.slug)}`, "data-slug": s.slug },
+      el("h3", {}, s.name), rail, badge, sing);
+    card._sing = sing;
+    return card;
   });
+  const singHead = el("p", { className: "sing-head hint", hidden: true });
+  const onlyResing = el("input", { type: "checkbox", checked: localStorage.getItem("onlyResing") === "1",
+    onchange: () => { localStorage.setItem("onlyResing", onlyResing.checked ? "1" : "0"); filterResing(); } });
+  const resingFilter = el("label", { className: "sing-filter", hidden: true }, onlyResing, " Only songs to re-sing");
+  let resing = null;
+  const filterResing = () => {
+    for (const c of cards) {
+      const st = resing?.songs[c.dataset.slug];
+      c.hidden = onlyResing.checked && !!resing && !(st?.pending.length || (st?.run && st.run.state !== "done"));
+    }
+  };
   const sortSel = el("select", {
     onchange: () => { localStorage.setItem("songSort", sortSel.value); renderLibrary(); },
   }, Object.entries(SORTS).map(([k, v]) =>
@@ -119,8 +133,78 @@ async function renderLibrary() {
             catch (err) { b.disabled = false; b.textContent = "Import existing"; alert(err.message); }
           } }, "Import existing"),
           el("button", { className: "primary", onclick: newSongDialog }, "+ New song"))),
+      el("div", { className: "row sing-bar" }, singHead, resingFilter),
       cards.length ? el("div", { className: "cards" }, cards)
                    : el("p", { className: "hint" }, "No songs yet. Create one to begin.")));
+  showResing();
+
+  // Which songs need a re-sing with the current singer, and each run's progress (#453).
+  // Read again every 10 s while a run is waiting or going, and every minute otherwise, so a run
+  // an agent queues while the list is open shows up; only while this list is shown.
+  async function showResing() {
+    clearTimeout(resingTimer);
+    try { resing = await getJSON("/api/resing"); }
+    catch (err) {
+      if (!singHead.isConnected) return;
+      singHead.hidden = false;
+      singHead.textContent = `Re-sing status: ${err.message}`;
+      resingTimer = setTimeout(showResing, RESING_IDLE_MS);   // try again: the app may be restarting
+      return;
+    }
+    if (!singHead.isConnected) return;   // the list was left or drawn again
+    for (const c of cards) fillSing(c._sing, resing.songs[c.dataset.slug]);
+    singHead.hidden = false;
+    resingFilter.hidden = false;
+    const site = resing.site.error
+      ? ` Site not reachable (${resing.site.error})${resing.site.at ? `; as read ${when(resing.site.at)}` : ""}.` : "";
+    singHead.textContent = `Singer v${resing.version}: ${resing.pending} song(s) to re-sing` +
+      (resing.running ? `, ${resing.running} run(s) waiting or going.` : ".") + site;
+    filterResing();
+    resingTimer = setTimeout(showResing, resing.running ? RESING_BUSY_MS : RESING_IDLE_MS);
+  }
+}
+let resingTimer = null;
+const RESING_BUSY_MS = window.RESING_BUSY_MS || 10000;   // a test may set these first
+const RESING_IDLE_MS = window.RESING_IDLE_MS || 60000;
+
+// "14:32" today, "Oct 21 14:32" another day.
+function when(t) {
+  const d = new Date(t * 1000);
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString()
+    ? hm : `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${hm}`;
+}
+
+function runText(run) {
+  const choirs = run.choirs?.length ? ` (${run.choirs.join(", ")})` : "";
+  switch (run.state) {
+    case "waiting": return ["Re-sing waiting" + choirs, ""];
+    case "bundle": return ["Re-sing: building the score", ""];
+    case "singing": return [`Singing part ${run.part} of ${run.parts}${run.part_name ? ` (${run.part_name})` : ""}` +
+      (run.remote ? " on the remote GPU" : ""), ""];
+    case "publishing": return [`Publishing to ${run.choir}` +
+      (run.choir_count > 1 ? ` (${run.choir_index} of ${run.choir_count})` : ""), ""];
+    case "done":
+      // a piano-only run (--no-sing) or one that published nowhere is not a re-sing
+      if (run.sing === false) return [`Piano-only run done ${when(run.finished)}` + choirs, ""];
+      if (!run.choirs?.length) return [`Sung, not published, ${when(run.finished)}`, ""];
+      return [`Re-sung ${when(run.finished)}` + choirs, "good"];
+    case "failed": return [`${run.sing === false ? "Piano-only run" : "Re-sing"} failed ${when(run.finished || run.updated)}: ${run.error || "no reason given"}`, "warn"];
+    default: return [run.state, ""];
+  }
+}
+
+function fillSing(box, st) {
+  box.hidden = !st;
+  if (!st) return;
+  const lines = [];
+  if (st.pending.length) lines.push(el("span", { className: "badge warn" }, `Needs re-sing: ${st.pending.join(", ")}`));
+  else if (st.current.length) lines.push(el("span", { className: "badge good" }, `✓ Sung with the current singer`));
+  if (st.run) {
+    const [text, kind] = runText(st.run);
+    lines.push(el("span", { className: `badge run ${kind}`, title: st.run.error || "" }, text));
+  }
+  box.replaceChildren(...lines);
 }
 
 // ---- installing homr ---------------------------------------------------------
@@ -1705,7 +1789,29 @@ function panelRegister(panel, song, P, refresh) {
     el("p", {}, `PDF: ${song.sources?.pdf || "— (none)"}`),
     el("p", {}, `Mode: ${song.mode}`),
     el("p", { className: "hint" }, "Go to the Clean step to build the score."),
+    deleteSongBox(song, P),
     makeLog());
+}
+
+// Delete the song from the app (#428). The folder goes to songs/.trash/, so moving it
+// back undoes this; the site keeps its own copy of a published song.
+function deleteSongBox(song, P) {
+  const onSite = song.published?.length
+    ? `It stays on the site (${song.published.join(", ")}): deleting here does not touch the site.`
+    : "It is not on the site.";
+  const btn = el("button", { className: "danger deletesong", onclick: async () => {
+    if (!confirm(`Delete “${song.name}”?\n\n${onSite}\n\n`
+        + "The folder is moved to songs/.trash/, so it can be put back by hand.")) return;
+    btn.disabled = true;
+    try {
+      await api(P, { method: "DELETE" });
+      location.hash = "";
+    } catch (e) { btn.disabled = false; appendLog(e.message, true); }
+  }}, "Delete song");
+  return el("div", { className: "deletebox", style: "margin-top:24px" },
+    el("h3", {}, "Delete"),
+    el("p", { className: "hint" }, `Removes the song from this app. ${onSite}`),
+    el("div", { className: "row" }, btn));
 }
 
 async function panelClean(panel, song, slug, P, refresh) {
@@ -2898,9 +3004,100 @@ function panelPublish(panel, song, P, refresh, actions) {
     return input;
   });
 
+  // Parts that share a staff on the site (#420). Above five parts the site draws
+  // them two to a staff, paired the way the page prints them; the pairing can be
+  // changed here, or emptied to give every part a staff of its own.
+  const shared = song.publish_staff_groups || { shown: false };
+  const groupsText = (groups) => (groups || []).map((g) => g.join("+")).join(", ");
+  let sharedAuto = !shared.saved;
+  const sharedInput = el("input", { type: "text", value: groupsText(shared.groups),
+    placeholder: "none: every part on its own staff", "data-staff-groups": "",
+    style: "width:100%" });
+  const sharedNote = el("span", { className: "hint staff-groups-note" });
+  const sayShared = () => {
+    sharedNote.className = `hint staff-groups-note${shared.message ? " err" : ""}`;
+    sharedNote.textContent = shared.message || (sharedAuto
+      ? (shared.source === "part names"
+        ? "guessed from the part names — check against the PDF"
+        : shared.groups?.length ? "as the page prints them" : "the page prints every part on its own staff")
+      : "set by hand");
+    sharedReset.hidden = sharedAuto;
+  };
+  const sharedReset = el("button", { "data-staff-groups-auto": "", onclick: () => {
+    sharedAuto = true;
+    sharedInput.value = groupsText(shared.proposal);
+    shared.groups = shared.proposal;
+    shared.message = "";
+    changed();
+    sayShared();
+  } }, "Use the automatic pairing");
+  sayShared();
+  sharedInput.addEventListener("input", () => { sharedAuto = false; changed(); sayShared(); });
+
+  // Where each part name the site's voice tree does not know goes (#430). The
+  // site carries a singer's part from song to song by that tree, and refuses a
+  // name in no place; where a part belongs is the publisher's call, never a guess.
+  const placeOf = {};  // part name, lower case without spaces -> "is:<id>" | "under:<id>" | "-"
+  for (const p of pub.places || []) {
+    placeOf[normPart(p.name)] = p.id === "-" ? "-" : p.parent != null ? `under:${p.parent}` : `is:${p.id}`;
+  }
+  let tree = { available: false, unknown: [] };
+  const placesBox = el("div", { className: "voice-places", "data-voice-places": "" });
+  const currentNames = () => partNames.length
+    ? partNames.map((input) => input.value.trim()).filter(Boolean) : publishParts.names;
+  const drawPlaces = () => {
+    placesBox.replaceChildren();
+    if (tree.error && !tree.available) {
+      if (song.publish_configured) placesBox.append(el("span", { className: "hint err" }, tree.error));
+      return;
+    }
+    if (!tree.unknown.length) return;
+    // Each option says which kind it is: a picked option shows without its group's label.
+    const options = (prefix, said, list) => list.map((p) =>
+      el("option", { value: `${prefix}:${p.id}` }, `${"\u00a0\u00a0".repeat(p.depth - 1)}${said} ${p.name} (${p.id})`));
+    placesBox.append(
+      el("label", {}, "New part names on the site"),
+      el("span", { className: "hint" },
+        "The site does not know these names yet. Say where each one goes, so a singer's part carries over from other songs."),
+      ...tree.unknown.map((name) => {
+        const select = el("select", { "data-voice-place": name },
+          el("option", { value: "" }, "— where does it go? —"),
+          el("optgroup", { label: "Another name for" }, ...options("is", "Same as", tree.places)),
+          el("optgroup", { label: "A new place under" }, ...options("under", "New place under", tree.places.filter((p) => p.can_hold))),
+          el("optgroup", { label: "Neither" },
+            el("option", { value: "-" }, "No place: matches only itself (a solo, a trio)")));
+        select.value = placeOf[normPart(name)] || "";
+        select.addEventListener("input", () => { placeOf[normPart(name)] = select.value; changed(); });
+        return el("div", { className: "row voice-place" }, el("strong", {}, name), select);
+      }));
+  };
+  // Only the reply to the latest names may draw: an earlier lookup can finish last.
+  let treeAsked = 0;
+  const checkTree = () => {
+    const asked = ++treeAsked;
+    return postJSON("/api/voice-tree", { names: currentNames() })
+      .then((reply) => { if (asked === treeAsked) { tree = reply; drawPlaces(); } })
+      .catch((e) => {
+        if (asked === treeAsked) { tree = { available: false, unknown: [], error: e.message }; drawPlaces(); }
+      });
+  };
+  let treeTimer = null;
+  for (const input of partNames) {
+    input.addEventListener("input", () => { clearTimeout(treeTimer); treeTimer = setTimeout(checkTree, 400); });
+  }
+  if (song.publish_configured) checkTree();
+  const places = () => tree.unknown.filter((name) => placeOf[normPart(name)]).map((name) => {
+    const choice = placeOf[normPart(name)];
+    if (choice === "-") return { name, id: "-" };
+    const [kind, id] = [choice.slice(0, choice.indexOf(":")), choice.slice(choice.indexOf(":") + 1)];
+    return kind === "under" ? { name, parent: id } : { name, id };
+  });
+
   const settings = () => ({
     tempo_changes: tempoChanges(),
+    ...(tree.available ? { places: places() } : {}),
     ...(partNames.length ? { part_names: partNames.map((input) => input.value.trim()) } : {}),
+    ...(shared.shown ? { staff_groups: sharedAuto ? null : sharedInput.value.trim() } : {}),
     credits: Object.fromEntries(CREDITS.map(([key]) => [key, credits[key].value.trim()])),
     ...(song.needs_initial_bpm ? { bpm: Number(bpm.value) } : {}),
   });
@@ -2934,10 +3131,21 @@ function panelPublish(panel, song, P, refresh, actions) {
       el("span", { className: `part-names-note hint${publishParts.stale ? " err" : ""}` },
         publishParts.stale ? publishParts.message : "as the singers see them, top staff first"),
     ] : []),
+    ...(shared.shown ? [
+      el("label", {}, "Shared staves"),
+      el("div", { className: "row staff-groups", "data-staff-groups-row": "" }, sharedInput),
+      el("div", { className: "row" }, sharedNote, sharedReset),
+      el("span", { className: "hint" },
+        `More than ${shared.max_staves} parts: the site draws two parts on one staff, e.g. S1+S1b, S2+S2b. The sound stays one part each.`),
+    ] : []),
+    placesBox,
     el("div", { className: "row" }, saveBtn, saveNote),
     publishSection(P, song, refresh, settings, saveNote),
     makeLog(song.jobs?.publish));
 }
+
+// Part names are the same when they differ only in letter case and spaces, as on the site.
+const normPart = (name) => name.toLowerCase().replace(/\s+/g, "");
 
 function publishSection(P, song, refresh, settings, saveNote) {
   const pub = song.publish || {};
@@ -2956,7 +3164,8 @@ function publishSection(P, song, refresh, settings, saveNote) {
     getJSON("/api/choirs").then((reply) => {
       for (const c of reply.choirs) {
         names[c.id] = c.name;
-        choir.append(el("option", { value: c.id }, c.public ? `${c.name} (${c.id}, open to all)` : `${c.name} (${c.id})`));
+        const kind = c.public ? ", open to all" : c.staging ? ", test" : "";
+        choir.append(el("option", { value: c.id }, `${c.name} (${c.id}${kind})`));
       }
       choir.value = pub.choir || "";
       if (reply.error) {

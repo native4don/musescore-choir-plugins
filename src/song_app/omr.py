@@ -21,9 +21,13 @@ Three things about homr that this module exists to absorb:
   the run happens on a copy in a scratch directory and only the MusicXML is
   kept.
 * ``--gpu`` defaults to ``auto``, which asks whether the CUDA provider is
-  *registered* and not whether it can run. This host's card is below
-  onnxruntime's floor (issue #93), so auto would pick CUDA and die on the
-  first segnet node without falling back. Every call passes ``no``.
+  *registered* and not whether it can run. The stock onnxruntime GPU build
+  starts at compute 6.0 and this host's GTX 970 is 5.2 (issue #93), so auto
+  could pick CUDA and die on the first segnet node. So the value is never left
+  to homr: it is ``no`` unless the venv says it was installed with an
+  onnxruntime built for this card (``gpu=force`` in its marker file, written by
+  ``scripts/install-homr.sh`` with ``HOMR_ORT_WHEEL``; issue #418), and
+  ``OMR_GPU`` overrides both.
 * Its **slurs used to come out unpaired**, so a dropped stop let one slur run
   away over bars nobody engraved and swallow their syllable slots. That repair
   lived here until #144 and is now homr's own (``homr/slur_resolution.py``,
@@ -58,6 +62,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -173,6 +178,8 @@ class Engine:
     default: bool = False
     commit: Optional[str] = None
     dirty: bool = False
+    #: homr's ``--gpu`` value for this engine; see :func:`_gpu_mode`.
+    gpu: str = "no"
 
 
 #: Written by the installer into the venv it builds, saying what is in it.
@@ -194,6 +201,25 @@ def _marker(venv: str) -> dict:
     except OSError:
         return {}
     return dict(line.split("=", 1) for line in lines if "=" in line)
+
+
+#: The values homr's ``--gpu`` takes.
+GPU_MODES = ("no", "auto", "force")
+
+
+def _gpu_mode(venv: str) -> str:
+    """homr's ``--gpu`` value for the engines that run on ``venv``.
+
+    ``no`` unless the installer put an onnxruntime built for this host's card
+    into the venv and said so (``gpu=force`` in its marker, #418): a stock GPU
+    onnxruntime registers CUDA on a card it cannot run (#93), so nothing is
+    inferred from what is installed. ``OMR_GPU`` overrides it either way.
+    """
+    configured = os.getenv("OMR_GPU", "").strip().lower()
+    if configured in GPU_MODES:
+        return configured
+    marked = _marker(venv).get("gpu", "").strip().lower()
+    return marked if marked in GPU_MODES else "no"
 
 
 def _installed_vcs(venv: str) -> Dict[str, str]:
@@ -246,7 +272,8 @@ def default_engine() -> Optional[Engine]:
              or fields.get("source") or "installed")
     return Engine(key=DEFAULT_ENGINE, label=f"installed: {label}",
                   command=[binary], default=True,
-                  commit=_installed_vcs(venv).get("commit") or fields.get("commit"))
+                  commit=_installed_vcs(venv).get("commit") or fields.get("commit"),
+                  gpu=_gpu_mode(venv))
 
 
 def _venv_python() -> Optional[str]:
@@ -404,6 +431,9 @@ def engines() -> List[Engine]:
     if not python:
         return found
     used = {DEFAULT_ENGINE}
+    # A working copy runs on the installed venv's onnxruntime, so it can use
+    # the GPU exactly when the installed engine can.
+    gpu = _gpu_mode(os.path.dirname(os.path.dirname(python)))
     for path, label, commit in _worktrees(CHECKOUT):
         if not os.path.isdir(_package_dir(path)):
             continue                       # not a homr working copy after all
@@ -418,7 +448,7 @@ def engines() -> List[Engine]:
         found.append(Engine(key=key, label=f"{label} — {key}",
                             command=[python, "-c", RUN_HOMR],
                             env={"PYTHONPATH": path},
-                            commit=commit, dirty=_is_dirty(path)))
+                            commit=commit, dirty=_is_dirty(path), gpu=gpu))
     return found
 
 
@@ -647,21 +677,27 @@ def read_page(
         shutil.copy2(image_path, scratch_image)
         produced = os.path.join(scratch, base + ".musicxml")
 
-        with _queued(label or f"song app homr {base}", log, queue) as slot:
-            # homr's own output is the only place a page can be interrupted, so
-            # that is where the lease is checked (heavy_slot.Slot.guard).
-            watched = slot.guard(log)
-            watched(f"Reading {os.path.basename(image_path)} with homr")
-            argv = list(engine.command) + ["--gpu", "no", "--no-title"]
-            if bar_length is not None and engine_supports(engine, BAR_LENGTH_FLAG):
-                argv += [BAR_LENGTH_FLAG, str(bar_length)]
-            if engine_supports(engine, MARK_DOUBT_FLAG):
-                argv.append(MARK_DOUBT_FLAG)
-            else:
-                watched("This homr cannot mark the bars it is unsure of, so none are "
-                        "marked: update homr to have them checked")
-            output = _run(argv + [scratch_image], watched, timeout, engine.env)
-            slot.check()
+        flags = ["--gpu", engine.gpu, "--no-title"]
+        if bar_length is not None and engine_supports(engine, BAR_LENGTH_FLAG):
+            flags += [BAR_LENGTH_FLAG, str(bar_length)]
+        if engine_supports(engine, MARK_DOUBT_FLAG):
+            flags.append(MARK_DOUBT_FLAG)
+        else:
+            log("This homr cannot mark the bars it is unsure of, so none are "
+                "marked: update homr to have them checked")
+
+        # Another machine first, when .env names a reader for it (#437).
+        output = _read_remotely(engine, flags, scratch_image, scratch, log)
+        watched = log
+        if output is None:
+            with _queued(label or f"song app homr {base}", log, queue) as slot:
+                # homr's own output is the only place a page can be interrupted, so
+                # that is where the lease is checked (heavy_slot.Slot.guard).
+                watched = slot.guard(log)
+                watched(f"Reading {os.path.basename(image_path)} with homr")
+                output = _run(list(engine.command) + flags + [scratch_image],
+                              watched, timeout, engine.env)
+                slot.check()
 
         if not os.path.exists(produced):
             # homr deletes its own output when parsing fails, so a zero exit
@@ -907,6 +943,43 @@ def _split_measure(measure: etree._Element, spare: int) -> List[MovedRest]:
     return moved
 
 
+#: How long the remote runner may take, its own first-time setup included.
+REMOTE_TIMEOUT = 1800
+#: How long a stopped runner may take to end its job over there before it is killed.
+REMOTE_STOP_S = 30
+
+
+def _read_remotely(engine: Engine, flags: List[str], image: str, out_dir: str,
+                   log: Logger) -> Optional[List[str]]:
+    """Read ``image`` with ``REMOTE_RUNNER``, or say why not and return None.
+
+    The runner is a command, run as ``<runner> read-band <image> <out dir> <homr venv>
+    <homr flags...>``; it prints the read's log and exits 0 with ``<out dir>/<image
+    name>.musicxml`` written. Anything else and the page is read here under the heavy
+    slot, as without one. Which machine reads, and how it reads the same as here, is the
+    runner's business (the one shipped is ``src/kube_runner/runner.py``). Only the
+    installed homr is offered: a working copy of a branch is run from this host's disk.
+    """
+    reader = (os.getenv("REMOTE_RUNNER") or "").strip()
+    if not reader or not engine.default:
+        return None
+    venv = os.path.dirname(os.path.dirname(engine.command[0]))
+    produced = os.path.join(out_dir, os.path.splitext(os.path.basename(image))[0]
+                            + ".musicxml")
+    try:
+        lines = _run(shlex.split(reader) + ["read-band", image, out_dir, venv] + flags, log,
+                     REMOTE_TIMEOUT, stop_grace=REMOTE_STOP_S)
+    except HomrError as exc:
+        why = str(exc).strip().splitlines()
+        log(f"The remote runner did not read it ({why[-1] if why else 'no reason given'}); "
+            "reading it on this host")
+        return None
+    if not os.path.exists(produced):
+        log("The remote runner wrote no MusicXML; reading it on this host")
+        return None
+    return lines
+
+
 @contextmanager
 def _queued(label: str, log: Logger, queue: bool):
     """A heavy slot for this page, or the un-held Slot when the caller has one."""
@@ -918,12 +991,14 @@ def _queued(label: str, log: Logger, queue: bool):
 
 
 def _run(command: List[str], log: Logger, timeout: int,
-         extra_env: Optional[Dict[str, str]] = None) -> List[str]:
+         extra_env: Optional[Dict[str, str]] = None,
+         stop_grace: Optional[float] = None) -> List[str]:
     """Run homr, streaming its output to ``log``, and return the lines.
 
     The deadline is a timer that kills the process, not ``wait(timeout=...)``:
     reading the pipe is what blocks, and a wedged homr holding it open would
-    never reach the wait at all.
+    never reach the wait at all. With ``stop_grace`` it is asked to stop first
+    (see ``_kill``).
     """
     try:
         process = subprocess.Popen(
@@ -943,7 +1018,7 @@ def _run(command: List[str], log: Logger, timeout: int,
 
     def give_up() -> None:
         expired.set()
-        _kill(process)
+        _kill(process, stop_grace)
 
     deadline = threading.Timer(timeout, give_up)
     deadline.start()
@@ -961,7 +1036,7 @@ def _run(command: List[str], log: Logger, timeout: int,
         # The log callback carries the heavy slot's check, so it can raise
         # here. Abandoning the loop without this would leave homr running on
         # cores that have been promised to somebody else.
-        _kill(process)
+        _kill(process, stop_grace)
         raise
     finally:
         deadline.cancel()
@@ -975,8 +1050,23 @@ def _run(command: List[str], log: Logger, timeout: int,
     return lines
 
 
-def _kill(process: subprocess.Popen) -> None:
-    """Kill homr and anything it started (it runs in its own process group)."""
+def _kill(process: subprocess.Popen, grace: Optional[float] = None) -> None:
+    """Kill homr and anything it started (it runs in its own process group).
+
+    With ``grace``, SIGTERM first and SIGKILL only if it has not exited within that
+    many seconds. The remote runner needs that (#443): its homr runs detached in a pod,
+    so a SIGKILL here leaves homr on the card and the runner's job never ended.
+    """
+    if grace is not None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            process.terminate()
+        try:
+            process.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):

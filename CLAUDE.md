@@ -2,10 +2,19 @@
 
 Guidance for working in this repository.
 
+**Asked to build a practice track from a PDF?** Follow `docs/pdf-to-practice-track.md` (AGENTS.md
+says the same for other agents).
+
+This guide is about 2,900 lines. List its headings with `grep -n '^#' CLAUDE.md` and read the
+section for your task before writing steps. Live-check song-app with a desktop viewport (about
+1280 wide): below 840 px the stage bar folds into a menu (`style.css`).
+
 ## What this project is
 
-A personal toolkit for producing **choir practice tracks** from MuseScore 3
-sheet music. It has two halves:
+A personal toolkit for producing **choir practice tracks** from MuseScore
+sheet music. The app works with MuseScore 3 or 4 (#414); MuseScore 3 is still the
+default and the only one that runs the corruption check below, and the QML plugins
+are MuseScore 3 only. It has two halves:
 
 1. **MuseScore QML plugins** (`plugins/`) that run *inside* MuseScore 3 to edit
    scores and export audio.
@@ -33,6 +42,7 @@ song.py                  Launcher for the song web app (FastAPI; src/song_app/)
 clean_score.py           CLI wrapper → src/clean_score/main.py (split voices into staves)
 lyric_txt.py             CLI wrapper → src/clean_score/lyric_txt.py (lyrics <-> txt/json)
 rename_parts.py          Standalone CLI: rename Part/Instrument names + add click staff
+sing_song.py             CLI wrapper → src/sing_song/main.py (sing the parts; optionally publish)
 src/song_app/            Local web app tying the workflow together (see DESIGN.md)
   state.py               Song state machine (.song.json), slug, stages
   health.py              Health check (malformed-tick / extra-voice scan; no mutation)
@@ -52,9 +62,15 @@ src/clean_score/         Score-cleaning package
   utils/                 part_types, reversed_voices, missing_ties,
                          corrupted_measures, utils, globals
   tests/                 pytest
+src/sing_song/           Sing a song's parts with the UFR DiffSinger voices (see its section below)
+  main.py                bundle + unroll + onset check + sing + MP3s; --publish through publish.py
+  sing_ufr.py            the singer (runs in scripts/install-singer.sh's venv)
+  unroll.py, check_onsets.py, g2p.py, gate.py, spoken.py, fold.py   its steps
+  tests/                 pytest
+src/kube_runner/         REMOTE_RUNNER for a GPU in a Kubernetes cluster: read a band, sing a line
 src/score_export/        The cleaned score made ready to publish (see its section below)
   score.py               the publish copy: silent parts out, marks off, tempos, fermata hold
-  musescore.py           the MuseScore 3 CLI (run_musescore, part_names, CLI_TIMEOUT)
+  musescore.py           the MuseScore 3 or 4 CLI (run_musescore, part_names, CLI_TIMEOUT)
   clock.py               MuseScore's clock: TempoMap from the MIDI, bar order from .mpos
   engraving.py           verovio settings shared by every toolkit (RESOURCE_PATH, XML_ID_SEED)
   tests/                 pytest
@@ -215,7 +231,8 @@ bar too; a spanner starting or ending in it, any volta starting in it, a repeat 
 or a clef/key/meter change refuses. Fixes apply **in file order**: an entry before a
 `delbar` counts bars with the invented one still there, an entry after it without, so
 neither has to be renumbered; a Fix-panel pick is relocated (`relocate_picks`) in that numbering too, and the bars homr offered readings of are numbered off the scan, so `offers` maps them past the moved bars (`score_fixes.after_moves`). The printed-system bar labels (`.systems.json`) and the
-line breaks the previews take off the converted input still count the invented bar.
+line breaks the previews take off the converted input still count the invented bar; the
+lyric import and editor map the labels through the moves (`pipeline.moved_system`, #446).
 
 `insbar` (#346, `measure`, `from`) is the other way round, for a barline the scan
 lost (Kristallen den fina squeezed printed bars 2-4 into cleaned bars 3-4): an empty
@@ -241,6 +258,21 @@ back with the organ's "1." ending and end repeat copied onto an extra bar, and t
 render refused it. `volta` takes `second`, the bars of the "2." ending (a bracket may now
 close the score), and `barlen` (`measure`, `from`, `to`) gives a bar every staff rests
 through another length (`len`), for a 2nd ending printed 6/4 that cleaning cut to 4/4.
+
+`voice2` (#431, `staff`, `measure`, `from`, `to`) writes a second line into one bar of a
+part, as that part's voice 2, for a part that splits on the page for a bar or two (Butterfly's
+Sopraano 1 holds an E flat over "Love me" in bar 61). Cleaning gives a staff whose voice 2
+appears anywhere a part of its own for the whole song, which moves every later staff and makes
+the song's other fixes miss, so the line goes in after the clean instead. `to` is a `bar`
+fix's notes; the line must fill the bar, its silences written as rests (the singer reads the
+voice alone and would sing a note early after a gap). `from` is voice 2 as it reads now, `[]`
+for none (`GET /bar` returns it as `voice2`); writing it again replaces the line, keeping its
+words. Its words go in through the lyric editor's voice-2 box. Health does not list such a bar
+as `extra-voices` (it reads `fixes.json` beside the score), and the publish copy keeps both lines.
+Put the upper line in voice 1: sing_song's low line reads voice 2. `tie` and `untie` take `"voice": 2`
+(#434), with `from` and `index` read off voice 2, so the line can hold a note into the next
+bar's voice 2 (Butterfly bar 84 into 85); the tied-into note takes no syllable. List them after
+the `voice2` entries they tie.
 
 `timesig` (#353, `measure`, `from`, `to`) takes a time signature the scan invented off
 every staff (`"to": null`) or writes another in its place (`"to": "6/8"`). Kesäaamu is
@@ -361,11 +393,11 @@ So: **verify your change with its own tests, push, and read CI.** Cite the CI ru
 the PR body rather than a local "full suite passed" count.
 
 Two things follow from that, because **nothing is gated**. `main` has no branch
-protection and no required checks — deliberately, this is a one-person project merged
-by hand — and `scripts/deploy-song-app.sh` runs no tests, so a merge is on the live
-app within two minutes. **Check CI is green before commenting `/merge`.** It is the
-only thing that ran the suite, and nothing will stop you merging while it is red or
-still running.
+protection and no required checks, and `scripts/deploy-song-app.sh` runs no tests, so a
+merge is on the live app within two minutes. The deck merges a pull request by itself
+once its review passed and every GitHub check is green on its head (agentdeck#3269), so
+**a red or unfinished CI run is what holds a merge**. CI is the only thing that ran
+the suite; a person's `/merge` or Merge press goes through the same gates.
 
 The full run is still the right thing before a release you are nervous about, or when
 you have touched something with reach (`lyric_txt.py`, `main.py`, `publish.py`):
@@ -441,7 +473,8 @@ Key test modules:
 - `src/song_app/tests/test_omr.py` — added by this pull request. Most of it drives a
   stub standing in for homr, because what `omr.py` owns is the boundary: where the
   binary is found, that the MusicXML lands where the caller asked and the teaser
-  litter does not follow it, that `--gpu no` is actually on the command line, that
+  litter does not follow it, that `--gpu no` is actually on the command line (and
+  `--gpu force` once the venv says it has the GPU build, #418), that
   both streams reach the log, and that each way of failing says something — a bad
   exit, a clean exit with no file, a wedged run, a PDF handed in by mistake, homr not
   installed. It also pins the heavy slot: a page is read under one, held across the
@@ -745,7 +778,7 @@ proposed by this pull request and settled on #141. This file carries the full
 reasoning; the fork's `README.md` carries a short statement of the rule ("About this
 fork", merged as `eerovil/homr#22`).
 
-`/merge` on a card here releases a fork pull request too, as long as its description
+The deck releases a fork pull request with its card too, as long as its description
 names the card in full (`eerovil/musescore-choir-plugins#<n>` or the issue URL; a bare
 `#<n>` does not count). It goes through the same review and test gates and is not
 merged by hand.
@@ -1003,6 +1036,16 @@ state model are in `DESIGN.md`.
   `hub.emit`, one at a time per song (`job_state`). The song's display name is
   editable on the Start panel (`POST /rename`); the folder slug never changes, and a
   song already on the site shows the new name there once it is published again.
+  **Delete** (#428, `DELETE /api/songs/{slug}`, the Start panel's *Delete song*) moves
+  the folder to `songs/.trash/<slug>-<time>/` (`state.trash`) rather than removing it:
+  moving it back restores the song. Refused (409) while any job or a scan runs; a
+  published song is only named in the reply, since the site keeps its own copy.
+  `import_legacy` skips dot folders so the trash is never adopted as a song.
+  A request that loaded a song before it was deleted (and perhaps re-created under
+  the same slug) must not touch it: `Song.check_still_here` compares the loaded
+  copy's `created_at` with the file, under `song_lock`, and every save and every job
+  start (`state.start_job`, song lock then job lock) goes through it; `create`
+  claims a slug under the same lock. A mismatch is `SongGone`, a 404.
   **Publish** (`publish.py`, `POST /publish`, body `{choir, settings}`) is where a
   song ends: it sends the song to the Cloudflare stemmanauhat site
   (eerovil/stemmanauhat-cf), which draws the score with OpenSheetMusicDisplay and
@@ -1033,13 +1076,24 @@ state model are in `DESIGN.md`.
   `choirs` table (`GET /api/choirs`), keeps the last list in `songs/.choirs.json`
   for when Cloudflare is out of reach, and a publish is refused (502) until a live
   read succeeds. There is no list in the code, and the choir is no longer guessed
-  from the song's voicing; `public` is the one id every site has.
+  from the song's voicing; `public` is the one id every site has. A choir marked
+  `staging` is the site's test list (#422): publishing there removes the song from
+  no other choir, while publishing to a choir still removes it from the test list.
+  Publishing to a choir leaves every other choir's listing alone (#450: the old
+  one-private-choir rule took songs shared by `joy` and `joy-alumnit` off one of them).
   **Part names** (#402) are set there too: cleaning renames every part by guessing
   from pitch unless the song has a voicing, so older songs reached the site with
   tenors in a women's choir. `publish.part_names` keeps one name per singing part,
   top staff first, and `score.prepare` writes them into the publish copy's
   `trackName` and instrument long/short names, so the MIDI tracks, the MusicXML and
-  the database agree; the cleaned score is never renamed. Empty or repeated names
+  the database agree; the cleaned score is never renamed.
+  **New part names go into the site's voice tree** (#430, stemmanauhat-cf#107): the
+  site carries a singer's part between songs by a tree of voices in D1 and refuses
+  a name in neither `voices` nor `unplaced_parts`. `POST /api/voice-tree` says which
+  names are new and offers the places; the panel asks, per name, another name for a
+  place, a new place under one, or no place, saved as `publish.places`, and
+  `publish.place_statements` writes those rows before the upload. Never guessed: an
+  agent publishing asks Eero. A site without the tables is published to as before. Empty or repeated names
   are refused (the site tells parts apart by name), and a re-clean that changes
   the number of parts makes Publish refuse until they are checked
   (`server._publish_parts` says so on the panel).
@@ -1456,15 +1510,32 @@ state model are in `DESIGN.md`.
   reversed and the extra is **load-bearing**: onnxruntime has moved out of the base
   dependencies into `cpu`/`cuda`/`rocm`, so a plain install of `main` has no inference
   runtime at all and fails at the first parse rather than at install time. `HOMR_SOURCE`
-  therefore names `homr[cpu] @ git+...`. CPU is still the only one this host can use.
+  therefore names `homr[cpu] @ git+...`; `HOMR_ORT_WHEEL` swaps it for the GPU build below.
   What the module absorbs is the CLI's shape. homr takes one image, writes
   `<image>.musicxml` **beside it**, has no `--output`, and drops a `_teaser.png` next
   to the input, so the run happens on a copy in a scratch dir and only the answer is
-  moved to where the caller asked. `--gpu` is passed **`no`** every time and never
-  left at `auto`: auto asks whether the CUDA provider is *registered*, not whether it
-  can run, and this host's GTX 970 is sm_52 against onnxruntime's sm_60 floor, so auto
-  would pick CUDA and die on the first segnet node without falling back (#93). Note
-  the value is `no`, not `off`. Output is streamed line by line to a `log` callback —
+  moved to where the caller asked. `--gpu` is never left at `auto`: auto asks whether
+  the CUDA provider is *registered*, not whether it can run, and this host's GTX 970 is
+  sm_52 against the stock onnxruntime's sm_60 floor, so auto would pick CUDA and die on
+  the first segnet node without falling back (#93). The value is `no` (not `off`)
+  unless the venv's `homr-engine.txt` says `gpu=force`, and `OMR_GPU` overrides both.
+  **The 970 can read** (#418): `scripts/onnxruntime-sm52/build.sh` builds onnxruntime
+  1.29.0 for compute 5.2 in an NVIDIA CUDA 12.8 container (`patch.py` beside it says what
+  its source needed: a float fallback for one half-precision kernel, and the MoE and
+  4-bit MatMulNBits ops taken out because their kernels only exist from 7.5), and
+  `HOMR_ORT_WHEEL=<wheel> scripts/install-homr.sh` puts it in the venv with pinned CUDA
+  12.8 / cuDNN 9.10.2 wheels, writes `gpu=force`, and keeps the wheel for later plain
+  runs. Two traps, both silent CPU fallbacks: a library with an undefined symbol does
+  not load (the build now refuses one), and a locally built wheel's `_ld_preload.py`
+  finds `libcudart` only on the system path and otherwise sets `ORT_CUDA_UNAVAILABLE`
+  (the installer replaces it). homr's GPU route uses its fp16 models; this card has no
+  fast fp16 but it is still the quicker route (5 systems: fp16 8.6 s and 10 s of CPU time
+  a system, fp32 10.6 s and 17 s). Measured on the Virta fixture's 15 systems
+  (`--mark-doubt`, 200 dpi): GPU 8.6 s and 11 s of CPU time a system against the CPU's
+  13.7 s and 38 s. The readings are not identical — cuDNN's arithmetic is not the CPU's,
+  and borderline calls flip: 10 of 15 systems have the same notes, and across the other
+  five the GPU loses 5 notes the CPU reads (shared unison heads) and gains 2 the CPU
+  misses, of 856. Every differing bar carries a `⚠` mark in both readings. Output is streamed line by line to a `log` callback —
   a page is ~30s and a song 2–5 minutes, so that is the progress channel #93 asked
   for — and every failure raises `HomrError` carrying the tail of what homr said.
   Including the quiet one: homr **deletes its own MusicXML when parsing raises**, so a
@@ -1481,6 +1552,16 @@ state model are in `DESIGN.md`.
   stops with `SlotLost`). homr's own output lines are the checkpoints `Slot.guard`
   needs, and abandoning the read loop kills homr's process group — otherwise it would
   keep running on cores that have been handed away.
+  **Another machine may read a band first** (#437, #439): when `.env` names
+  `REMOTE_RUNNER`, `read_page` runs it as `<runner> read-band <image> <out dir> <homr venv>
+  <homr flags...>` for the installed homr (never a branch engine), streams what it
+  prints into the log, and uses `<out dir>/<image>.musicxml` when it exits 0 with the file
+  written; anything else reads the band here under the heavy slot, as without one. A runner
+  given up on (`REMOTE_TIMEOUT`, or an error while reading) gets SIGTERM and `REMOTE_STOP_S`
+  (30 s) to end its job over there before SIGKILL (#443); a local homr is killed at once. The
+  runner shipped is `src/kube_runner/runner.py` (see "Where heavy work runs" in
+  `docs/pdf-to-practice-track.md`); on the owner's host it reads on eero-pc's GPU.
+  `test_remote_runner.py` pins the contract with a stub runner.
   **One slot per page, not one per song.** The page is the unit `read_page` owns and
   each page writes its own MusicXML, so releasing between pages lets a suite in, and an interruption costs the page in flight rather than the song — the
   pages already read are on disk. A caller that would rather hold one lease across a
@@ -2116,7 +2197,9 @@ state model are in `DESIGN.md`.
 - **Every clean asks MuseScore 3 whether it would open the result** (#235). MuseScore
   checks a score as it opens it (`Score::sanityCheck`: voice 1 of each staff must fill
   the bar exactly, no other voice may run past it) and calls one that fails
-  "corrupted" -- on Sangerhilsen the app crashed instead. Only the app runs that check;
+  "corrupted" -- on Sangerhilsen the app crashed instead. **MuseScore 3 only**: with
+  MuseScore 4 as `MUSESCORE_CLI_PATH` the check answers `None` and the song records
+  "not checked" (#416). Only the app runs that check;
   a command-line export does not, which is why every render went through and nobody
   heard of it until a person opened the file. The one export that does run it is
   `-o x.mlog`, so `pipeline.musescore_check` asks MuseScore itself rather than keeping
@@ -2528,13 +2611,28 @@ timing are the same parts on the same clock.
   of each bar; `"start"` is the tempo the copy opens at. Kept beside the BPM rather
   than in `fixes.json`: it is a playback setting, a re-clean must not need it
   replayed, and changing it needs only a re-publish.
+- **Above five parts, parts share staves in the picture** (#420, `staff_groups.py`,
+  `score.merge_staves`). The site's score of a big song was too tall to read, so
+  once the split score has more than `staff_groups.MAX_STAVES` (5) singing parts,
+  every part goes back onto the staff the PDF prints it on (owner's rule: all of
+  them, not just enough to reach five). The pairs come from `lyricsStaffMap`, or for
+  a per-system song the pairs sharing a printed staff in the most bars (a part
+  cannot move between staves on the site), or failing both a guess from the names
+  (a b-part with its main part, then S1+S2). The upper part takes voices 1 and 3
+  and the lower 2 and 4, since MuseScore stems 1/3 up and 2/4 down and a unison
+  then shares a notehead; a pair needing more is left apart and logged. Only
+  `score.musicxml` is merged: the MIDI and the timing come off the unmerged copy,
+  and the manifest's parts carry `staff` and `voices` so the site knows where each
+  part is drawn. The Publish panel's *Shared staves* field saves
+  `publish.staff_groups` (null: automatic, `[]`: none). It is #246's video option
+  brought back, which #400 removed with the videos.
 - **A fermata holds one beat longer than written** (#380, `score.hold_fermatas`).
   Cleaning writes `timeStretch=3`, which held a dotted half for six seconds at 90 bpm.
   The copy rewrites every fermata's stretch so it adds one beat (a dotted quarter in
   6/8), worked out from the span MuseScore stretches: from the fermata's beat to the
   next note or rest on *any* staff. A fermata marked not to play is left alone.
 
-`musescore.py` is the MuseScore 3 command line (`run_musescore`, bounded by
+`musescore.py` is the MuseScore 3 or 4 command line (`run_musescore`, bounded by
 `CLI_TIMEOUT` because a wedged MuseScore otherwise hangs the publish) and the part
 names a score carries (`part_names`), which the site matches to the MIDI tracks.
 `engraving.py` is what every verovio toolkit in the app is set up with:
@@ -2631,30 +2729,67 @@ Worked through twice, with the wrong turn left in, in
 
 ## A new song from PDF to the site (agents)
 
-An errand like "new song, put it on the new stemmanauhat site" runs every stage here, then
-publishes. The playbook above is how to read the page; this is the rest, learnt on Insomnis
-(eerovil/eeron-omat-taskit#33). The running app is at `http://localhost:8123`; drive it through its API.
+The flow is `docs/pdf-to-practice-track.md`. What is particular to this host:
 
-- **Check every bar of every part** against the page with `GET /api/songs/<slug>/bar`, before
-  lyrics. On Insomnis the notes were nearly all right; the scan swapped two parts in one chord and
-  lost or merged about twenty melisma slurs.
-- **Every correction goes in `fixes.json`**, then clean again (`POST /clean`). A hand edit to the
-  cleaned score, red marks included, is gone at the next clean. An `unmark` entry, saying what
-  was checked, is how a homr `slur?`/`tie?` mark comes off.
-- **Lyrics:** give each part its own entry and name that part in `parts`, rather than relying
-  on the mapping: `{"staff_number": 1, "text": "...", "parts": ["T1"]}`, then `["T2"]`, `["B1"]`,
-  `["B2"]` for the others (one entry per part per printed system). Each `too_many`/`too_few`
-  left over was a slur the page prints differently (see the table above).
-- **Tempo and credits:** save the printed tempos and who wrote the song with
-  `POST /api/songs/<slug>/publish-settings` (`bpm`, `tempo_changes`, `credits` with
-  `composer`/`lyricist`/`arranger`); the score has no tempo after a clean, and the
-  credits otherwise come from the score's metaTags.
-- **Publish** from the app: `POST /api/songs/<slug>/publish` with `{"choir": "jm"}`
-  (it needs the Review approval and the Cloudflare keys in `.env`, and refuses
-  without either). `jm` is the men's choir; only public-domain songs go in `public`.
-  The stand-in bundle scripts in stemmanauhat-cf (`scripts/song-app-bundle.py`,
-  `scripts/publish-songs.*`) are superseded by this.
-- Leave the Review approval to Eero.
+- The running app is at `http://localhost:8123` (`song-app.service`); drive it through its API.
+- Run `sing_song.py` as an `agentdeck job` (a few minutes on the GTX 970), with the desktop's
+  `DISPLAY` and `XAUTHORITY` (`systemctl --user show-environment`): MuseScore needs a screen
+  even to export.
+- Every live Finnish song has AI-sung parts (eeron-omat-taskit#36): a new song is done when it
+  is published **and** sung. Publish only when the errand asks, to the choir it names: `jm` is
+  the men's choir, `naiskuoro` the women's, `joy`, `joy-alumnit` and `yl` mixed, `laurille`
+  three treble parts (`--voice LYSE`), `testi` the test list; only public-domain songs go in
+  `public`. A part name the site's voice tree does not know: ask Eero where it goes, never guess.
+- Check the live row afterwards: `cd ~/stemmanauhat-cf && ./scripts/run.sh --cloudflare corepack
+  pnpm exec wrangler d1 execute stemmanauhat --remote --command "SELECT choir, prefix, parts,
+  duration FROM songs WHERE slug='<slug>'"`.
+- Leave the Review approval to Eero; `sing_song.py --publish` does not need it.
+- A change to how a sound is sung is Eero's call by ear: explain it, and check it with
+  `DUMP_TOKENS=<file>` (the planned sounds and their lengths, without singing) before rendering.
+  The by-ear benchmark that tunes `sing_ufr.py` lives in eeron-omat-taskit (`finnish-sing-bench`).
+
+## Singing (`src/sing_song/`)
+
+`sing_song.py <slug>` builds the bundle with `publish.build_bundle` (the Publish settings'
+tempo, part names, credits), then for each part: `unroll.py` writes each line (top and bottom
+of the staff) on the bundle's clock, `check_onsets.py` stops the run unless every note starts
+within 50 ms of a note in `score.mid`, `spoken.py` cuts a sentence on one held chord into a
+syllable a note, `g2p.py` gives the sounds of a song not in Finnish, `sing_ufr.py` sings it
+(UFR DiffSinger: LYSE for S/A/M parts, REMY for T/B), two different lines of a part are mixed
+at half volume each, and `gate.py` fades the rests where the whole part rests (the voice
+leaves a hiss). `--fold-divisi` folds lettered divisi parts (`S1b`) into their part as further
+voices (Katedralen, eeron-omat-taskit#104). `--publish <choir>` hands the MP3s to
+`publish.publish` as `Bundle.sung`. It came from eeron-omat-taskit's `sing-song/` (#439),
+where its history is. The bundle's `words.json` (`sung_words()`) lists each part's notes with
+the syllable sung on each; `--publish` sends it along (`Bundle.words`), and the site sings a
+note several parts start together once only where they sing the same syllable
+(eeron-omat-taskit#110: the tenor's "kis" fell on the bass's "dum"). `python -m
+src.sing_song.add_words` added it once to the songs sung before it, only for parts whose every
+note (pitch, place, words) still matches the live `score.musicxml`. With `REMOTE_RUNNER` set, lines are shared with the runner as each side
+is free (`share()`, `<runner> sing-line <line.json> <out.wav> <voice>`); a line it fails is
+sung here and it gets no more.
+
+`src/kube_runner/runner.py` is that runner for a GPU node in a Kubernetes cluster (eero-pc
+here, `REMOTE_KUBE_CONTEXT=eero-pc`), moved from eeron-omat-taskit's `homr-eero-pc/` (#439).
+Stdlib only, so the app's service can run it as a file. One pod per job kind (`homr/reader`,
+`sing/singer`), its venv on the node's disk, one job on the card at a time (a lock under
+`~/.cache/musescore-choir-remote`), and a kind that failed is not asked again for five
+minutes. Every step is a short `kubectl exec`, retried, because eero-pc's long streams were
+cut (#103). The reader builds its homr venv from this host's pins and checks it file by file.
+`src/kube_runner/tests/` runs it against a fake cluster.
+
+**Re-sings** (#453): `SINGER_VERSION` in `sing_ufr.py` is bumped when the singing rules change; a
+sung publish records it as `singer_version` on that choir's publish record, and a run writes its
+progress to `songs/<slug>/.sing-run.json` (`progress.py`). The song list (`GET /api/resing`,
+`song_app/resing.py`) calls a song pending in a choir where the site lists it sung (its D1 `songs`
+rows, kept in `songs/.site-songs.json`) and this app did not publish that upload with the current
+version; the test list never counts.
+
+The singer runs in its own venv (`scripts/install-singer.sh`, default
+`~/.local/share/musescore-choir-plugins/sing-venv`; CUDA 11 onnxruntime when there is an NVIDIA
+card, because the GTX 970 is below newer builds' floor). The voices are not in the repo: their
+terms forbid re-hosting them, so `UFR_DIR` in `.env` points at a downloaded pack
+(`/var/tmp/i36-ufr` here). The singer is not deterministic: two runs are two takes.
 
 ## MuseScore plugins (`plugins/`)
 
@@ -2746,13 +2881,15 @@ script. The deploy does not touch it, on purpose: it is not in `pip-requirements
 so a merge cannot churn 150 MB of model weights, and `/healthz` does not know it
 exists.
 
-Issues are worked from a GitHub Project board by the AgentDeck poller (instance
-`musescore`, unit `agentdeck-poller@musescore.timer`). Its manifest is **not** in this
-repo: it lives in `~/agentdeck/poller/manifests/musescore/`, with every project's
-alongside it, and the host half (paths, account, token) is the uncommitted overlay in
+Issues are worked by AgentDeck (instance `musescore`, unit
+`agentdeck-poller@musescore.timer`): the `claude` label starts a Work, and the deck runs
+it. Its manifest is **not** in this repo: it lives in
+`~/agentdeck/poller/manifests/musescore/`, with every project's alongside it, and the
+host half (paths, account, token) is the uncommitted overlay in
 `~/.local/share/agentdeck/poller/instances/musescore/`. Comment `/claude <what you want>`
-on an issue to start or steer work; `/merge` from **In review** releases it. Nothing
-merges without that comment.
+on an issue to steer work. The deck merges a pull request by itself once its review
+passed and its checks are green on the same head, so nobody presses Merge
+(agentdeck#3269); the `paused` label holds a Work, and a draft is never merged.
 
 ## Conventions & gotchas
 

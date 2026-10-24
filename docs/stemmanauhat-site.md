@@ -32,8 +32,9 @@ songs/<choir>/<slug>/<version>/      version = UTC time, 20261009T120000Z
 ```
 
 `choir` is one of the ids in the site's D1 `choirs` table (`SELECT id, name,
-public FROM choirs`), which song-app reads to offer them (#408); `public` is the
-one every site has. On the original copy they are `jm`, `naiskuoro` and `public`. `slug` is song-app's folder name and
+public, staging FROM choirs`), which song-app reads to offer them (#408); `public` is the
+one every site has. A choir with `staging = 1` is the site's test list
+(stemmanauhat-cf#73, `testi` on the original copy); a site without the column has none. On the original copy they are `jm`, `naiskuoro` and `public`. `slug` is song-app's folder name and
 never changes.
 
 **No audio is published.** The site plays `score.mid` with a piano soundfont and
@@ -53,6 +54,20 @@ unread.
  "midi": "score.mid", "parts": [{"name": "T1"}, {"name": "T2"}, ...],
  "duration": 96.375, "composer": "…", "lyricist": "…"}
 ```
+
+**Parts that share a staff** (#420). A song with more than five singing parts
+is drawn with its parts back on the staves the page prints them on, so
+`score.musicxml` can have fewer parts than `parts`. Then every entry says where
+it is drawn: `staff` is the 0-based `<part>` of `score.musicxml` and `voices` the
+`<voice>` numbers of its notes there:
+
+```json
+"parts": [{"name": "S1", "staff": 0, "voices": [1]},
+          {"name": "S1b", "staff": 0, "voices": [2]}, ...]
+```
+
+An entry without them is one part on its own staff in voice order, as every song
+published before had. The MIDI still has one track per part.
 
 `composer`, `lyricist` and `arranger` are the credits set on song-app's Publish
 panel (prefilled from the score's own metaTags until someone saves them). Each is
@@ -79,13 +94,34 @@ columns song-app writes:
   PRIMARY KEY (choir, slug)
 ```
 
-Publishing upserts one row. A song can be in the `public` list and one
-choir's list at once (#384): publishing to `public` deletes nothing, and
-publishing to a choir deletes the song's row in any *other* private choir (a
-move between `jm` and `naiskuoro`) but never its `public` row — the same rule as
-the site's own hand-publish script (eerovil/stemmanauhat-cf#20). song-app keeps
+Publishing upserts one row. A song can be in any number of lists at once:
+publishing to `public` or to a choir deletes no other choir's row (#450; until
+then a publish to a choir deleted the song's row in any *other* private choir,
+the rule of the site's hand-publish script, eerovil/stemmanauhat-cf#20, which
+took songs shared by `joy` and `joy-alumnit` off one of them). Publishing to the
+test list deletes nothing either (#422), so a fix tried out there leaves the song
+on its choirs' lists; publishing to a choir still takes it off the test list. song-app keeps
 one publish record per choir, so replacing a version deletes only that choir's
 old files.
+
+### The voice tree
+
+The site carries a singer's part from song to song with a tree of voices
+(stemmanauhat-cf#107, its migration 0009): `voices (id, parent, name_fi, name_en,
+names)`, at most four levels, and `unplaced_parts (name)` for names in no place on
+purpose. Names are compared ignoring letter case and spaces, and a name ending in
+"b" counts when the name without it is above the fourth level. song-app reads
+both tables and, for each part name in neither, the Publish panel asks where it
+goes (#430); where a part belongs is the publisher's call, never a guess. Before
+anything goes up, the publish writes:
+
+- another name for a place: `UPDATE voices SET names = json_insert(names, '$[#]', ?)`
+- a new place under one: an `INSERT INTO voices` row whose id and both names are
+  the part name (made unique), until someone renames it on the site
+- no place: `INSERT OR IGNORE INTO unplaced_parts`
+
+A part name with no answer refuses the publish. A database without the tables
+is published to as before.
 
 ## timing.json
 
