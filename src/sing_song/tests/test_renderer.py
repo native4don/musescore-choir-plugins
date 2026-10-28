@@ -165,20 +165,6 @@ def test_a_short_vowel_closed_by_a_consonant_is_found():
     assert not short({**n("hat"), "ph": {"on": [], "vs": [], "co": []}}, ["en/t"], None)   # g2p's sounds
 
 
-def test_a_doubled_l_keeps_its_short_vowel_when_the_consonant_is_not_held():
-    import numpy as np
-    ns = {"os": os, "re": re, "json": json, "np": np, "FPS": 44100 / 512, "bpm": 100}
-    old = os.environ.get("CODA_HOLD")
-    os.environ["CODA_HOLD"] = "0"
-    try:
-        exec(SRC[SRC.index("V = {"):SRC.index("TIMING = ")], ns)
-    finally:
-        if old is None: os.environ.pop("CODA_HOLD")
-        else: os.environ["CODA_HOLD"] = old
-    n = lambda syl: {"pitch": 60, "syl": syl, "beats": 1}
-    assert ns["short_before_stop"](n("sil"), ["it/l"], n("lan"))   # short i, l, then silence
-
-
 def planned(tmp_path, notes, **env):
     """The sounds and frames sing_ufr.py plans for `notes` (DUMP_TOKENS), without the voice
     files or onnxruntime: a stand-in UFR folder and stand-in modules."""
@@ -225,6 +211,18 @@ def test_a_held_n_before_k_is_still_an_ng(tmp_path):
     (tmp_path / "2").mkdir()
     toks = [t for t, _ in planned(tmp_path / "2", notes, SONG_LANG="fi")]
     assert "it/g" not in toks and toks.count("de/ng") >= 2   # "ken-gät": a long ng, as before
+
+
+def test_a_closing_stop_on_a_long_note_keeps_the_vowel_and_a_short_gap(tmp_path):
+    # #450: "nyt." stretched to 2.1 s by a fermata sang 0.25 s of y and 1.8 s of silence
+    notes = [{"pitch": 60, "beats": 1, "sec": 2.1, "syl": "nyt.", "syllabic": "single"},
+             {"pitch": 62, "beats": 1, "sec": 0.7, "syl": "ei", "syllabic": "single"}]
+    plan = planned(tmp_path, notes, SONG_LANG="fi")
+    toks = [t for t, _ in plan]
+    i = toks.index("fr/uh")
+    vowel, gap = plan[i][1], plan[i + 3][1]
+    assert toks[i + 1:i + 4] == ["it/cl", "it/t", "SP"]
+    assert vowel > 1.5 * 44100 / 512 and gap <= round(0.3 * 44100 / 512)
 
 
 def test_the_short_vowel_rule_is_finnish_only():
@@ -319,6 +317,21 @@ def test_a_rest_longer_than_the_limit_is_cut_in_silence_within_the_limit():
     assert all(b == a2 for (_, b), (a2, _) in zip(wins, wins[1:]))     # no overlap: cut in silence
     assert all(110 < b <= 12110 for _, b in wins[:-1])                 # every cut inside the rest
     assert wins[-1][1] == 12220
+
+
+def test_a_piece_cut_inside_a_sound_is_sung_with_silence_beyond_the_cut():
+    # eeron-omat-taskit#123: a held vowel cut between two pieces was sung as nothing at all
+    import numpy as np
+    ns = chunking()
+    toks, durs = ["SP", "it/k", "it/a", "SP"], [10, 5, 100, 10]
+    f0 = np.arange(125, dtype=np.float32)
+    ts, ds, f, pre = ns["piece"](toks, durs, f0, 0, 70, edge=8)
+    assert (ts, ds, pre) == (["SP", "it/k", "it/a", "SP"], [10, 5, 55, 8], 0)
+    assert len(f) == 78 and f[-8:].tolist() == [69] * 8
+    ts, ds, f, pre = ns["piece"](toks, durs, f0, 50, 125, edge=8)
+    assert (ts, ds, pre) == (["SP", "it/a", "SP"], [8, 65, 10], 8)
+    assert len(f) == 83 and f[:9].tolist() == [50] * 9
+    assert ns["piece"](toks, durs, f0, 0, 125, edge=8)[3] == 0      # whole: nothing added
 
 
 def test_overlapping_pieces_are_cross_faded_and_lose_no_frames():

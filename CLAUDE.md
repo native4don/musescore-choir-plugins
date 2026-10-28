@@ -325,6 +325,13 @@ difference and was fixed in the text. `STEPS.md` records how each stage
 was produced, including a wrong conclusion and its correction — worth reading before
 trusting a tidy-looking diagnosis of a scanned score.
 
+Before writing a pitch fix from a scan, crop the bar from the PDF at 300 dpi
+(`pdftoppm -r 300`), compare the glyph with other accidentals on the same page, and
+confirm which voice it belongs to.
+Before reporting that a part sounds an octave off, check the staff's clef (treble-8 or
+plain treble) and the pitches stored in the score: a tenor line in treble-8 sounds an
+octave below what it looks like, so it is usually right.
+
 ### The OMR benchmark's public-domain slice
 
 `fixtures/omr-benchmark/` is added by this pull request: three real scanned pages the
@@ -363,7 +370,8 @@ in the main checkout at `~/musescore-choir-plugins`. Interactive sessions use th
 worktree too (`git worktree add .worktrees/<topic> -b <branch> origin/main`), never that
 shared checkout: several sessions share it, and a dirty one blocks the deploy timer. Without them nothing runs: there is
 no interpreter with lxml in it, `MUSESCORE_CLI_PATH` is unset, and the app has no songs.
-Link them in before doing anything else:
+Link them in before doing anything else, and check they resolve before the first build or
+test:
 
 ```bash
 for f in .venv .env songs; do ln -sfn ~/musescore-choir-plugins/"$f" "$f"; done
@@ -1222,7 +1230,9 @@ state model are in `DESIGN.md`.
   voice-2 box exists only where that voice has notes.
   **Verse tabs** keep you on the system. The browser sends only the boxes changed,
   `{"verse": n, "boxes": {system: {key: text}}}` (`blocks_from_boxes`, addressed by
-  staff id — a part may be named "1", or two parts the same), and an emptied box
+  staff id — a part may be named "1", or two parts the same: key every new box and part
+  lookup by staff id, never part name, and run the round trip over every song in `songs/`
+  before review), and an emptied box
   takes its words out. **← Previous / Next →** import first and stay on the system if
   the import warned; pressing again moves on. **Show what landed** swaps the picture for
   `GET /landed/{n}`: MuseScore exports the score and verovio engraves only that system's
@@ -1263,8 +1273,10 @@ state model are in `DESIGN.md`.
   two-jobs-on-four-cores case the queue exists to prevent. So that stops the work
   (`SlotLost`). Stopping a call that lasts minutes needs somewhere to stop *at*:
   `Slot.guard` wraps the work's own log callbacks. (The scrolling video render was the
-  first user and is gone; publishing is a few quick MuseScore exports and takes no
-  slot.)
+  first user and is gone. Publishing takes one too, around its MuseScore exports:
+  `server.py`'s publish job runs under `heavy_slot`.) Run song_app tests that publish with
+  `env -u AGENTDECK_URL -u AGENTDECK_API_URL`: a deck chat sets `AGENTDECK_URL`, so
+  `heavy_slot` waits for a real host slot and the run hangs until its timeout.
   `src/song_app/tests/test_heavy_slot.py` pins those rules: every way the deck can fail
   to co-operate leaves the work running, a lease is renewed while the work runs and
   released when it raises, and a 404 heartbeat stops it.
@@ -1535,7 +1547,17 @@ state model are in `DESIGN.md`.
   13.7 s and 38 s. The readings are not identical — cuDNN's arithmetic is not the CPU's,
   and borderline calls flip: 10 of 15 systems have the same notes, and across the other
   five the GPU loses 5 notes the CPU reads (shared unison heads) and gains 2 the CPU
-  misses, of 856. Every differing bar carries a `⚠` mark in both readings. Output is streamed line by line to a `log` callback —
+  misses, of 856. Every differing bar carries a `⚠` mark in both readings.
+  **The GTX 1660 Super reads with the stock build** (eeron-omat-taskit#138): this host's
+  card has been a Turing GTX 1660 Super (compute 7.5, 6 GB) since 2026-10-28, and the 970
+  build above has no code for it (`cudaErrorNoKernelImageForDevice`). `HOMR_GPU=cuda
+  scripts/install-homr.sh` installs homr's `[cuda]` extra instead and keeps it for the Update
+  button (`gpu_extra=cuda` in the marker; `HOMR_GPU=cpu` goes back to the CPU). The card
+  gives only NaN with homr's fp16 segmentation model, so homr falls back to the fp32 one on
+  the card (eerovil/homr#99); its fp16 encoder and decoder are fine. Page 1 of Virta at
+  200 dpi: 222 notes, every pitch and length the same as the CPU's, 10.2 s against 15.2 s.
+  eero-pc no longer reads (Eero's choice, #138): the runner copies this host's venv and needs
+  its `ort_wheel`, so it says it has none to copy and the page is read here. Output is streamed line by line to a `log` callback —
   a page is ~30s and a song 2–5 minutes, so that is the progress channel #93 asked
   for — and every failure raises `HomrError` carrying the tail of what homr said.
   Including the quiet one: homr **deletes its own MusicXML when parsing raises**, so a
@@ -2226,6 +2248,11 @@ state model are in `DESIGN.md`.
   fails); `POST /undo-clean` puts the newest back. The stash records the fingerprint
   the clean made (`mark_made`), and Undo refuses (409) once the score differs from it,
   since anything done after the clean would be lost. `fixes.json` is not restored.
+  A new job that writes the song shares the busy guard with every sibling job, both ways:
+  it refuses while they run, and they refuse while it runs. There is no single list: add its
+  kind to every `state.start_job(..., ("scan", "clean", "check", "publish"))` exclusion tuple
+  in `server.py`, to `_publish_busy` and to `/undo-clean`'s own running-job check, and test
+  both directions. Its undo refuses once the score has changed since.
 - **Hazards guarded:** re-cleaning warns it discards manual edits (the Clean
   button label changes once a cleaned file exists); lyric import uses `--replace`.
   No automatic LLM (users have no API key) — the lyrics stage supports either a
@@ -2732,9 +2759,13 @@ Worked through twice, with the wrong turn left in, in
 The flow is `docs/pdf-to-practice-track.md`. What is particular to this host:
 
 - The running app is at `http://localhost:8123` (`song-app.service`); drive it through its API.
-- Run `sing_song.py` as an `agentdeck job` (a few minutes on the GTX 970), with the desktop's
-  `DISPLAY` and `XAUTHORITY` (`systemctl --user show-environment`): MuseScore needs a screen
-  even to export.
+- Run `sing_song.py` as a background command in your own chat (a few minutes on the card),
+  not as an `agentdeck job`: the job queue's one heavy slot is shared with other projects' tests,
+  and singing needs the card, not the processor (eerovil/eeron-omat-taskit#123). Check the card
+  is free first, pause 60 s between songs (a continuous run crashed the old GTX 970 and needed a
+  reboot), and split a long batch into runs under 2 hours, the background command's limit.
+  Give it the desktop's `DISPLAY` and `XAUTHORITY` (`systemctl --user show-environment`):
+  MuseScore needs a screen even to export.
 - Every live Finnish song has AI-sung parts (eeron-omat-taskit#36): a new song is done when it
   is published **and** sung. Publish only when the errand asks, to the choir it names: `jm` is
   the men's choir, `naiskuoro` the women's, `joy`, `joy-alumnit` and `yl` mixed, `laurille`
@@ -2755,7 +2786,7 @@ tempo, part names, credits), then for each part: `unroll.py` writes each line (t
 of the staff) on the bundle's clock, `check_onsets.py` stops the run unless every note starts
 within 50 ms of a note in `score.mid`, `spoken.py` cuts a sentence on one held chord into a
 syllable a note, `g2p.py` gives the sounds of a song not in Finnish, `sing_ufr.py` sings it
-(UFR DiffSinger: LYSE for S/A/M parts, REMY for T/B), two different lines of a part are mixed
+(UFR DiffSinger: every part of a men's song REMY and of a women's LYSE, by the song's voicing; in a mixed song or one with no voicing, LYSE for S/A/M parts and REMY for T/B, and a part called just "Solo" stops the run), two different lines of a part are mixed
 at half volume each, and `gate.py` fades the rests where the whole part rests (the voice
 leaves a hiss). `--fold-divisi` folds lettered divisi parts (`S1b`) into their part as further
 voices (Katedralen, eeron-omat-taskit#104). `--publish <choir>` hands the MP3s to
@@ -2773,7 +2804,7 @@ sung here and it gets no more.
 here, `REMOTE_KUBE_CONTEXT=eero-pc`), moved from eeron-omat-taskit's `homr-eero-pc/` (#439).
 Stdlib only, so the app's service can run it as a file. One pod per job kind (`homr/reader`,
 `sing/singer`), its venv on the node's disk, one job on the card at a time (a lock under
-`~/.cache/musescore-choir-remote`), and a kind that failed is not asked again for five
+`HOMR_EERO_PC_STATE`, default `~/.cache/homr-the GPU machine`), and a kind that failed is not asked again for five
 minutes. Every step is a short `kubectl exec`, retried, because eero-pc's long streams were
 cut (#103). The reader builds its homr venv from this host's pins and checks it file by file.
 `src/kube_runner/tests/` runs it against a fake cluster.
@@ -2787,7 +2818,8 @@ version; the test list never counts.
 
 The singer runs in its own venv (`scripts/install-singer.sh`, default
 `~/.local/share/musescore-choir-plugins/sing-venv`; CUDA 11 onnxruntime when there is an NVIDIA
-card, because the GTX 970 is below newer builds' floor). The voices are not in the repo: their
+card, because eero-pc's GTX 970 is below newer builds' floor; it runs on this host's GTX
+1660 Super as it is, eeron-omat-taskit#138). The voices are not in the repo: their
 terms forbid re-hosting them, so `UFR_DIR` in `.env` points at a downloaded pack
 (`/var/tmp/i36-ufr` here). The singer is not deterministic: two runs are two takes.
 
