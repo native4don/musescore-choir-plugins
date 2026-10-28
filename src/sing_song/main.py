@@ -102,6 +102,13 @@ def song_voicing(slug):
         return None
 
 
+def pronounce_env(song_dir):
+    """{"PRONOUNCE": path} when the song has its own pronunciation list (pronounce.json in its
+    folder), for g2p.py to sing those words as listed before the dictionary; else {}."""
+    path = os.path.join(song_dir, "pronounce.json")
+    return {"PRONOUNCE": path} if os.path.isfile(path) else {}
+
+
 def build_bundle(song_app, slug, out, folded=None):
     """The song's bundle in `out`, built by song-app's publish code; returns (manifest, cleaned,
     groups). With `folded` (a path), the bundle is built from the cleaned score with its lettered
@@ -313,7 +320,8 @@ def sung_staves(cleaned):
 
 
 def sing(manifest, cleaned, bundle_dir, work, voices, lang, python, ufr_dir, gpu, lang_from=None,
-         groups=None, resume=False, allow_silent=False, on_part=None, version=None, remote_only=False):
+         groups=None, resume=False, allow_silent=False, on_part=None, version=None, remote_only=False,
+         pronounce=None):
     """parts/<n>-<Name>.mp3 for every part, sung on the bundle's clock:
 
     - each line is checked against the piano before it is sung (check_onsets.py); a part whose
@@ -399,7 +407,8 @@ def sing(manifest, cleaned, bundle_dir, work, voices, lang, python, ufr_dir, gpu
         with open(js, "w") as f:
             json.dump(notes, f, ensure_ascii=False)
         for code in sorted({n["lang"] for n in notes if n.get("syl")} & G2P):
-            run([python, "-I", os.path.join(HERE, "g2p.py"), code, js], env=dict(os.environ, UFR_DIR=ufr_dir))
+            run([python, "-I", os.path.join(HERE, "g2p.py"), code, js],
+                env=dict(os.environ, UFR_DIR=ufr_dir, **(pronounce or {})))
         quiet += [(name, n["bar"], n["syl"]) for n in silent_notes(python, js, voices[i - 1], env)]
         said = f"{name}{' ' + line + ' line' if two else ''}"
         if resume and sung_before(work, i, line, voices[i - 1], version):
@@ -821,7 +830,8 @@ def sing_and_publish(a, run_record):
         sing(manifest, cleaned, bundle_dir, work, [v for v, _ in sung_by], a.lang, python, ufr_dir, gpu,
              parse_lang_from(a.lang_from), groups, a.resume, a.allow_silent,
              on_part=lambda i, n, name: run_record.step("singing", part=i, parts=n, part_name=name),
-             version=run_record.record["version"], remote_only=a.remote_only)
+             version=run_record.record["version"], remote_only=a.remote_only,
+             pronounce=pronounce_env(os.path.join(ROOT, "songs", a.slug)))
         manifest["sung"] = True
         for part, (_, credit) in zip(manifest["parts"], sung_by):
             part["voice"] = credit
