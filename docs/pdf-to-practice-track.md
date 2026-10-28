@@ -13,10 +13,13 @@ yourself.
 - `.venv` with `pip-requirements.txt`, MuseScore 3 (`MUSESCORE_CLI_PATH`), poppler, ffmpeg:
   `scripts/setup.sh`, then `./song.py --check`.
 - homr, which reads the notes off the page: `scripts/install-homr.sh`.
-- The singer: `scripts/install-singer.sh` (uses an NVIDIA card when there is one, else the
-  processor), and the UFR DiffSinger voices downloaded by hand from
-  <https://utaufrance.com/telechargement-du-pack-diffsinger-ufr/>, with `UFR_DIR` in `.env`
-  naming the folder that holds `core/`, `dsdur/` and `tiger/`.
+- The singer and its voices: download the UFR DiffSinger pack's zip by hand from
+  <https://utaufrance.com/telechargement-du-pack-diffsinger-ufr/> (a Google Drive link, no
+  sign-up; its terms forbid re-hosting it), then `scripts/install-singer.sh <the .zip>`. It
+  installs the singer (on an NVIDIA card when there is one, else the processor), copies what
+  the singer reads from the pack (made for OpenUtau) into a folder of `core/`, `dsdur/` and
+  `tiger/`, and sets `UFR_DIR` in `.env` to that folder. The folder the zip unzips to works
+  as the argument too.
 - The app running: `./song.py --no-browser` prints its address. Every step below is a call to
   it; `$APP` is that address (`http://127.0.0.1:8000`, or the next free port).
 
@@ -147,6 +150,20 @@ export: run it in the desktop's session, or with its `DISPLAY` and `XAUTHORITY` 
 
 - Not in Finnish: `--lang en|de|sv|la|et`. Two languages: `--lang-from fi:Word,...` names the
   first word of each stretch (it stops and lists the words it thinks you missed).
+- An English word the dictionary reads two ways ("wind" the breeze or the clock's, "read",
+  "live", "tear", "bow", "lead"): the song page's Publish stage has a **Pronunciation** list
+  (open it; it takes a few seconds). It shows every place a part sings such a word, with its
+  line, and the readings spelled out ("wind", as in sit / "wynd", as in find). Choose the reading
+  at a place, or for the word everywhere in the song, and save. Until one is chosen the
+  dictionary's first is sung. The choices are kept in `songs/<slug>/pronounce.json`, by place
+  (bar, the beat the word starts on, word), for every part singing the word there together and
+  on every pass through the bar; a part entering later on the same word has a place of its own. After a score edit
+  the list and the sing run name any choice whose word is no longer at its place.
+- A word a choir says its own way, in every song: `choirs/<choir>.json`, read for each
+  `--publish <choir>`, as a sound-alike spelling: `{"pronounce": {"harvest": "har-vist"}}`.
+  A place chosen on the song page wins over it. A spelling that gives a sound the voice lacks
+  stops the run, naming the word and the file. Choirs whose files differ need a run each: one
+  run sings once for all its `--publish` choirs.
 - A part name that does not start with S, A, M, T or B: `--voice LYSE` (high) or `--voice REMY`
   (low) for every part.
 - A stopped run: the same command with `--resume` sings only the lines not finished.
