@@ -31,29 +31,10 @@ def cut(tokens, is_vowel):
     while j < len(tokens) and is_vowel(tokens[j]): j += 1
     return tokens[:i], tokens[i:j], tokens[j:]
 
-# ---- a song's own pronunciations (PRONOUNCE: songs/<slug>/pronounce.json, main.py) ----
-def listed_sounds():
-    """{word: [sounds]} from the song's pronunciation list, each written as the CMU dictionary
-    writes it ("wind": "W IH1 N D"); {} when the song has none. A listed word is not looked up:
-    g2p_en is given one word at a time, so it cannot tell the wind that blows from winding a
-    watch, and a choir may say a word its own way ("harvest")."""
-    path = os.environ.get("PRONOUNCE")
-    if not path:
-        return {}
-    out = {}
-    for word, sounds in json.load(open(path, encoding="utf-8")).items():
-        arp = str(sounds).split()
-        if not arp or not all(re.match(r"^[A-Z]+[0-2]?$", p) for p in arp):
-            sys.exit(f"pronunciation list {path}: give {word!r} as the CMU dictionary writes it, "
-                     "for example W IH1 N D")
-        out[re.sub(r"[^a-z']", "", word.lower())] = arp
-    return out
-
 # ---- English: dictionary per word, dealt over the word's syllables ----
 def english():
     from g2p_en import G2p
     g2p = G2p()
-    listed = listed_sounds()
     words, cur = [], []
     for k, n in enumerate(notes):
         if not mine(n): continue
@@ -65,7 +46,7 @@ def english():
         text = "".join(re.sub(r"[^a-z']", "", unicodedata.normalize("NFC", notes[k]["syl"].lower().replace("\u2019", "'"))) for k in idx).strip("'")
         if not text: continue
         if not re.search(r"[aeiouy]", text): continue   # scat ("dn", "mm"): no dictionary word; sing_ufr.py hums it
-        arp = listed.get(text) or [p for p in g2p(text) if re.match(r"^[A-Z]+[0-2]?$", p)]
+        arp = [p for p in g2p(text) if re.match(r"^[A-Z]+[0-2]?$", p)]
         ph = []
         for p in arp:
             base = p.rstrip("012").lower()
