@@ -113,7 +113,11 @@ CMU = {"wind": [["W", "AY1", "N", "D"], ["W", "IH1", "N", "D"]], "read": [["R", 
        "bow": [["B", "AW1"], ["B", "OW1"]], "lead": [["L", "EH1", "D"], ["L", "IY1", "D"]],
        "the": [["DH", "AH0"], ["DH", "AH1"], ["DH", "IY0"]], "a": [["AH0"], ["EY1"]],
        "and": [["AH0", "N", "D"], ["AE1", "N", "D"]], "to": [["T", "UW1"], ["T", "IH0"], ["T", "AH0"]],
-       "blows": [["B", "L", "OW1", "Z"]]}
+       "blows": [["B", "L", "OW1", "Z"]],
+       # letters said aloud and scat are no choice for a director
+       "da": [["D", "AA1"], ["D", "IY1", "EY1"]], "ha": [["HH", "AA1"], ["EY1", "CH", "EY1"]],
+       "us": [["AH1", "S"], ["Y", "UW1", "EH1", "S"]], "am": [["AE1", "M"], ["EY1", "EH1", "M"]],
+       "di": [["D", "IY1"], ["D", "AY1"]], "de": [["D", "IY1"], ["D", "EY1"]]}
 LISTED = ["bow", "lead", "live", "read", "tear", "wind"]
 
 
@@ -133,20 +137,39 @@ SINGER = Path(os.path.expanduser(os.environ.get("SING_VENV") or "~/.local/share/
 
 @pytest.mark.skipif(not SINGER.exists(), reason="no singer venv with g2p_en")
 def test_the_real_dictionary_lists_the_homographs_and_not_the_little_words():
-    words = ["the", "a", "and", "to", "wind", "read", "live", "tear", "bow", "lead", "blows"]
+    words = ["the", "a", "and", "to", "wind", "read", "live", "tear", "bow", "lead", "blows",
+             "da", "di", "de", "ha", "us", "am", "dong"]
     r = subprocess.run([str(SINGER), "-I", str(HERE / "readings.py")], input=json.dumps(words),
                        capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stderr
     assert sorted(json.loads(r.stdout)) == LISTED
 
 
-def test_weak_forms_and_accent_variants_are_not_listed():
+def test_a_word_with_a_real_second_reading_loses_only_its_letters():
+    cmu = {"ga": [["G", "AA1"], ["JH", "IY1", "EY1"]], "ne": [["N", "IY1"], ["EH1", "N", "IY1"], ["N", "EY1"]],
+           "re": [["R", "EY1"], ["R", "IY1"]], "ye": [["Y", "IY1"], ["Y", "EH1"]],
+           "a": [["AH1"], ["EY1"]]}
+    assert readings.spelled_out("a", ["EY1"]) is False
+    assert readings.spelled_out("it's", ["AY1", "T", "IY1"]) is False       # no crash on an apostrophe
+    assert readings.spelled_out("ne", ["EH1", "N", "IY1"]) is True
+    got = readings.readings(list(cmu), cmu, lambda w: cmu[w][0])
+    assert sorted(got) == ["a", "re", "ye"]
+    assert [r["sounds"] for r in got["a"]] == ["AH1", "EY1"]
+
+
+def test_weak_forms_and_most_accent_variants_are_not_listed():
     cmu = {"for": [["F", "AO1", "R"], ["F", "ER0"], ["F", "R", "ER0"]], "are": [["AA1", "R"], ["ER0"]],
            "where": [["W", "EH1", "R"], ["HH", "W", "EH1", "R"]], "your": [["Y", "AO1", "R"], ["Y", "UH1", "R"]],
            "don't": [["D", "OW1", "N", "T"], ["D", "OW1", "N"]], "new": [["N", "UW1"], ["N", "Y", "UW1"]],
            "rather": [["R", "AE1", "DH", "ER0"], ["R", "AH1", "DH", "ER0"]],
+           "lot": [["L", "AA1", "T"], ["L", "AO1", "T"]],
+           # and real ones stay, with the accents a director chooses between
            "again": [["AH0", "G", "EH1", "N"], ["AH0", "G", "EY1", "N"]],
-           # and real ones stay
+           "plaza": [["P", "L", "AA1", "Z", "AH0"], ["P", "L", "AE1", "Z", "AH0"]],
+           # AH sounds like AE and like AA, but AE and AA still differ whichever comes first
+           "aunt": [["AH1", "N", "T"], ["AE1", "N", "T"], ["AA1", "N", "T"]],
            "close": [["K", "L", "OW1", "S"], ["K", "L", "OW1", "Z"]], "dove": [["D", "AH1", "V"], ["D", "OW1", "V"]],
            "bass": [["B", "AE1", "S"], ["B", "EY1", "S"]], "wound": [["W", "AW1", "N", "D"], ["W", "UW1", "N", "D"]]}
-    assert sorted(readings.readings(list(cmu), cmu, lambda w: cmu[w][0])) == ["bass", "close", "dove", "wound"]
+    assert sorted(readings.readings(list(cmu), cmu, lambda w: cmu[w][0])) == ["again", "aunt", "bass", "close", "dove", "plaza", "wound"]
+    got = readings.readings(["aunt"], cmu, lambda w: cmu[w][0])["aunt"]
+    assert [r["sounds"] for r in got] == ["AE1 N T", "AA1 N T"]

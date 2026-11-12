@@ -7,6 +7,19 @@ developers are listed under *Behind the scenes*.
 
 ## Unreleased
 
+- The song page's Pronunciation list no longer asks about scat: "da", "di" and the like took 106
+  of the 115 rows of Butterfly. A reading that only says a word's letters ("us" as U-S, "am" as
+  A-M) is gone from it too. What is sung does not change. (#472)
+
+- A MuseScore 4 score with a text or hairpin placed between two notes is sung in time: the
+  singer took the marks MuseScore writes around it for a rest, and every later note of the part
+  came late (Hodie Christus Natus Est). (#468)
+
+- The song page's Pronunciation list also shows "again" and "against" (a-GEN or a-GAIN), and
+  words like "plaza" or "khaki" the dictionary gives with an "a" as in cat or as in father, so a
+  choir director can choose. Other accent differences ("your", "rather", "where") stay left off.
+  (eeron-omat-taskit#147)
+
 - An English word the dictionary reads two ways ("wind", "read", "live") is sung the way the
   song means: the song page's Publish stage lists each place one is sung, and a reading chosen
   there (or for the whole song) is sung by every part at that place. A choir's own way of saying
