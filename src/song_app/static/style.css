@@ -199,12 +199,18 @@ table.grid { border-collapse: collapse; width: 100%; margin-bottom: 12px; }
 table.grid th, table.grid td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
 table.grid th { background: var(--panel2); color: var(--muted); font-weight: 600; }
 table.grid input { width: 100%; }
+/* A staff's notes are one comma list with no spaces; let it wrap so the
+   Part names box keeps its room inside the panel. */
+table.grid td.stsum { overflow-wrap: anywhere; }
+table.grid td:has(> input) { min-width: 8em; }
 table.grid input.unset { border-color: var(--warn); }
 table.grid input.undernamed { border-color: var(--warn); }
 table.grid .undernote { color: var(--warn); font-size: 12px; }
 table.grid .undernote:empty { display: none; }
 .sysblock { margin-bottom: 18px; }
 .sysblock h4 { margin: 0 0 6px; }
+.sysblock .restpick { gap: 6px; margin: 0 0 6px; font-size: 0.9em; }
+.sysblock.restsys table.grid { opacity: 0.45; }
 .syshead { justify-content: space-between; margin-bottom: 6px; }
 .syshead h4 { margin: 0; }
 .lyrow { margin-bottom: 8px; }
@@ -270,6 +276,15 @@ table.grid .undernote:empty { display: none; }
 .tempo-row { flex-wrap: nowrap; }
 .tempo-row input[type=number] { min-width: 0; }
 .tempo-row label.tempo-start { display: flex; align-items: center; gap: 4px; margin: 0; color: var(--text); white-space: nowrap; }
+.hint.err { color: var(--bad); }
+p.err { color: var(--bad); }
+.publish-keep-sung { margin-top: 8px; }
+.publish-keep-sung summary { cursor: pointer; color: var(--muted); }
+.publish-keep-sung .hint { margin: 6px 0; }
+.overlong summary { cursor: pointer; color: var(--warn); }
+.gradual-row { margin: 10px 0; }
+.gradual-row .gradual-controls { margin: 4px 0 0; }
+.gradual-row label { display: flex; align-items: center; gap: 4px; margin: 0; color: var(--text); white-space: nowrap; }
 
 /* ---- Systems: printed-system boundaries drawn over the page ---- */
 .sysbar { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
@@ -281,6 +296,8 @@ table.grid .undernote:empty { display: none; }
 .syspagewrap { margin-bottom: 1rem; }
 .syspage { position: relative; display: inline-block; width: 100%; }
 .syspage img { width: 100%; display: block; cursor: crosshair; }
+.syspage.skipped img { opacity: 0.35; cursor: default; }
+.syspagehead { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .sysband { position: absolute; left: 0; right: 0; box-sizing: border-box;
            border: 2px solid rgba(30, 110, 200, .85);
            background: rgba(30, 110, 200, .10); }
@@ -546,3 +563,6 @@ table.grid .undernote:empty { display: none; }
 .pron-row { flex-wrap: wrap; gap: 4px 8px; margin: 6px 0; }
 .pron-place { font-variant-numeric: tabular-nums; min-width: 4.5em; }
 .pron-line { flex: 1 1 14em; }
+/* Dismiss on a lyric warning (#482) */
+.warnlist .dismiss, .lyerr .dismiss { padding: 1px 8px; font-size: 12px; margin-left: 4px; }
+.lyunboxed:empty { display: none; }

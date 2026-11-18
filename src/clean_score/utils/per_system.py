@@ -33,9 +33,11 @@ the song app can clean headless after the grid is submitted.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
+import tempfile
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
@@ -57,6 +59,29 @@ logger = logging.getLogger(__name__)
 Answers = Dict[int, Dict[int, str]]
 
 CLEARED = "-"
+
+# A system answered `{ALL_REST: REST}` sings nothing (#482): the page prints piano or
+# instruments only there. Its notes go to no part, every part rests through its bars,
+# and the names carry on past it from the system before, which "-" on every row
+# would stop. The key sits beside the staff ids in one system's answers.
+ALL_REST = "*"
+REST = "rest"
+
+
+def is_rest_system(system_answers: Optional[Dict]) -> bool:
+    """True when a system's answers say no voice sings there (`ALL_REST`)."""
+    return (system_answers or {}).get(ALL_REST) == REST
+
+
+def _answer_key(key):
+    """A staff id as an int; the rest marker `ALL_REST` as itself."""
+    return key if key == ALL_REST else int(key)
+
+
+def parse_answers(entry: Dict) -> Answers:
+    """Answers as stored in JSON (string keys) back to their int-keyed form."""
+    return {int(sidx): {_answer_key(sid): ans for sid, ans in staves.items()}
+            for sidx, staves in entry.items()}
 
 # {system_index: {(staff_id, voice_index): part_name}} — internal, resolved form.
 _Decls = Dict[int, Dict[Tuple[int, int], str]]
@@ -122,6 +147,8 @@ class SystemLayout:
     start: int
     end: int
     staves: List[StaffRow] = field(default_factory=list)
+    # Answered "No voices here" (`ALL_REST`): nothing on it is a part.
+    rest: bool = False
 
     def to_dict(self) -> Dict:
         return {
@@ -129,6 +156,7 @@ class SystemLayout:
             "measure_start": self.start,
             "measure_end": self.end,
             "staves": [s.to_dict() for s in self.staves],
+            "rest": self.rest,
         }
 
 
@@ -288,8 +316,7 @@ def saved_answers(input_path: Optional[str]) -> Optional[Answers]:
     entry = raw.get(key) or raw.get(_legacy_key_for(input_path))
     if not entry:
         return None
-    return {int(sidx): {int(sid): ans for sid, ans in staves.items()}
-            for sidx, staves in entry.items()}
+    return parse_answers(entry)
 
 
 def has_answers(input_path: Optional[str]) -> bool:
@@ -298,18 +325,92 @@ def has_answers(input_path: Optional[str]) -> bool:
 
 
 def save_answers(input_path: Optional[str], answers: Answers) -> None:
-    """Record answers for this input score so a later rebuild needs no prompting."""
+    """Record answers for this input score so a later rebuild needs no prompting.
+
+    A write that fails is logged and the file is left as it was, which is what the
+    terminal prompt has always done; the song app calls :func:`update_answers`
+    itself so a failure reaches the person who pressed Save.
+    """
+    try:
+        update_answers(input_path, lambda _old: answers)
+    except (OSError, AnswerFileError) as exc:
+        logger.warning("Could not write per-system answers: %s", exc)
+
+
+class AnswerFileError(RuntimeError):
+    """The answer file is there and cannot be read, so it is not written over."""
+
+
+@contextlib.contextmanager
+def _answer_lock() -> Iterator[None]:
+    """Hold the answer file for one read-change-write.
+
+    The file holds every song's answers, and a grid save, a re-scan dropping a
+    system's answers and a clean of another song all reach it (#498). `flock` is
+    taken on a lock file beside it, opened afresh by each caller, so two threads
+    of the app wait for each other as well as two processes do.
+    """
+    with open(_ANSWER_FILE + ".lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def update_answers(input_path: Optional[str],
+                   change: Callable[[Optional[Answers]], Optional[Answers]]) -> None:
+    """Change one score's answers in place, under the answer file's lock.
+
+    `change` gets the answers recorded now (or None) and returns the new set, or
+    None to remove it. The file is re-read inside the lock and replaced whole by
+    rename, so a reader without the lock sees the old file or the new one and
+    never half of one. A file that is there and does not parse is refused rather
+    than written over with this one score's answers, which would erase every
+    other song's.
+    """
     key = _key_for(input_path)
     if not key:
         return
-    raw = _read_answer_file()
-    raw[key] = {str(sidx): {str(sid): ans for sid, ans in staves.items()}
-                for sidx, staves in answers.items()}
-    try:
-        with open(_ANSWER_FILE, "w", encoding="utf-8") as f:
-            json.dump(raw, f, indent=2, ensure_ascii=False)
-    except OSError as exc:
-        logger.warning("Could not write per-system answers: %s", exc)
+    with _answer_lock():
+        raw: Dict = {}
+        if os.path.exists(_ANSWER_FILE):
+            try:
+                with open(_ANSWER_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except ValueError as exc:
+                logger.error("The per-system answer file %s cannot be read: %s",
+                             _ANSWER_FILE, exc)
+                raise AnswerFileError(
+                    f"The answer file {_ANSWER_FILE} cannot be read ({exc}); "
+                    "it was left as it is.") from exc
+            if not isinstance(raw, dict):
+                raise AnswerFileError(
+                    f"The answer file {_ANSWER_FILE} is not a mapping; "
+                    "it was left as it is.")
+        entry = raw.get(key) or raw.get(_legacy_key_for(input_path))
+        current = parse_answers(entry) if entry else None
+        new = change(current)
+        if new is None:
+            raw.pop(key, None)
+        else:
+            raw[key] = {str(sidx): {str(sid): ans for sid, ans in staves.items()}
+                        for sidx, staves in new.items()}
+        folder = os.path.dirname(_ANSWER_FILE) or "."
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".persystem_cache.",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, _ANSWER_FILE)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
 
 # --------------------------------------------------------------------------- #
@@ -417,7 +518,8 @@ def system_layout(
                 summary=_first_nonempty_summary(staff, a, b),
                 answer=recorded.get(sidx, {}).get(sid, ""),
             ))
-        layouts.append(SystemLayout(index=sidx, start=a + 1, end=b + 1, staves=rows))
+        layouts.append(SystemLayout(index=sidx, start=a + 1, end=b + 1, staves=rows,
+                                    rest=is_rest_system(recorded.get(sidx))))
     return layouts
 
 
@@ -459,11 +561,15 @@ def _answers_in_force(
     """Each (system, staff) with the answer that applies there and where it was typed.
 
     A staff left unanswered in a system inherits its answer from the previous system;
-    CLEARED is yielded as itself and stops that inheritance.
+    CLEARED is yielded as itself and stops that inheritance. A system answered
+    `ALL_REST` yields nothing and leaves the carry alone, so the system after it
+    inherits from the one before it.
     """
     last_answer: Dict[int, Tuple[str, int]] = {}
     for layout in layouts:
         sys_ans = answers.get(layout.index, {})
+        if is_rest_system(sys_ans):
+            continue
         for row in layout.staves:
             raw = sys_ans.get(row.staff_id, "")
             if raw == "":
@@ -483,7 +589,8 @@ def _decls_from_answers(layouts: List[SystemLayout], answers: Answers) -> _Decls
 
     A staff left unanswered in a system inherits its answer from the previous system;
     CLEARED declares nothing and stops that inheritance (the staff stays unnamed until
-    it is answered again). Names beyond the staff's voice count are ignored.
+    it is answered again). Names beyond the staff's voice count are ignored. A system
+    answered `ALL_REST` declares nothing, so every part rests there.
     """
     decls: _Decls = {}
     for layout, row, raw, _ in _answers_in_force(layouts, answers):
@@ -895,7 +1002,7 @@ def _fill_from_fallbacks(
 
 def _build_lyric_map(
     bounds: List[Tuple[int, int]], decls: _Decls, parts: List[str],
-    staves: Optional[List[int]] = None,
+    staves: Optional[List[int]] = None, rest: Set[int] = frozenset(),
 ) -> List[Dict]:
     """
     Per-system printed-staff -> output-staff(s) map for lyric placement.
@@ -921,6 +1028,8 @@ def _build_lyric_map(
     order rather than rank order — and, given `staves`, "staves": how many staves that
     system prints. "map" ranks the staves, which is what the lyric JSON numbers; the
     Fix panel needs the page position instead, to know which part homr read (#310).
+    A system in `rest` (answered "No voices here") carries "rest": true and an empty
+    "map": the lyric import gives it no line of the words (#482).
     """
     part_id = {name: i + 1 for i, name in enumerate(parts)}
     fallbacks = _fallback_of(parts)
@@ -951,6 +1060,8 @@ def _build_lyric_map(
                 follow.setdefault(part_id[base], []).append(part_id[child])
         if follow:
             entry["follow"] = follow
+        if sidx in rest:
+            entry["rest"] = True
         out.append(entry)
     return out
 
@@ -975,6 +1086,81 @@ def _write_lyric_metadata(
     meta = etree.Element("metaTag", name="lyricsStaffMap")
     meta.text = ";".join(f"{i}:{i}" for i in range(1, len(parts) + 1))
     score.insert(insert_at, meta)
+
+
+#: `read_system_map`'s answer about the bars the map counts.
+MAP_AS_RECORDED = ""
+#: Bars were added or removed after Clean, and the line breaks gave the new ranges.
+MAP_RECOUNTED = "recounted"
+#: Bars were added or removed after Clean, and the line breaks cannot say where.
+MAP_STALE = "stale"
+
+
+@dataclass
+class SystemMap:
+    """`lyricsSystemMap` as stored, each entry's `start`/`end` put in today's bars.
+
+    `entries` are the stored JSON objects (copies), so every reader keeps the fields
+    it uses; `state` is one of the `MAP_*` values.
+    """
+
+    entries: List[Dict]
+    state: str = MAP_AS_RECORDED
+
+
+def has_system_map(root: etree._Element) -> bool:
+    """Whether the score carries a `lyricsSystemMap`, readable or not."""
+    score = _score_of(root)
+    return score is not None and any(
+        tag.get("name") == "lyricsSystemMap" and (tag.text or "").strip()
+        for tag in score.findall("metaTag"))
+
+
+def read_system_map(root: etree._Element) -> Optional[SystemMap]:
+    """The score's per-system lyric map, its bar ranges checked against the score.
+
+    The one reader of `lyricsSystemMap` (#482). The map is written at Clean and
+    counts the bars as they were then. A bar a recorded `insbar`/`delbar` moves is
+    renumbered in the metaTag itself; one added or removed by hand in MuseScore is
+    not, and every later system's words then land on the wrong bars.
+
+    So when the map's last bar is no longer the score's last bar, its ranges are read
+    again off the top staff's line breaks (the rebuild puts the printed breaks there,
+    and MuseScore keeps a break on its bar) — in memory only, so a later save cannot
+    fight it — if the score has as many systems as the map. With another count the
+    map comes back as stored and `state` says it is stale. A map whose last bar is
+    still the score's is left alone: a line break moved or taken out in MuseScore
+    without a bar added is a layout choice, not a change to the page (two songs here
+    had one when this was written). None with no map, or one that does not parse.
+    """
+    score = _score_of(root)
+    if score is None:
+        return None
+    raw = None
+    for tag in score.findall("metaTag"):
+        if tag.get("name") == "lyricsSystemMap" and (tag.text or "").strip():
+            try:
+                raw = json.loads(tag.text)
+            except ValueError:
+                return None
+            break
+    if not isinstance(raw, list) or not raw:
+        return None
+    entries = [dict(e) for e in raw if isinstance(e, dict)]
+    try:
+        last = max(int(e["end"]) for e in entries)
+    except (KeyError, TypeError, ValueError):
+        return SystemMap(entries)
+    staff = score.find("Staff")
+    bars = len(staff.findall("Measure")) if staff is not None else 0
+    if not bars or last == bars:
+        return SystemMap(entries)
+    ranges = system_ranges(root)
+    if len(ranges) != len(entries):
+        return SystemMap(entries, MAP_STALE)
+    for entry, rng in zip(entries, ranges):
+        entry["start"], entry["end"] = rng.start, rng.end
+    return SystemMap(entries, MAP_RECOUNTED)
 
 
 # --------------------------------------------------------------------------- #
@@ -1030,6 +1216,10 @@ def clean_per_system(
     for selector in _STRIP_SELECTORS:
         delete_all_elements_by_selector(root, selector)
 
-    lyric_map = _build_lyric_map(bounds, decls, parts, [len(l.staves) for l in layouts])
+    # A system with no staff to name sings nothing either (#482).
+    rest = {l.index for l in layouts
+            if is_rest_system(answers.get(l.index)) or not l.staves}
+    lyric_map = _build_lyric_map(bounds, decls, parts, [len(l.staves) for l in layouts],
+                                 rest)
     _write_lyric_metadata(root, parts, lyric_map)
     return PerSystemResult(parts=parts, lyric_map=lyric_map)

@@ -57,3 +57,49 @@ def test_the_chosen_choir_survives_the_panel_being_drawn_again(live, page, size)
         "Published to Joensuun Mieslaulajat (jm)", timeout=15000)
     assert [row[0] for row in cf.listed("jm")] == [slug]
     assert errors == []
+
+
+def test_an_emptied_choice_stays_empty_after_a_publish(live, page):
+    # once published to jm, choosing "— choir —" again must not snap back to jm on a redraw,
+    # or the next Publish goes to a choir the person had just turned away from
+    base, slug, cf = live
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(f"{base}/#/song/{slug}")
+    choir = page.locator(".publish-section select.publish-choir")
+    expect(choir.locator("option")).to_have_count(4)
+    choir.select_option("jm")
+    page.locator(".publish-section button.publish-btn").click()
+    expect(page.locator(".publish-section .publish-status")).to_contain_text(
+        "Published to Joensuun Mieslaulajat (jm)", timeout=15000)
+
+    choir.select_option("")
+    choir.evaluate("el => { el.dataset.beforeRedraw = '1'; }")
+    _wait_for_page_connection(slug)
+    server.hub.emit(slug, {"type": "state"})
+    page.wait_for_function(
+        "() => document.querySelector('select.publish-choir')"
+        " && !document.querySelector('select.publish-choir[data-before-redraw]')",
+        timeout=10000)
+    expect(choir).to_have_value("")
+
+
+def test_a_choice_left_unpublished_is_forgotten_when_the_song_is_opened_again(live, page):
+    # a choice made on an earlier visit and never published must not stand in for the
+    # song's saved choir when the song is opened again, or Publish goes to the wrong choir
+    base, slug, cf = live
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(f"{base}/#/song/{slug}")
+    choir = page.locator(".publish-section select.publish-choir")
+    expect(choir.locator("option")).to_have_count(4)
+    choir.select_option("jm")
+    page.locator(".publish-section button.publish-btn").click()
+    expect(page.locator(".publish-section .publish-status")).to_contain_text(
+        "Published to Joensuun Mieslaulajat (jm)", timeout=15000)
+
+    choir.select_option("")                      # abandoned, never published
+    page.evaluate("location.hash = '#/'")        # back to the library
+    expect(page.locator(".publish-section")).to_have_count(0)
+    page.evaluate(f"location.hash = '#/song/{slug}'")
+    choir = page.locator(".publish-section select.publish-choir")
+    expect(choir.locator("option")).to_have_count(4)
+    expect(choir).to_have_value("jm")

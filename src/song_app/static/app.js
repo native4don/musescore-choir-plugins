@@ -15,7 +15,14 @@ const el = (tag, props = {}, ...kids) => {
 };
 async function api(path, opts) {
   const r = await fetch(path, opts);
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  if (!r.ok) {
+    // A detail may be an object the panel acts on (#483: `sung_on_site`); the message
+    // is its text either way, and the object rides along as `detail`.
+    const detail = (await r.json().catch(() => ({}))).detail;
+    const err = new Error(detail?.message || (typeof detail === "string" ? detail : "") || r.statusText);
+    if (detail && typeof detail === "object") err.detail = detail;
+    throw err;
+  }
   return r.headers.get("content-type")?.includes("json") ? r.json() : r.text();
 }
 const getJSON = (p) => api(p);
@@ -282,16 +289,32 @@ function homrBox() {
   return box;
 }
 
+// The languages a song can be sung in (#484), as a select. `blank` is the text of the
+// "nothing saved" choice; without it the list holds only the languages. Filled from
+// /api/languages so the list lives in one place (language_check.LANGUAGES).
+function languageSelect(current, blank, id) {
+  const sel = el("select", id ? { id } : {});
+  if (blank) sel.append(el("option", { value: "" }, blank));
+  getJSON("/api/languages").then(({ languages }) => {
+    for (const l of languages) sel.append(el("option", { value: l.code }, `${l.name} (${l.code})`));
+    sel.value = current || "";
+  }).catch(() => {});
+  return sel;
+}
+
 function newSongDialog() {
   const name = el("input", { placeholder: "Song name, e.g. Laulun aika" });
   // Which voices sing it. Asked here because nothing in the file can settle it:
   // a male-choir score is written in treble sounding an octave down and editions
   // routinely leave the 8 off the clef, so its tenor line reads as a soprano one.
-  const voicing = el("select", {},
+  const voicing = el("select", { id: "f-voicing" },
     el("option", { value: "" }, "Choose…"),
     el("option", { value: "men" }, "Men (TTBB)"),
     el("option", { value: "women" }, "Women (SSAA)"),
     el("option", { value: "mixed" }, "Mixed (SATB)"));
+  // The language the words are sung in (#484). Optional: a song with none is sung in
+  // Finnish only when its words look Finnish, and otherwise refused until one is set.
+  const language = languageSelect("", "Not set — Finnish if the words look Finnish", "f-language");
   // The PDF leads and the score file is the fallback, because that is now the
   // ordinary way in: a PDF on its own is a song and the app reads the score off
   // the page (#127). Handing in a score instead is the manual import (#86).
@@ -336,6 +359,7 @@ function newSongDialog() {
     const fd = new FormData();
     fd.append("name", name.value.trim() || fileName());
     fd.append("voicing", voicing.value);
+    if (language.value) fd.append("language", language.value);
     if (xml.files[0]) fd.append("xml", xml.files[0]);
     if (pdf.files[0]) fd.append("pdf", pdf.files[0]);
     status.textContent = "Creating…";
@@ -354,6 +378,8 @@ function newSongDialog() {
     el("p", { className: "hint" }, "Optional — a score you already have. Hand one in and the page is not scanned."),
     routeHint,
     el("label", {}, "Who sings it"), voicing,
+    el("label", {}, "Language of the words"), language,
+    el("p", { className: "hint" }, "What the parts are sung in. Can be changed later on the Start panel."),
     el("div", { className: "row" }, create, el("button", { onclick: renderLibrary }, "Cancel")),
     status));
 }
@@ -364,6 +390,7 @@ let logBox = null;
 
 async function renderWorkspace(slug) {
   if (ws) { ws.close(); ws = null; }
+  for (const k of Object.keys(publishChoice)) delete publishChoice[k];  // a fresh visit
   const song = await getJSON(`/api/songs/${encodeURIComponent(slug)}`);
   crumb.textContent = "› " + song.name;
   let view = song.stage; // which panel is shown
@@ -1139,6 +1166,9 @@ async function systemsEditor(view, slug) {
     return;
   }
   let bands = (data.systems || []).map((b) => ({ page: b.page, top: b.top, bottom: b.bottom }));
+  // Pages a person said hold no music to scan (#480): counted as marked, and the
+  // finder proposes nothing on them.
+  let skipped = new Set(data.skipped_pages || []);
   let dirty = false;
 
   const status = el("div", { className: "sysstatus" });
@@ -1148,6 +1178,8 @@ async function systemsEditor(view, slug) {
     const agree = want && n === want;
     status.replaceChildren(
       el("span", {}, `${n} system${n === 1 ? "" : "s"}`),
+      skipped.size ? el("span", { className: "muted" },
+        ` — ${skipped.size} page${skipped.size === 1 ? "" : "s"} left out`) : el("span"),
       want ? el("span", { className: agree ? "ok" : "warn" },
         agree ? ` — matches the score` : ` — the score declares ${want}`) : el("span"),
       dirty ? el("span", { className: "warn" }, " — unsaved") : el("span"),
@@ -1157,11 +1189,12 @@ async function systemsEditor(view, slug) {
   const save = async () => {
     const res = await fetch(`${P}/bounds`, {
       method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ systems: bands }),
+      body: JSON.stringify({ systems: bands, skipped_pages: [...skipped] }),
     });
     if (!res.ok) { alert("Save failed: " + (await res.text())); return; }
     const out = await res.json();
     bands = out.systems.map((b) => ({ page: b.page, top: b.top, bottom: b.bottom }));
+    skipped = new Set(out.skipped_pages || []);
     dirty = false;
     drawBands();
   };
@@ -1185,7 +1218,8 @@ async function systemsEditor(view, slug) {
       });
       if (!res.ok) throw new Error(await res.text());
       const out = await res.json();
-      bands = out.systems.map((b) => ({ page: b.page, top: b.top, bottom: b.bottom }));
+      bands = out.systems.filter((b) => !skipped.has(b.page))
+        .map((b) => ({ page: b.page, top: b.top, bottom: b.bottom }));
       dirty = true;
       findNote.textContent = ` Proposed ${bands.length} — check each one against the`
         + " page, then save.";
@@ -1219,6 +1253,7 @@ async function systemsEditor(view, slug) {
       const holder = el("div", { className: "syspage" }, img, overlay);
       holder.onclick = (ev) => {
         if (ev.target !== img) return;              // only empty page area adds one
+        if (skipped.has(p)) return;                 // a left-out page takes no system
         const r = img.getBoundingClientRect();
         if (!r.height) return;
         const y = (ev.clientY - r.top) / r.height;
@@ -1226,16 +1261,36 @@ async function systemsEditor(view, slug) {
         dirty = true; drawBands();
       };
       img.onload = drawBands;                        // positions need the real height
-      pageEls.push({ page: p, img, overlay });
+      const leave = el("input", { type: "checkbox", className: "sysskip" });
+      leave.onchange = () => {
+        const on = bands.filter((b) => b.page === p).length;
+        if (leave.checked && on && !confirm(
+          `Leave page ${p} out of the scan? Its ${on} system(s) will be removed.`)) {
+          leave.checked = false;
+          return;
+        }
+        if (leave.checked) {
+          skipped.add(p);
+          bands = bands.filter((b) => b.page !== p);
+        } else skipped.delete(p);
+        dirty = true; drawBands();
+      };
+      pageEls.push({ page: p, img, overlay, holder, leave });
       kids.push(el("div", { className: "syspagewrap" },
-        el("div", { className: "muted" }, `Page ${p}`), holder));
+        el("div", { className: "syspagehead" },
+          el("span", { className: "muted" }, `Page ${p}`),
+          el("label", { className: "muted", title: "A page with no music to sing, such as a title page" },
+            leave, " Leave this page out")),
+        holder));
     }
     pagesWrap.replaceChildren(...kids);
   }
 
   function drawBands() {
     redrawStatus();
-    for (const { page, img, overlay } of pageEls) {
+    for (const { page, img, overlay, holder, leave } of pageEls) {
+      leave.checked = skipped.has(page);
+      holder.classList.toggle("skipped", skipped.has(page));
       const mine = bands
         .map((b, i) => ({ b, i }))
         .filter(({ b }) => b.page === page)
@@ -1600,7 +1655,7 @@ function panelScan(panel, song, P, refresh, actions) {
     ready ? `${st.systems} printed system(s) marked.`
       : !st.systems
       ? "No printed systems marked yet. Draw a band around each system in the Systems tab — the scan reads exactly those bands."
-      : `Page(s) ${gaps.join(", ")} have no systems marked. Every page has to be marked, or its music is simply never read.`,
+      : `Page(s) ${gaps.join(", ")} have no systems marked. Every page has to be marked, or its music is simply never read. A page with no music to sing can be left out in the Systems tab.`,
     " ",
     el("button", { onclick: () => actions?.openDoc?.("systems") }, "Open the Systems editor")));
 
@@ -1784,6 +1839,7 @@ function panelRegister(panel, song, P, refresh) {
       el("span", { className: "hint" }, song.published?.length
         ? "The folder name stays the same. Publish again to show the new name on the site."
         : "The folder name stays the same.")),
+    languageBox(song, P),
     el("p", { className: "sub", style: "margin-top:16px" }, "Sources for this song."),
     el("p", {}, `Score: ${song.sources?.xml || "—"}`),
     el("p", {}, `PDF: ${song.sources?.pdf || "— (none)"}`),
@@ -1791,6 +1847,30 @@ function panelRegister(panel, song, P, refresh) {
     el("p", { className: "hint" }, "Go to the Clean step to build the score."),
     deleteSongBox(song, P),
     makeLog());
+}
+
+// The language the song is sung in (#484). Saved at once on change; its own file, so no
+// job running on the song holds it back. A run already singing keeps its language, and
+// the reply names it.
+function languageBox(song, P) {
+  const sel = languageSelect(song.language, song.language ? "" : "Not set", "start-language");
+  const said = el("span", { className: "hint startlanguage" }, song.language ? ""
+    : "Not set: sung in Finnish only if the words look Finnish, otherwise singing is refused.");
+  sel.onchange = async () => {
+    if (!sel.value) return;
+    sel.disabled = true;
+    try {
+      const r = await postJSON(`${P}/language`, { language: sel.value });
+      song.language = r.language;
+      said.textContent = "Saved." + (r.note ? " Note: " + r.note + "." : "")
+        + (r.previous && r.previous !== r.language ? " Songs already sung in the old language show as needing a re-sing." : "");
+      const blank = sel.querySelector('option[value=""]');
+      if (blank) blank.remove();
+    } catch (e) { appendLog(e.message, true); sel.value = song.language || ""; }
+    sel.disabled = false;
+  };
+  return el("div", { className: "languagebox", style: "margin-top:16px" },
+    el("label", {}, "Language of the words"), sel, el("div", {}, said));
 }
 
 // Delete the song from the app (#428). The folder goes to songs/.trash/, so moving it
@@ -1812,6 +1892,29 @@ function deleteSongBox(song, P) {
     el("h3", {}, "Delete"),
     el("p", { className: "hint" }, `Removes the song from this app. ${onSite}`),
     el("div", { className: "row" }, btn));
+}
+
+// The scan's voices that run past their barline (#481), said bar by bar (#500).
+// Once the song is cleaned they were already cut or reset, so the list folds away.
+function overlongLine(o) {
+  if (o.found && o.expected) {
+    return `Bar ${o.measure}, staff ${o.staff}, voice ${o.voice}: notes add up to ${o.found} in a ${o.expected} bar`;
+  }
+  return o.message;
+}
+function overlongList(overlong, cleaned) {
+  const list = el("ul", { className: "warnlist" }, overlong.map((o) => el("li", {}, overlongLine(o))));
+  if (cleaned) {
+    const n = new Set(overlong.map((o) => o.measure)).size;
+    return el("details", { className: "overlong" },
+      el("summary", {}, `${n} bar${n === 1 ? "" : "s"} in the scan ran past ${n === 1 ? "its" : "their"} barline — cleaning cut or reset ${n === 1 ? "it" : "them"}`),
+      list);
+  }
+  return el("div", { className: "overlong" },
+    el("p", { className: "sub" },
+      "These voices in the scan run past their barline. MuseScore will not open them " +
+      "like this, so cleaning cuts or resets these bars:"),
+    list);
 }
 
 async function panelClean(panel, song, slug, P, refresh) {
@@ -1837,8 +1940,9 @@ async function panelClean(panel, song, slug, P, refresh) {
     const holder = el("div", {}, el("p", { className: "hint" }, "Loading systems…"));
     panel.append(holder);
     try {
-      const { grid } = await getJSON(`${P}/systems`);
+      const { grid, overlong = [], stamps = {} } = await getJSON(`${P}/systems`);
       holder.replaceChildren(
+        ...(overlong.length ? [overlongList(overlong, song.has_cleaned)] : []),
         el("p", { className: "hint fallbackhint" },
           "S1b sings S1's notes wherever it has none of its own; the same goes for any part name plus one small letter."),
         ...grid.map((sys) => sysBlock(sys)));
@@ -1849,9 +1953,13 @@ async function panelClean(panel, song, slug, P, refresh) {
       // carry instead of setting it — same rule the backend applies (per_system.CLEARED).
       const CLEARED = "-";
       const inputs = [...holder.querySelectorAll("input[data-sys]")];
+      // "No voices here" (per_system.ALL_REST): the system's rows are switched off and
+      // the names carry on past it from the system before, as the clean does (#482).
+      const restBoxes = [...holder.querySelectorAll("input[data-rest]")];
+      const isRest = (si) => restBoxes.some((box) => +box.dataset.rest === +si && box.checked);
       const byStaff = () => {
         const m = {};
-        for (const inp of inputs) (m[inp.dataset.staff] ||= []).push(inp);
+        for (const inp of inputs) if (!isRest(inp.dataset.sys)) (m[inp.dataset.staff] ||= []).push(inp);
         for (const sid in m) m[sid].sort((a, b) => a.dataset.sys - b.dataset.sys);
         return m;
       };
@@ -1867,6 +1975,17 @@ async function panelClean(panel, song, slug, P, refresh) {
         return +inp.dataset.lines - answered;
       };
       const cascade = () => {
+        for (const inp of inputs) {
+          const off = isRest(inp.dataset.sys);
+          inp.disabled = off;
+          if (off) {
+            inp.classList.remove("unset", "undernamed");
+            const note = inp.parentElement.querySelector(".undernote");
+            if (note) note.textContent = "";
+          }
+        }
+        for (const box of restBoxes)
+          box.closest(".sysblock").classList.toggle("restsys", box.checked);
         for (const list of Object.values(byStaff())) {
           let carry = "";
           for (const inp of list) {
@@ -1903,6 +2022,7 @@ async function panelClean(panel, song, slug, P, refresh) {
         button.onclick = () => {
           const start = +button.dataset.reuse;
           for (let si = start; si < grid.length && grid[si].can_reuse_previous; si++) {
+            if (isRest(si)) continue;
             for (const inp of inputs.filter((candidate) => +candidate.dataset.sys === si)) {
               const suggested = effectiveBefore(inp.dataset.staff, si);
               if (!inp.value.trim() && suggested) inp.value = suggested;
@@ -1930,6 +2050,7 @@ async function panelClean(panel, song, slug, P, refresh) {
         .map((inp) => `staff ${inp.dataset.staff} · system ${+inp.dataset.sys + 1}`
           + ` — ${inp.parentElement.querySelector(".undernote").textContent}`);
       inputs.forEach((inp) => (inp.oninput = cascade));
+      restBoxes.forEach((box) => (box.onchange = cascade));
       cascade();
 
       const collect = () => {
@@ -1938,11 +2059,15 @@ async function panelClean(panel, song, slug, P, refresh) {
           const si = inp.dataset.sys, sid = inp.dataset.staff;
           (answers[si] ||= {})[sid] = inp.value.trim();
         });
+        // Kept beside the names typed there, so unticking it gives them back.
+        restBoxes.forEach((box) => { if (box.checked) (answers[box.dataset.rest] ||= {})["*"] = "rest"; });
         return answers;
       };
       const save = () => api(`${P}/systems`, {
         method: "PUT", headers: { "content-type": "application/json" },
-        body: JSON.stringify(collect()),
+        // The readings this grid shows: the server refuses answers about a
+        // system read again since it was loaded (#498).
+        body: JSON.stringify({ answers: collect(), stamps }),
       });
 
       const saveBtn = el("button", { onclick: async () => {
@@ -2005,6 +2130,13 @@ async function panelClean(panel, song, slug, P, refresh) {
 }
 
 function sysBlock(sys) {
+  if (!sys.staves.length) {
+    // Nothing to name: the clean fills every part with rests and the names go on (#482).
+    return el("div", { className: "sysblock allrest" },
+      el("div", { className: "row syshead" },
+        el("h4", {}, `System ${sys.system + 1} — measures ${sys.measure_start}–${sys.measure_end}`)),
+      el("p", { className: "hint" }, "Every staff rests here; names carry on to the next system."));
+  }
   const rows = sys.staves.map((st) =>
     el("tr", {},
       el("td", {}, "staff " + st.staff_id),
@@ -2019,21 +2151,25 @@ function sysBlock(sys) {
   const reuse = sys.can_reuse_previous
     ? el("button", { "data-reuse": sys.system }, "Reuse previous assignments through matching systems")
     : "";
+  const rest = el("input", { type: "checkbox", "data-rest": sys.system });
+  rest.checked = !!sys.rest;
   return el("div", { className: "sysblock" },
     el("div", { className: "row syshead" },
       el("h4", {}, `System ${sys.system + 1} — measures ${sys.measure_start}–${sys.measure_end}`), reuse),
+    el("label", { className: "row restpick" }, rest,
+      el("span", {}, "No voices here (piano or instruments only)")),
     el("table", { className: "grid" },
       el("tr", {}, el("th", {}, "Staff"), el("th", {}, "Voices"), el("th", {}, "Content"), el("th", {}, "Part names")),
       rows));
 }
 
-// Run the clean's own checks again -- notes against the scan, MuseScore 3's check,
+// Run the clean's own checks again -- notes against the scan, MuseScore's check,
 // health -- on the cleaned score as it is now, without cleaning (#391). A score fixed
 // by hand showed them as stale, and a re-clean would have thrown the fixes away.
 function checkAgainButton(song, P) {
   const running = song.jobs?.check?.status === "running";
   const btn = el("button", { disabled: running, title:
-      "Compare the notes with the scan, ask MuseScore 3 whether it opens the score, "
+      "Compare the notes with the scan, ask MuseScore whether it opens the score, "
       + "and check health -- on the score as it is now. Changes nothing in the score.",
     onclick: async () => {
       btn.disabled = true;
@@ -2542,21 +2678,39 @@ async function panelLyrics(panel, song, P, refresh) {
 
 // Import mismatches come from the server as fields (kind, measure range, staff ids,
 // syllables, slots, message). Songs imported before that shipped hold the sentence as
-// a plain string; read the fields back out of it so those keep their cell markers too.
+// a plain string, which the server sends as {message, id} (#482); read the fields back
+// out of it so those keep their cell markers too, and keep the id for Dismiss.
 const LEGACY_WARN = /^Measures (\d+)-(\d+) \(staffs ([\d,\s]+)\): (too many|too few) tokens \((\d+) syllables, (\d+) slots\)/;
 
 function lyricMismatches(song) {
   return (song.lyrics?.warnings || []).map((w) => {
-    if (typeof w !== "string") return w;
-    const m = w.match(LEGACY_WARN);
-    if (!m) return { message: w, staff_ids: [] };
+    const text = typeof w === "string" ? w : (!w.kind && typeof w.message === "string" ? w.message : null);
+    if (text === null) return w;
+    const id = typeof w === "string" ? undefined : w.id;
+    const m = text.match(LEGACY_WARN);
+    if (!m) return { message: text, staff_ids: [], id };
     return {
-      kind: m[4] === "too many" ? "too_many" : "too_few", message: w,
+      id, kind: m[4] === "too many" ? "too_many" : "too_few", message: text,
       measure_start: +m[1], measure_end: +m[2],
       staff_ids: m[3].split(",").map((s) => +s.trim()).filter(Number.isFinite),
       syllables: +m[5], slots: +m[6],
     };
   });
+}
+
+// Dismiss: the person has answered a warning the app cannot see answered (#482) --
+// a corrected name, words checked against the page. Only warnings with an id (all of
+// them since #482; the server gives an old saved one an id on reading).
+function dismissButton(P, song, w, after) {
+  if (!w.id) return "";
+  return el("button", { className: "dismiss", title: "I have checked this; take it off the list",
+    onclick: async (ev) => {
+      ev.currentTarget.disabled = true;
+      try {
+        Object.assign(song, await postJSON(`${P}/lyrics/warnings/dismiss`, { id: w.id }));
+      } catch (e) { appendLog(e.message, true); }
+      after();
+    } }, "Dismiss");
 }
 
 function autoGrow(ta) {
@@ -2586,7 +2740,8 @@ async function lyricsPaste(panel, song, P, refresh) {
     const warns = lyricMismatches(song);
     warnBox.replaceChildren(...(warns.length ? [
       el("p", { className: "sub" }, "Mismatches (often a note problem — check the measure in MuseScore):"),
-      el("ul", { className: "warnlist" }, warns.map((w) => el("li", {}, w.message)))] : []));
+      el("ul", { className: "warnlist" }, warns.map((w) => el("li", {}, w.message, " ",
+        dismissButton(P, song, w, () => { drawWarns(); refresh(); }))))] : []));
   };
   drawWarns();
   panel.append(warnBox);
@@ -2604,7 +2759,7 @@ async function lyricsPaste(panel, song, P, refresh) {
   panel.append(
     el("div", { className: "row" },
       el("button", { onclick: async () => {
-        const { prompt } = await getJSON("/api/prompt");
+        const { prompt } = await getJSON(`/api/prompt?slug=${encodeURIComponent(song.slug)}`);
         await navigator.clipboard.writeText(prompt);
         appendLog("Prompt copied — paste it into your AI chat with the PDF.");
       }}, "1. Copy prompt"),
@@ -2693,11 +2848,32 @@ async function lyricsManual(panel, song, P, refresh) {
     && (w.staff_ids || []).includes(b.id)
     && w.measure_start >= sys().start && w.measure_start <= sys().end);
   const warnRows = [];
+  const afterDismiss = () => { drawWarns(); refresh(); };
   const warnLines = (b) => warnsFor(b).map((w) => el("div", { className: "lyerr" },
     `⚠ m${w.measure_start}–${w.measure_end}`
     + `${w.measure_end > sys().end ? " (runs into the next system)" : ""}: `
-    + `${w.message.split("): ").pop()}`));
-  const drawWarns = () => { for (const [box, b] of warnRows) box.replaceChildren(...warnLines(b)); };
+    + `${w.message.split("): ").pop()} `, dismissButton(P, song, w, afterDismiss)));
+  // A warning about this system that no box here shows: a pasted line naming a part
+  // that rests here has no box (#482).
+  const unboxed = el("div", { className: "lyerrs lyunboxed" });
+  const drawUnboxed = () => {
+    const s = sys();
+    // By id, not by object: a sentence saved before warnings had fields is parsed
+    // afresh on every call, so two reads of one warning are two objects.
+    const wkey = (w) => w.id ?? w.message;
+    const shown = new Set(boxesOf(S.n).flatMap((b) => warnsFor(b)).map(wkey));
+    const rest = lyricMismatches(song).filter((w) => !shown.has(wkey(w))
+      && (w.verse || 1) === S.verse
+      && w.measure_start >= s.start && w.measure_start <= s.end);
+    unboxed.replaceChildren(...(rest.length ? [
+      el("p", { className: "sub" }, "Not under any box here:"),
+      ...rest.map((w) => el("div", { className: "lyerr" },
+        `⚠ ${w.message} `, dismissButton(P, song, w, afterDismiss)))] : []));
+  };
+  const drawWarns = () => {
+    for (const [box, b] of warnRows) box.replaceChildren(...warnLines(b));
+    drawUnboxed();
+  };
 
   const statusEl = el("span", { className: "lyedstatus" });
   const showStatus = () => {
@@ -2789,6 +2965,7 @@ async function lyricsManual(panel, song, P, refresh) {
     nextBtn.disabled = S.n + 1 >= grid.systems.length;
     landedBtn.textContent = S.landed ? "Show the page" : "Show what landed";
     warnRows.length = 0;
+    drawUnboxed();
     const boxes = boxesOf(S.n);
     if (!boxes.length) {
       body.replaceChildren(...listView([], "No part sings in this system."));
@@ -2808,6 +2985,7 @@ async function lyricsManual(panel, song, P, refresh) {
       && boxes.every((b) => found.printed.includes(b.printed)));
     const focusKey = document.activeElement?.dataset?.box;
     warnRows.length = 0;
+    drawUnboxed();
     body.replaceChildren(...(matched ? staffView(boxes, found)
       : listView(boxes, s.crop != null && !S.landed
         ? "The staves in this picture could not be matched to the parts, so the boxes are listed under it." : "")));
@@ -2882,6 +3060,7 @@ async function lyricsManual(panel, song, P, refresh) {
       "_ is a note with no new syllable: after a word ending in - it holds that word "
       + "(e-lei- _ _ son). A word ending in - carries on into the next system. "
       + "Empty a box and import to take its words out."),
+    unboxed,
     body,
     el("div", { className: "lyedbar" }, prevBtn, importBtn, statusEl, landedBtn, nextBtn),
     makeLog());
@@ -2983,6 +3162,58 @@ function panelPublish(panel, song, P, refresh, actions) {
   const addTempo = el("button", { onclick: () => { addTempoRow().querySelector("input").focus(); } },
     "+ Add tempo change");
 
+  // The score's printed rit. and accel. marks (#483): each eases the speed beat by
+  // beat to three quarters (rit.) or five quarters (accel.) unless a target BPM is
+  // given here, or it is switched off and played as written.
+  // Where the ramp stops, so a director can tell whether it is the span they meant:
+  // "eases until bar 42 (fermata)", "eases to the end".
+  const gradualUntil = (mark) => {
+    const until = mark.until || {};
+    if (mark.until_why === "end") return "eases to the end";
+    const place = `bar ${until.measure}${until.beat > 1 ? ` beat ${until.beat}` : ""}`;
+    return `eases until ${place} (${mark.until_why})`;
+  };
+  const savedGradual = Object.fromEntries((pub.gradual || []).map((g) => [g.measure, g]));
+  // A setting is kept per bar and applies to the bar's first mark, so only that one
+  // gets controls; a later mark in the same bar is listed and eases by the default.
+  const allMarks = song.gradual_marks || [];
+  const marks = allMarks.filter((m, i) => allMarks.findIndex((o) => o.measure === m.measure) === i);
+  const sameBar = allMarks.filter((m) => !marks.includes(m));
+  const markBars = new Set(marks.map((m) => m.measure));
+  const gradualRows = el("div", { className: "gradual-marks", "data-gradual": "" },
+    ...(marks.length ? marks.flatMap((mark) => {
+      const saved = savedGradual[mark.measure] || {};
+      const speed = el("input", { type: "number", min: 20, max: 300, step: 1, value: saved.bpm ?? "",
+        placeholder: mark.kind === "rit" ? "¾ speed" : "1¼ speed", style: "width:96px",
+        "data-gradual-bpm": mark.measure, disabled: !!saved.off });
+      const off = el("input", { type: "checkbox", checked: !!saved.off, "data-gradual-off": mark.measure });
+      off.addEventListener("input", () => { speed.disabled = off.checked; });
+      for (const control of [speed, off]) control.addEventListener("input", changed);
+      // Two lines (#500): what the score says and where the ramp stops, then the
+      // controls, so the sentence is not broken up by the inputs on a narrow panel.
+      return [el("div", { className: "gradual-row" },
+        el("div", { className: "gradual-head" },
+          el("span", {}, `Bar ${mark.measure}${mark.beat > 1 ? ` beat ${mark.beat}` : ""}: “${mark.text}” — `),
+          el("span", { className: "hint", "data-gradual-until": mark.measure }, gradualUntil(mark))),
+        el("div", { className: "row gradual-controls" },
+          el("span", {}, "ease to"), speed,
+          el("span", { className: "hint" }, "BPM"),
+          el("label", {}, off, " play as written"))),
+      ...sameBar.filter((m) => m.measure === mark.measure).map((m) =>
+        el("div", { className: "hint", "data-gradual-same-bar": m.measure },
+          `Bar ${m.measure}: a second mark, “${m.text}”, eases to ${m.kind === "rit" ? "¾" : "1¼"} speed; `
+          + "the setting above is for the bar's first mark only."))];
+    }) : [el("span", { className: "hint" }, "No rit. or accel. in the score.")]),
+    ...(pub.gradual || []).filter((g) => !markBars.has(g.measure)).map((g) =>
+      el("div", { className: "hint", "data-gradual-stale": g.measure },
+        `Bar ${g.measure}: the setting saved here has no rit. or accel. in the score any more, and is dropped on save.`)));
+  const gradual = () => marks.map((mark) => ({
+    measure: mark.measure,
+    bpm: gradualRows.querySelector(`[data-gradual-bpm="${mark.measure}"]`).value
+      ? Number(gradualRows.querySelector(`[data-gradual-bpm="${mark.measure}"]`).value) : null,
+    off: gradualRows.querySelector(`[data-gradual-off="${mark.measure}"]`).checked,
+  }));
+
   // Who wrote it, as the site shows it. Until someone saves their own, the names
   // the score itself carries are offered.
   const credited = pub.credits || song.score_credits || {};
@@ -3018,8 +3249,14 @@ function panelPublish(panel, song, P, refresh, actions) {
     sharedNote.className = `hint staff-groups-note${shared.message ? " err" : ""}`;
     sharedNote.textContent = shared.message || (sharedAuto
       ? (shared.source === "part names"
-        ? "guessed from the part names — check against the PDF"
-        : shared.groups?.length ? "as the page prints them" : "the page prints every part on its own staff")
+        ? (shared.groups?.length ? "guessed from the part names — check against the PDF"
+          : "no pairs guessed from the part names — check against the PDF")
+        : shared.groups?.length ? "as the page prints them"
+        // Only a record of the page that found no pairs may say so (#482).
+        : shared.skipped?.length
+          ? `the page shares ${groupsText(shared.skipped)}, but they sing too many voices for one staff`
+        : ["page", "page, per system"].includes(shared.source)
+          ? "the page prints every part on its own staff" : "no pairing proposed — check against the PDF")
       : "set by hand");
     sharedReset.hidden = sharedAuto;
   };
@@ -3095,6 +3332,7 @@ function panelPublish(panel, song, P, refresh, actions) {
 
   const settings = () => ({
     tempo_changes: tempoChanges(),
+    gradual: gradual(),
     ...(tree.available ? { places: places() } : {}),
     ...(partNames.length ? { part_names: partNames.map((input) => input.value.trim()) } : {}),
     ...(shared.shown ? { staff_groups: sharedAuto ? null : sharedInput.value.trim() } : {}),
@@ -3123,6 +3361,8 @@ function panelPublish(panel, song, P, refresh, actions) {
     tempoRows,
     el("div", { className: "row" }, addTempo,
       el("span", { className: "hint" }, "where the page changes speed; bars counted from 1")),
+    el("label", {}, "rit. and accel."),
+    gradualRows,
     el("div", { className: "credits" },
       ...CREDITS.flatMap(([key, label]) => [el("label", {}, label), credits[key]])),
     ...(partNames.length ? [
@@ -3149,10 +3389,12 @@ function panelPublish(panel, song, P, refresh, actions) {
 // dictionary reads more than one way ("wind", "read"), and the reading to sing there or
 // everywhere in the song. Until one is chosen the dictionary's first is sung. Loaded when
 // opened: finding the words runs the singer's dictionary, which takes a few seconds.
+// Below it (#484), a reading in the voice's own sounds for any word, in the language the word is
+// sung in (a Latin refrain in a Finnish song is "la"), and every reading saved, by language.
 function pronunciationSection(P) {
   const body = el("div", { className: "pronunciation-body" }, el("p", { className: "hint" }, "Reading the lyrics…"));
   const box = el("details", { className: "pronunciation", "data-pronunciation": "" },
-    el("summary", {}, "Pronunciation (English songs)"), body);
+    el("summary", {}, "Pronunciation"), body);
   let loaded = false;
   box.addEventListener("toggle", () => {
     if (!box.open || loaded) return;
@@ -3163,28 +3405,33 @@ function pronunciationSection(P) {
   const say = (r) => `“${r.say}”${r.as_in ? `, as in ${r.as_in}` : ""}`;
   function draw(reply) {
     const note = el("span", { className: "hint save-note" }, "");
+    const unsaved = () => { note.className = "hint save-note"; note.textContent = "Unsaved changes"; };
+    const langName = Object.fromEntries((reply.languages || []).map((l) => [l.code, l.name]));
     const byWord = {};
     for (const row of reply.places) (byWord[row.word] ||= []).push(row);
+    const enEvery = (reply.everywhere || {}).en || {};
     const everywhere = {};
     const placeSelects = [];
+    // a reading saved that is none of the dictionary's (a script's, or voice sounds) stays a choice
+    const options = (readings, chosen) => [...readings.map((r) => el("option", { value: r.sounds }, say(r))),
+      ...(chosen && !readings.some((r) => r.sounds === chosen) ? [el("option", { value: chosen }, chosen)] : [])];
     const groups = Object.entries(byWord).map(([word, rows]) => {
       const readings = rows[0].readings;
       const all = el("select", { "data-pron-everywhere": word },
-        el("option", { value: "" }, `the dictionary's: ${say(readings[0])}`),
-        ...readings.map((r) => el("option", { value: r.sounds }, say(r))));
-      all.value = reply.everywhere[word] || "";
+        el("option", { value: "" }, `the dictionary's: ${say(readings[0])}`), ...options(readings, enEvery[word]));
+      all.value = enEvery[word] || "";
       everywhere[word] = all;
       // a place with no reading of its own sings the word's everywhere one
-      const sameText = () => `same as everywhere: ${say(readings.find((r) => r.sounds === all.value) || readings[0])}`;
+      const sameText = () => `same as everywhere: ${readings.find((r) => r.sounds === all.value) ? say(readings.find((r) => r.sounds === all.value)) : all.value || say(readings[0])}`;
       const sames = [];
       all.addEventListener("input", () => { for (const o of sames) o.textContent = sameText(); });
       const list = rows.map((row) => {
         const same = el("option", { value: "" }, sameText());
         sames.push(same);
         const pick = el("select", { "data-pron-place": `${row.bar}:${row.beat}:${row.word}` },
-          same, ...readings.map((r) => el("option", { value: r.sounds }, say(r))));
+          same, ...options(readings, row.chosen));
         pick.value = row.chosen || "";
-        pick.addEventListener("input", () => { note.className = "hint save-note"; note.textContent = "Unsaved changes"; });
+        pick.addEventListener("input", unsaved);
         placeSelects.push([row, pick]);
         const words = row.line.split(" ");
         const line = el("span", { className: "pron-line" },
@@ -3193,37 +3440,89 @@ function pronunciationSection(P) {
           el("span", { className: "pron-place" }, `Bar ${row.bar}${row.n > 1 ? ` (${row.n}.)` : ""}`),
           line, el("span", { className: "hint" }, row.parts.join(", ")), pick);
       });
-      all.addEventListener("input", () => { note.className = "hint save-note"; note.textContent = "Unsaved changes"; });
+      all.addEventListener("input", unsaved);
       return el("div", { className: "pron-word" },
         el("div", { className: "row" }, el("strong", {}, word), el("span", { className: "hint" }, "everywhere in this song:"), all),
         ...list);
     });
     let stale = reply.stale;
+    const staleKey = (c) => `${c.lang}:${c.bar}:${Number(c.beat).toFixed(3)}:${c.word}`;
+    const staleKeys = new Set(stale.map(staleKey));
     const staleBox = el("div", { className: "pron-stale" });
     const drawStale = () => staleBox.replaceChildren(...(stale.length ? [
       el("p", { className: "hint err" },
         `${stale.length} reading(s) chosen earlier no longer match a word in the score: `
         + stale.map((c) => `“${c.word}” at bar ${c.bar}`).join(", ") + ". They are not sung."),
-      el("button", { onclick: () => { stale = []; drawStale(); note.textContent = "Unsaved changes"; } }, "Forget them"),
+      el("button", { onclick: () => { stale = []; drawStale(); unsaved(); } }, "Forget them"),
     ] : []));
     drawStale();
+    // Every saved reading the dictionary lists above do not hold, grouped by language, each with a
+    // remove button. They are sent back with each save unless removed.
+    const placeKeys = new Set(reply.places.map((p) => `${p.bar}:${Number(p.beat).toFixed(3)}:${p.word}`));
+    let saved = (reply.saved || []).filter((c) => !(c.lang === "en" && (c.bar == null ? c.word in byWord
+      : placeKeys.has(`${c.bar}:${Number(c.beat).toFixed(3)}:${c.word}`))) && !(c.bar != null && staleKeys.has(staleKey(c))));
+    const savedBox = el("div", { className: "pron-saved", "data-pron-saved": "" });
+    const drawSaved = () => {
+      const langs = [...new Set(saved.map((c) => c.lang))].sort();
+      savedBox.replaceChildren(...langs.map((lang) => el("div", { className: "pron-word" },
+        el("strong", {}, `Saved for ${langName[lang] || lang}`),
+        ...saved.filter((c) => c.lang === lang).map((c) => el("div", { className: "pron-row row", "data-pron-saved-row": `${lang}:${c.word}` },
+          el("span", { className: "pron-place" }, c.bar == null ? "everywhere" : `Bar ${c.bar}`),
+          el("strong", {}, c.word), el("code", {}, c.sounds),
+          el("button", { onclick: () => { saved = saved.filter((x) => x !== c); drawSaved(); unsaved(); } }, "Remove"))))));
+    };
+    drawSaved();
+    // a new reading in voice sounds, for a word everywhere in the song
+    const g2pLangs = reply.languages || [];
+    const songLang = g2pLangs.some((l) => l.code === reply.language) ? reply.language : "";
+    const newWord = el("input", { type: "text", placeholder: "word", "data-pron-new-word": "" });
+    const newLang = el("select", { "data-pron-new-lang": "" },
+      ...(songLang ? [] : [el("option", { value: "" }, "sung in…")]),
+      ...g2pLangs.map((l) => el("option", { value: l.code }, l.name)));
+    newLang.value = songLang;
+    const newSounds = el("input", { type: "text", placeholder: "voice sounds, e.g. it/k it/w it/i", "data-pron-new-sounds": "" });
+    const soundList = el("p", { className: "hint pron-sounds", "data-pron-sounds": "" });
+    const drawSounds = () => {
+      const lang = newLang.value;
+      if (!reply.pack) soundList.textContent = reply.note || "";
+      else soundList.textContent = lang ? `${langName[lang]} sounds: ${(reply.pack[lang] || []).join(" ")}` : "Choose the language the word is sung in.";
+    };
+    newLang.addEventListener("input", drawSounds);
+    for (const i of [newWord, newSounds]) i.addEventListener("input", unsaved);
+    drawSounds();
+    const addBox = el("div", { className: "pron-add" },
+      el("strong", {}, "A reading in the voice's own sounds"),
+      el("p", { className: "hint" }, "For a word in any language the song sings, everywhere in this song. Choose the language the word is sung in: a Latin refrain in a Finnish song is Latin."),
+      el("div", { className: "row" }, newWord, newLang, newSounds), soundList);
     const save = el("button", { className: "pron-save", onclick: async () => {
+      if (newWord.value.trim() || newSounds.value.trim()) {
+        if (!newLang.value || !newWord.value.trim() || !newSounds.value.trim()) {
+          note.className = "hint save-note err";
+          note.textContent = "Give the word, the language it is sung in and its sounds.";
+          return;
+        }
+      }
       const places = placeSelects.filter(([, pick]) => pick.value)
-        .map(([row, pick]) => ({ bar: row.bar, beat: row.beat, word: row.word, sounds: pick.value }));
-      const all = Object.fromEntries(Object.entries(everywhere).filter(([, s]) => s.value).map(([w, s]) => [w, s.value]));
+        .map(([row, pick]) => ({ bar: row.bar, beat: row.beat, word: row.text || row.word, sounds: pick.value, lang: "en" }));
+      const every = { en: Object.fromEntries(Object.entries(everywhere).filter(([, s]) => s.value).map(([w, s]) => [w, s.value])) };
+      for (const c of saved) {
+        if (c.bar == null) (every[c.lang] ||= {})[c.word] = c.sounds;
+        else places.push({ bar: c.bar, beat: c.beat, word: c.word, sounds: c.sounds, lang: c.lang });
+      }
+      if (newWord.value.trim()) (every[newLang.value] ||= {})[newWord.value.trim()] = newSounds.value.trim();
+      // every language this panel shows: English (the dictionary's list), each saved one, the new one's
+      const langs = [...new Set(["en", ...(reply.saved || []).map((c) => c.lang), ...Object.keys(every), ...stale.map((c) => c.lang)])];
       try {
-        draw(await postJSON(`${P}/pronunciation`, { places: [...places, ...stale], everywhere: all }));
+        draw(await postJSON(`${P}/pronunciation`, { places: [...places, ...stale], everywhere: every, langs }));
       } catch (e) { note.className = "hint save-note err"; note.textContent = e.message; }
     } }, "Save pronunciation");
     body.replaceChildren(
-      el("p", { className: "hint" }, groups.length
-        ? "Words the dictionary reads more than one way. Choose the reading the song means; until you do, the dictionary's is sung."
-        : "No word in the lyrics has two readings."),
-      staleBox, ...groups,
-      ...(groups.length || stale.length ? [el("div", { className: "row" }, save, note)] : []));
-    if (!groups.length && !stale.length) return;
-    note.className = "hint save-note";
-    note.textContent = "";
+      el("p", { className: "hint", "data-pron-english": "" }, reply.english_note ? reply.english_note
+        : groups.length
+        ? "English words the dictionary reads more than one way. Choose the reading the song means; until you do, the dictionary's is sung."
+        : "No English word in the lyrics has two readings."),
+      staleBox, ...groups, savedBox, addBox,
+      el("div", { className: "row" }, save, note));
   }
   return box;
 }
@@ -3232,7 +3531,8 @@ function pronunciationSection(P) {
 const normPart = (name) => name.toLowerCase().replace(/\s+/g, "");
 
 // The choir chosen on screen, per song, so it survives the panel being drawn again
-// (a saved score sends "state" and the whole panel is rebuilt).
+// (a saved score sends "state" and the whole panel is rebuilt). Only for this visit:
+// renderWorkspace empties it, so a song opened again shows its saved choir.
 const publishChoice = {};
 
 function publishSection(P, song, refresh, settings, saveNote) {
@@ -3247,7 +3547,7 @@ function publishSection(P, song, refresh, settings, saveNote) {
   const choirName = (c) => names[c] ? `${names[c]} (${c})` : c;
   const choir = el("select", { className: "publish-choir" },
     el("option", { value: "" }, "— choir —"));
-  choir.addEventListener("change", () => { publishChoice[P] = choir.value; });
+  choir.addEventListener("change", () => { publishChoice[P] = choir.value; showSung(); });
   const choirNote = el("p", { className: "hint publish-choirs" });
   if (song.publish_configured) {
     getJSON("/api/choirs").then((reply) => {
@@ -3256,7 +3556,7 @@ function publishSection(P, song, refresh, settings, saveNote) {
         const kind = c.public ? ", open to all" : c.staging ? ", test" : "";
         choir.append(el("option", { value: c.id }, `${c.name} (${c.id}${kind})`));
       }
-      choir.value = publishChoice[P] || pub.choir || "";
+      choir.value = P in publishChoice ? publishChoice[P] : (pub.choir || "");
       if (reply.error) {
         choirNote.className = "hint publish-choirs err";
         choirNote.textContent = `Could not read the site's choirs: ${reply.error}`
@@ -3265,9 +3565,43 @@ function publishSection(P, song, refresh, settings, saveNote) {
         choirNote.textContent = "The site has no choirs yet: add one with its scripts/add-choir.sh.";
       }
       if (site && !running && !pub.error) status.textContent = publishedText();
+      if (sungNote.dataset.choir) sungText(sungNote.dataset.choir);
+      else showSung();
     }).catch((e) => { choirNote.className = "hint publish-choirs err"; choirNote.textContent = e.message; });
   }
   const status = el("p", { className: "hint publish-status" });
+  // A sung version on the site is replaced only when asked (#483): this publish sends
+  // piano only. The note says so and offers the one button that does it.
+  const sungNote = el("div", { className: "publish-sung", hidden: true });
+  const sungText = (c) => {
+    sungNote.querySelector("p").textContent = `The ${choirName(c)} list has a sung version of this song. `
+      + "Publishing from here sends piano only and would replace it.";
+  };
+  // To keep the voices, sing it again instead: the command a person can copy.
+  const singCommand = (c) => `.venv/bin/python sing_song.py ${song.slug} --publish ${c}`;
+  const offerPianoOnly = (detail) => {
+    const cmd = el("input", { type: "text", readOnly: true, className: "publish-sing-cmd",
+      value: singCommand(detail.choir), style: "width:100%", onfocus: (e) => e.target.select() });
+    // One red line and the button; how to keep it sung is folded away (#500),
+    // since nearly every live song is sung and this shows for most of them.
+    sungNote.replaceChildren(el("p", { className: "hint err" }),
+      el("button", { className: "publish-piano-only", onclick: () => go(detail.choir, true) },
+        "Replace with piano only"),
+      el("details", { className: "publish-keep-sung" },
+        el("summary", {}, "Keep it sung instead"),
+        el("p", { className: "hint" }, "Publish by singing it again, on the host:"),
+        cmd));
+    sungNote.dataset.choir = detail.choir;
+    sungText(detail.choir);
+    sungNote.hidden = false;
+  };
+  // A choir this app recorded as sung is said as soon as it is chosen, not only
+  // after a refused publish; the site's own row is still checked on Publish.
+  const showSung = () => {
+    const refused = pub.error?.kind === "sung_on_site" && pub.error.choir === choir.value;
+    if (choir.value && (sites[choir.value]?.sung || refused)) offerPianoOnly({ choir: choir.value });
+    else { sungNote.hidden = true; delete sungNote.dataset.choir; }
+  };
   const publishedText = () => listed.map((c) => {
     const s = sites[c];
     const against = s.published_against || pub.published_against;
@@ -3280,35 +3614,51 @@ function publishSection(P, song, refresh, settings, saveNote) {
     status.textContent = "Publishing is off on this host: the Cloudflare keys are not in .env.";
   } else if (running) {
     status.textContent = "Publishing… the log below shows how far it is.";
+  } else if (pub.error?.kind === "sung_on_site") {
+    status.className = "hint publish-status err";
+    status.textContent = "Last publish was not sent.";
+    offerPianoOnly(pub.error);
   } else if (pub.error) {
     status.className = "hint publish-status err";
-    status.textContent = "Last publish failed: " + pub.error;
+    status.textContent = "Last publish failed: " + (pub.error.message || pub.error);
   } else if (site) {
     status.textContent = publishedText();
   } else {
     status.textContent = "Not published yet.";
   }
+  const go = async (to, pianoOnly) => {
+    btn.disabled = true;
+    sungNote.hidden = true;
+    appendLog(pianoOnly ? "Publishing piano only over the sung version…" : "Publishing…");
+    try {
+      // The settings on screen are saved with it, so what goes up is what is shown.
+      const body = { choir: to, settings: settings() };
+      if (pianoOnly) body.piano_only = true;
+      await postJSON(`${P}/publish`, body);
+      saveNote.textContent = "";
+      refresh();
+    } catch (e) {
+      status.className = "hint publish-status err";
+      btn.disabled = false;
+      if (e.detail?.kind === "sung_on_site") {
+        status.textContent = "Not published.";
+        offerPianoOnly(e.detail);
+      } else {
+        status.textContent = e.message;
+      }
+    }
+  };
   const btn = el("button", { className: "primary publish-btn",
     disabled: !song.publish_configured || running,
-    onclick: async () => {
+    onclick: () => {
       if (!choir.value) { status.className = "hint publish-status err"; status.textContent = "Choose a choir first."; return; }
-      btn.disabled = true;
-      appendLog("Publishing…");
-      try {
-        // The settings on screen are saved with it, so what goes up is what is shown.
-        await postJSON(`${P}/publish`, { choir: choir.value, settings: settings() });
-        saveNote.textContent = "";
-        refresh();
-      } catch (e) {
-        status.className = "hint publish-status err";
-        status.textContent = e.message;
-        btn.disabled = false;
-      }
+      go(choir.value, false);
     } }, site ? "Publish again" : "Publish");
   return el("div", { className: "publish-section" },
     el("h3", {}, "Stemmanauhat site"),
     el("label", {}, "Choir"),
     el("div", { className: "row" }, choir, btn),
     choirNote,
-    status);
+    status,
+    sungNote);
 }

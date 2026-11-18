@@ -215,6 +215,13 @@ that note, both halves, in this bar or across the barline, so playback sings the
 again. Strophic songs print **dashed** ties that belong to a later verse only, and homr
 reads them as real ties, so verse 1 loses a syllable (Gaudeamus igitur bars 6 and 8).
 Strict about `from` like the others, and replayed on every clean.
+A homr that reads the dash (eerovil/homr#100) writes `line-type="dashed"` on the tie or
+slur, MuseScore keeps it as `<lineType>2</lineType>`, and cleaning marks the bar `⚠ dashed
+tie?` or `⚠ dashed slur?` on a sung part (`utils/dashed_arcs.py`, #482) and leaves the arc:
+whether verse 1 sings it is the person's call. `untie` and `unslur` answer the mark once
+no dashed arc of that kind is left in that part's bar (a part sharing the staff keeps its own); an
+assembled tie or slur over a line break is dashed when either half was. homr finds a dash
+chain of four or more, so a short dashed tie can still come through solid and unmarked.
 
 `delete` (#352, `index`, `what`, optional `subtype`, `from`) takes a mark the scan invented
 off one chord — a fermata (Mieslaulu bar 13 has two where the page prints staccato
@@ -229,8 +236,9 @@ Kun poijat ne raitilla's scan put an empty bar between the "1." and "2." endings
 the "1." bracket covered two bars and the track played a bar of silence. A volta, slur
 or tie reaching across the bar is shortened by one, both halves, a "1." bracket that
 ends on the barline before it keeps its length, the removed-slur records (`removedSlurs`) move up with their bars, and a per-system lyric map loses the
-bar too; a spanner starting or ending in it, any volta starting in it, a repeat sign,
-or a clef/key/meter change refuses. Fixes apply **in file order**: an entry before a
+bar too; a spanner starting or ending in it, any volta starting in it, a repeat sign
+(the refusal names the `unrepeat` entry to put first, #480: a scan can read a double bar as a
+repeat), or a clef/key/meter change refuses. Fixes apply **in file order**: an entry before a
 `delbar` counts bars with the invented one still there, an entry after it without, so
 neither has to be renumbered; a Fix-panel pick is relocated (`relocate_picks`) in that numbering too, and the bars homr offered readings of are numbered off the scan, so `offers` maps them past the moved bars (`score_fixes.after_moves`). The printed-system bar labels (`.systems.json`) and the
 line breaks the previews take off the converted input still count the invented bar; the
@@ -279,9 +287,19 @@ the `voice2` entries they tie.
 `timesig` (#353, `measure`, `from`, `to`) takes a time signature the scan invented off
 every staff (`"to": null`) or writes another in its place (`"to": "6/8"`). Kesäaamu is
 printed in 6/8 and homr read a 3/4 at bar 22; the notes fit both, so `spurious_timesigs`
-cannot see it. Only a change that keeps the bar's length is allowed (3/4 and 6/8, or a
-removal where the meter in force is that length), bar 1 refuses, and it counts bars in
-file order like `delbar`.
+cannot see it. A change that keeps the bar's length only relabels (3/4 and 6/8, or a
+removal where the meter in force is that length). A change of length is allowed only where
+every bar the signature governs, up to the next one, already has the new length on every
+staff (a `len` override), and those overrides then come off (#480: homr put a 1/1 over a
+bar three quarters long); otherwise it refuses naming the first bar that does not fit.
+Bar 1's signature may be replaced, never removed. It counts bars in file order like
+`delbar`.
+
+`rehearsal` (#480, `measure`, `text`) puts a rehearsal mark on a bar: homr reads none at all,
+so a scanned score reached the site without the letters or numbers singers count bars from. The
+mark goes on the top staff of a part publish keeps (a rest-only click staff or a percussion part is passed over, by publish's own `score.part_is_silent`), in the first voice ahead of the bar's first note, where MuseScore keeps
+it, and the publish copy carries it into the MusicXML. A bar that already has one, on any staff,
+refuses. There is no Fix panel button for it (nor for most kinds): it is written into `fixes.json`.
 
 A further kind, `text`, is just a sentence (`{"kind": "text", "what": "..."}`), because
 most edits are none of the other three — turning a bar-length rest into a whole-bar
@@ -679,6 +697,10 @@ Key test modules:
   and (with MuseScore) the bar it had refused opens once the dot is back. `untie`
   (#342) takes both halves out across or inside a bar, gives the syllable back,
   leaves other ties alone, and replays on a rebuild.
+- `test_dashed_arcs.py` — added for #482: a dashed tie or slur in a sung part is marked
+  and kept, a solid or dotted one and an instrument part are not, a second clean marks
+  once, and `untie` / `unslur` answer the mark while a new `tie` does not; taking out a
+  solid tie, or one dashed tie of two, keeps it, and so does a part sharing the staff.
 - `test_delete_mark.py` — added for #352, on the shapes of Mieslaulu bar 13 and Annin
   laulu bar 19: the named fermata goes and the chord, its words and the bar's other
   fermata stay; every listed kind and `subtype`; each refused kind names its tool; a
@@ -764,6 +786,19 @@ Key test modules:
   import's `lyrics` record and stage survive. The rule it pins: `_rescan` writes only
   health and the fingerprint, onto the state re-read under `state.song_lock`, and
   every `Song.save` takes that lock and writes by rename.
+  **A save merges, and the lock reaches other processes** (#498, `test_state_merge.py`). A
+  clean held its start-of-run copy for minutes and saved it whole, erasing the publish record
+  `sing_song.py --publish` wrote meanwhile. `state.load` remembers what it read (`_base`), and
+  `Song.save` re-reads the file under the lock and writes only the top-level records this copy
+  changed since then, whole; `publish`, `publish.sites`, `scan.systems` and
+  `scan.answered_against` (`state.MERGED`) are merged a key deeper, so the panel's settings and a
+  CLI's choir record both survive, and a scan's band save keeps a grid answer stamped meanwhile.
+  `GET /systems` returns each system's reading (`stamps`) and the grid's `PUT` sends them back:
+  answers about a system read again since the grid loaded are refused (409). The grid counts systems from 0 and `.systems.json`'s bands from 1. `_assemble` saves, with the score, which band each grid row came from and that band's reading (`scan.assembled_order`, built on first read for a song assembled before it); the grid's stamps, the answer stamps and the drop of a row's answers read that list, never today's bands, so removing two bands at once drops both rows' answers, and answers for a row whose band was read again since the assembly are refused until a Scan assembles it (409, "Press Scan"). The PUT checks, saves the stamp and writes the answers in one `song_lock` hold, stamp first. `.persystem_cache.json` holds every song's answers, so `per_system.update_answers` writes it under an `flock` on `.persystem_cache.json.lock`, re-read inside the lock, through a temp file and `os.replace`, and refuses (`AnswerFileError`) a file that does not parse rather than overwrite it. Take another copy's
+  data with `song.adopt(fresh)`, never `song.data = fresh.data`, which drops the base and saves
+  whole. `song_lock` is re-entrant and also takes an `flock` under
+  `~/.local/state/musescore-choir-plugins/song-locks/` (the home from `pwd`, not `$HOME`), so
+  `sing_song.py` and `publish._move_records` wait for the app and the other way round.
 - `src/song_app/tests/test_score_file.py` / `test_score_file_ui.py` — added by this
   pull request for taking the score away to MuseScore and bringing it back (#216).
   The first is mostly about what must **not** be replaced: a PDF, a transfer that
@@ -1253,10 +1288,67 @@ state model are in `DESIGN.md`.
   line may say `"verse": n` and `"voice": 2`, one paste carries every verse, and it
   changes only what its lines name (an empty `text` clears that line). It is no longer
   a full replace of verse 1 (`run_lyric_import(replace=False)`).
+  **The prompt names the song's parts** (#482): `GET /api/prompt?slug=` appends the cleaned
+  score's part names, top staff first (`pipeline.lyric_prompt`, off `lyric_parts`), and
+  `lyric_json_prompt.txt` asks for them in every line's `"parts"`; `staff_number` and
+  `position` place a line whose `"parts"` is empty or names no part of the song. On a
+  per-system score the printed staff numbering shifts where a part rests, and a name does
+  not. A name two parts share, or a part with no name, is listed by its staff id. **A line
+  that names its part fills only its own printed system and never runs on** (owner's call on
+  #505): its end is cut at the next printed system (the caller's systems, else the score's
+  own line breaks), an end the source gave included, and syllables past it are crammed and
+  said as `too_many`. If its part has **no notes** there (a note held over by a tie counts)
+  it is not placed and comes back as a `part_rests` mismatch naming the part and bars, since
+  the name or the system is wrong. The by-system editor's boxes (by staff
+  id) and the older cells editor (by name) also name their part, but carry `"box": true`
+  and keep running on into an empty next system (#393). A
+  `staff_number` line runs on as before. A named entry and a `staff_number` entry landing on
+  one part, voice and verse in one block are not joined: the named one is used and the other
+  is a `two_lines` mismatch (`_block_lines`), which names both lines, so pasting either again (the named one alone, the usual correction) answers it. A name no part carries, or one two parts
+  share, is an `unknown_part` mismatch and the line falls back to `staff_number`, or is not
+  placed (and says so) when it has none that is a staff of the score; a staff id in
+  `"parts"` the score has not is unknown too (not checked under `--split`), and so is a
+  number in quotes that is one part's name and another staff's id (a bare number is always
+  a staff id, and a quoted number a part is named is that part); names are read like `lyric_parts` reads them (the instrument's
+  name when the part has none). These three warnings are about a source line, named in their
+  `lines` (`lyric_txt._line_ids`), and every import lists the lines it read
+  (`LyricImport.lines`); a later import drops such a warning only when it sends that line again
+  (`server._kept_warnings`), so pasting another part into the same system keeps it.
+  **A line is the line as written** (#482, design v12): canonical JSON of its bar, verse,
+  voice and `parts` exactly as given (types and list items kept, so `["2"]`, a part named
+  "2", is not `[2]`, staff 2), or `staff`/`position` for a numbered one, so two
+  entries naming one part in one block are one line and one warning, and a `two_lines`
+  warning names the line set aside and the named one. A warning is answered by itself
+  only when (a) that same line is sent again, or (b), for `part_rests` and `two_lines`,
+  a box import writes the warning's staff, verse and voice over its bars (an emptied box
+  counts). **A corrected name does not answer it**: a line with another name is another
+  line. What the app cannot see answered, a person takes off with **Dismiss** (a button
+  on every warning, in the paste list and in Type by system, where a warning about a
+  staff with no box in that system is listed above the boxes): `POST
+  /lyrics/warnings/dismiss {"id"}`, each warning's `id` being `lyric_txt.warning_id`
+  (stored, or a hash of its fields for one saved before ids). Dismissing the last one
+  moves a song on Lyrics to Review only when the words were imported against the score
+  as it is and no import is running.
+  **The import is a `lyrics` job** (#482): it writes the words into `<score>.lyrics-tmp`,
+  compares the score's fingerprint under the song lock and moves the copy over with
+  `os.replace`; a score saved meanwhile (MuseScore, an upload) is kept and the import
+  answers 409. Health is written afterwards only if the score is still the imported one.
+  Startup removes leftover `*.lyrics-tmp` files.
 - The clean panel's per-system grid mirrors the backend's answer rules: a blank cell
   inherits the staff's previous answer (shown as a faint placeholder) and `-` marks the
   staff silent from there on, clearing the carry — both cleared and never-named slots are
   flagged `unset` and listed in the "will be DROPPED" confirm before cleaning.
+  A printed system where every staff rests has no staves to name; the grid shows it as
+  one line, "Every staff rests here; names carry on to the next system" (#482), rather
+  than an empty block that read as a missing system. The owner chose not to number its
+  resting staves off the scan.
+  A system the page prints with staves but no singing (a piano interlude) is ticked
+  **No voices here (piano or instruments only)** under its heading (#482): its rows are
+  switched off and saved as `{"*": "rest"}` beside whatever was typed there
+  (`per_system.ALL_REST`, read back by `per_system.parse_answers`), so unticking gives
+  the names back. The clean rests every part through it and the names carry past it.
+  The terminal prompt (`per_system_prompt`) keeps such a system, and the names saved beside the
+  tick, and does not ask about it.
 - **Heavy slots** (`heavy_slot.py`). A homr read or a homr install is every core the
   machine has, and so is an agent's test suite — several at once is all of them slow
   rather than any finishing sooner. AgentDeck owns that queue (a small pool of
@@ -1308,7 +1400,7 @@ state model are in `DESIGN.md`.
   rewrites the lengths, re-brackets the triplets, moves ties and slurs with their notes
   and takes `rhythm?` off the red mark (#290: only what a pick answers comes off — a
   whole-bar pick takes homr's `rhythm?`, `pitch?`, `accidental?`, `notes?`, a pitch pick
-  `pitch?` and `accidental?`; `voice?` and cleaning's own marks stay). It carries the fragment's content stamp, and
+  `pitch?` and `accidental?`; `voice?` and cleaning's own marks stay, except that `long_bars`' "was 9/8, cut to 4/4 in voice 1" mark names the voices it cut, and a `bar` fix, which writes voice 1 only, takes off a mark naming voice 1 alone once voice 1 fills the bar; a mark naming another voice, or from before marks named voices, needs an `unmark`, #482). It carries the fragment's content stamp, and
   `drop_stale_picks` removes it before a clean once that system has been read again
   differently. "None of these" is kept in `.song.json` (`readings.declined`).
 - **Every problem is one list, each with its choices** (#290, `problems.py`, `GET
@@ -1380,7 +1472,8 @@ state model are in `DESIGN.md`.
   under `songs/`. From the phone the app is actually used from — or from any other
   computer — neither happens, so the Fix and Review stages could be read and never
   acted on. `GET /score-file` sends the cleaned `.mscx` as a download under its own
-  name, and `POST /score-file` puts the fixed one back: `pipeline.accept_uploaded_score`
+  name (with voice instruments written into the copy for a song cleaned before #481,
+  `pipeline.score_for_download`; the stored file and its fingerprint are untouched), and `POST /score-file` puts the fixed one back: `pipeline.accept_uploaded_score`
   parses it first and only then moves it into place, so a refused upload leaves the
   score that is there alone — this is the one route that overwrites the file every
   later stage is derived from. `.mscz` is accepted as well, because that is what
@@ -1586,6 +1679,13 @@ state model are in `DESIGN.md`.
   runner shipped is `src/kube_runner/runner.py` (see "Where heavy work runs" in
   `docs/pdf-to-practice-track.md`); on the owner's host it reads on eero-pc's GPU.
   `test_remote_runner.py` pins the contract with a stub runner.
+  `scripts/ssh-runner.sh` (#483) is a second runner, over plain SSH (`SSH_RUNNER_HOST`): it sings
+  lines only (`read-band` exits 2, so the band is read here), copies this checkout's `sing_ufr.py`
+  over with each line so the two sides cannot drift, and on SIGTERM ends the singer over there.
+  `src/sing_song/tests/test_ssh_runner.py` runs it against stub `ssh`/`scp`.
+  **A homr abort after a whole result is kept** (#483): homr can die in onnxruntime's shutdown
+  (SIGABRT, exit -6 or 134) after writing its MusicXML. `read_page` uses the file when it parses
+  and holds a measure, and logs it; any other crash, or an abort with no whole file, still fails.
   **One slot per page, not one per song.** The page is the unit `read_page` owns and
   each page writes its own MusicXML, so releasing between pages lets a suite in, and an interruption costs the page in flight rather than the song — the
   pages already read are on disk. A caller that would rather hold one lease across a
@@ -1964,6 +2064,14 @@ state model are in `DESIGN.md`.
   a whole note long whatever the meter, so counting it would drag every span with a
   resting staff towards 4/4), and a length no whole numerator fits is left with the
   signature it was given.
+  **A signature only a minority of the staves read is dropped** (#480), before any of
+  the above: one that fewer than half of the staves having the bar carry, that differs
+  from the meter in force, over a bar whose staves agree it is as long as that meter.
+  homr wrote a 1/1 on one of six staves of a 3/4 bar, and since a one-bar change needs
+  only that bar as evidence, the assembled score carried 1/1 on every part there. The
+  drop is logged (`Bar 5: dropped a 1/1 time signature only 1 of 6 staves read`). A
+  minority signature over a bar that really changed length, or one half the staves
+  read, is left to the rules below.
   **One bar is enough against a signature that only restates the meter already in force**,
   and that exception is what keeps the correction working at all. homr writes a signature
   at the head of every crop and again wherever its own decoding wobbled, and "the same as
@@ -2108,6 +2216,12 @@ state model are in `DESIGN.md`.
   score would still look complete. Without poppler it answers "no gaps" rather than "every
   page is a gap" — a missing binary must not be indistinguishable from an operator who has
   not drawn them yet.
+  **A page with no music can be left out** (#480): a title page, a page of piano solo.
+  The Systems editor's *Leave this page out* switch stores it in `.systems.json` as
+  `"skipped_pages": [n, ...]` (`pdf_systems.load_skipped`), and `pages_without_bands` counts
+  it as marked. A band on a left-out page is refused on save, Find systems proposes none
+  there, and a save that does not name `skipped_pages` keeps the ones stored. Saving bands
+  pings the song's `state`, so the Scan button turns on without a reload.
 
 - `system_finder.py` is added by this pull request: **where the printed systems are**,
   proposed rather than decided. Every band on this host was drawn by a person dragging,
@@ -2164,6 +2278,32 @@ state model are in `DESIGN.md`.
   systems). `Ask homr` (`{"method": "homr"}`) is still there, shown only when homr is
   installed. `test_quick_system_finder.py` pins it: drawn pages for the rules, the fixture
   and both B1 scans for the acceptance (needs poppler, no homr).
+  **A grey page sets its own ink threshold** (#480, `_ink`): ink was anything darker than
+  230, so a scan on grey paper read as ink from edge to edge and no system was found on any
+  page. A page whose median brightness is 240 or less now counts as ink what is clearly
+  darker than its own paper: 10 grey levels below the median, or four times the paper's
+  grain on a noisy scan, and never above 230. A whiter page keeps 230, so the pages
+  already drawn by hand read as before. Otsu's method was tried first and refused: on
+  near-white paper with faint staff lines its threshold fell between the black ink and
+  the lines, so the lines were read as paper and the page lost its systems.
+  `scripts/finder_vs_hand.py` counts the systems found on every hand-drawn page in `songs/`
+  against the bands drawn there (run it before and after a change to the finder). The
+  lyric editor's staff finder and `bar_box` use the same `_ink`.
+  **What joins two staves is stricter** (#480, `_joined`): pages over-split when a tight
+  crop put the systemic barline within the old 3% edge margin, and under-split when a
+  scan's printed border ran down the side through every gap. Now the outer **1%** is
+  ignored; a joining column must also run through the half of each staff next to the
+  gap; it must be darker than halfway between the paper and the page's darkest ink (a
+  grey shadow along the binding is not, nor a faint scan line where the staves start); and a **border column** never joins (`_border_columns`): one inked
+  through the page's top or bottom margin, or, within 3% of a side, one inked down every
+  staff of the page **and** through the two staff heights above the first or below the
+  last, read with the ink smeared 10 px sideways so a frame on a tilted scan is still
+  one line, plus 8 px either side. A tall system's own barline stops at its system and
+  so is not a border. The owner chose the 1%, the run into both staves and
+  the margin rule; the shadow and the near-side reach rule were added when the host's
+  pages showed them. `scripts/finder_vs_hand.py` on this host's hand-drawn pages: 42
+  pages read a different system count from the hand-drawn one before, 12 after, and none
+  got worse.
 - The **Scan panel** is added by this pull request (#116), replacing the holding one that
   #115 left. Its whole job is to stop a tidy-looking parse becoming a practice track, and
   every piece of it follows from that.
@@ -2218,16 +2358,27 @@ state model are in `DESIGN.md`.
   redrawing reloads every crop; a system read while it is open therefore appears in it.
   On a phone it is the existing pane switcher and the compare rows, both already built
   for 390px.
-- **Every clean asks MuseScore 3 whether it would open the result** (#235). MuseScore
+- **Every clean asks MuseScore whether it would open the result** (#235). MuseScore
   checks a score as it opens it (`Score::sanityCheck`: voice 1 of each staff must fill
   the bar exactly, no other voice may run past it) and calls one that fails
-  "corrupted" -- on Sangerhilsen the app crashed instead. **MuseScore 3 only**: with
-  MuseScore 4 as `MUSESCORE_CLI_PATH` the check answers `None` and the song records
-  "not checked" (#416). Only the app runs that check;
+  "corrupted" -- on Sangerhilsen the app crashed instead. Only the app runs that check;
   a command-line export does not, which is why every render went through and nobody
-  heard of it until a person opened the file. The one export that does run it is
-  `-o x.mlog`, so `pipeline.musescore_check` asks MuseScore itself rather than keeping
-  a copy of its rule here. Note MuseScore fills *gaps* with rests while reading, so a
+  heard of it until a person opened the file. The one MuseScore 3 export that does run
+  it is `-o x.mlog`, so with MuseScore 3 `pipeline.musescore_check` asks MuseScore
+  itself. **MuseScore 4 writes no `.mlog`** and refuses such a file outright when it
+  loads it, writing the reason only to its own log file (#481). So with MuseScore 4 the
+  check is the app's copy of that rule, `clean_score/utils/overlong_voices.py` (a voice
+  running past its bar), and the record says which ran (`verification.musescore.by`).
+  The raw scan is converted and rendered with `-f` so MuseScore 4 lets it in, and the
+  Clean panel lists those bars off `GET /systems`'s `overlong` (read off the converted
+  file on every load, so a reload shows them too) and the clean's log names them; the
+  cleaned check and publish never use `-f`. When a MuseScore 4 run fails,
+  `musescore_cli.failed_load_reason` reads the reason off its log (lines stamped during
+  the run, and only a refusal naming the file this run passed, since two songs may convert
+  at once) and the error names the bar
+  instead of blaming `MUSESCORE_CLI_PATH`; a MuseScore that does not start at all is
+  named once, in `musescore_cli.run`, so every render and export says so. Without any MuseScore the song records
+  "not checked". Note MuseScore fills *gaps* with rests while reading, so a
   short voice passes; what fails is a voice that runs past the bar, typically a
   misread triplet. `check_opens_in_musescore` runs after the recorded fixes: each
   staff-bar MuseScore rejects is reset to a whole-bar rest (`rejected_bars.clear_bar`,
@@ -2241,7 +2392,7 @@ state model are in `DESIGN.md`.
   page left in such a bar, and a file that will not open blocks the one route a person
   has for putting the right notes back.
 - **Check again and Undo last clean** (#391). `POST /recheck` (job `check`) runs the
-  clean's note comparison, MuseScore 3's check and health on the cleaned score as it
+  clean's note comparison, MuseScore's check (3 or 4) and health on the cleaned score as it
   is, and records them against its fingerprint. It **only reports**: unlike a clean it
   resets no bar MuseScore refuses (those become `musescore-corrupt` health rows), since
   the score may be a person's own edit. Before a clean replaces the score,
@@ -2251,10 +2402,13 @@ state model are in `DESIGN.md`.
   the clean made (`mark_made`), and Undo refuses (409) once the score differs from it,
   since anything done after the clean would be lost. `fixes.json` is not restored.
   A new job that writes the song shares the busy guard with every sibling job, both ways:
-  it refuses while they run, and they refuse while it runs. There is no single list: add its
-  kind to every `state.start_job(..., ("scan", "clean", "check", "publish"))` exclusion tuple
-  in `server.py`, to `_publish_busy` and to `/undo-clean`'s own running-job check, and test
-  both directions. Its undo refuses once the score has changed since.
+  it refuses while they run, and they refuse while it runs. The list is one tuple,
+  `server.WRITERS` (`scan`, `clean`, `check`, `publish`, `lyrics`, and `fix` for the short
+  routes that rewrite the score: an upload, a recorded slur, a picked reading or answer,
+  Undo, each run through `_fix_job`). Add its kind there, start it with
+  `state.start_job(song, kind, WRITERS)`, and test both directions. `_publish_busy` reads
+  the same tuple. `homr_install.SONG_JOBS` is a separate list (the jobs a homr install
+  waits for). Its undo refuses once the score has changed since.
 - **Hazards guarded:** re-cleaning warns it discards manual edits (the Clean
   button label changes once a cleaned file exists); lyric import uses `--replace`.
   No automatic LLM (users have no API key) — the lyrics stage supports either a
@@ -2363,7 +2517,8 @@ against the `laulun_aika.mscx` and `simple_1` fixtures.
    out. The app's clean also marks each bar the MuseScore check resets. Deleting a mark
    in MuseScore is how a person says the bar is fixed: until then health lists it
    (`marked-problem`) and the Fix panel reads it off the score (until #347 a copy went
-   into `fixes.json` as a `clean-marker` text entry). The publish copy strips marks
+   into `fixes.json` as a `clean-marker` text entry). A **dashed** tie or slur on a sung
+   part (`utils/dashed_arcs.py`) is marked `⚠ dashed tie?` / `⚠ dashed slur?` and kept. The publish copy strips marks
    (`score_export/score.prepare`), so a forgotten one never reaches the site.
 9. `centre_measure_rests` (`utils/measure_rests.py`, #298) runs last in both modes: a
    rest that alone fills its bar becomes a bar rest (`durationType` `measure`).
@@ -2385,6 +2540,16 @@ against the `laulun_aika.mscx` and `simple_1` fixtures.
    is made from, so a song cleaned before it is drawn right without a re-clean,
    which would cost its lyrics. `omr_systems.flatten` also steps to the bar's end
    before a right barline now, so new scans do not write the fake bar at all.
+11. `set_voice_instruments` (`utils/voice_instruments.py`, #481) runs last, in both
+   modes: every singing part gets a voice instrument id from its name (`S1` →
+   `soprano`/`voice.soprano`, A, T, B, `Bar` → baritone, any other name → `voice`/
+   `voice.vocals`). MuseScore 4 reads a part with no id, or MuseScore 3's `piano`, as a
+   piano and puts a new dynamic **below** the staff, where the words are; on a voice it
+   goes above. Only a part with no id or a piano id changes (any other id is someone's
+   choice), parts named as instruments (`Piano RH`, `Violin`, `Urut`), percussion and
+   rest-only staves are skipped, and the `Channel`/`program` is left alone, so the
+   sound and the MIDI do not change. Dynamics already in a score keep their side:
+   MuseScore 4 writes the side out when it converts an older file.
 
 Voice-count anomalies run first: a measure with >2 voices is beyond the splitter
 (which makes an upper/lower pair) and is either an OCR glitch or a real multi-way
@@ -2432,7 +2597,12 @@ the lyric block gives the b-part words of its own. The Review stage's note check
 counts those borrowed bars as copies of the base part's notes, not as a difference.
 A rest the scan wrote in its own voice or staff stays. Naming the part that way is the
 person's reading that the single line is unison, which is what the rebuild otherwise
-refuses to guess. **A line left unnamed is said out loud** (#330): the rebuild takes one name per
+refuses to guess. **A system with no voices** (#482) is answered `{"*": "rest"}`
+(`per_system.ALL_REST`): `_answers_in_force` skips it without touching the carry, so
+it declares nothing, every part gets measure rests there, the next system inherits the
+names from the one before it, `dropped_voices` reports nothing in it, and its lyric map
+entry is `"map": {}` with `"rest": true` (also written for a system with no staves).
+**A line left unnamed is said out loud** (#330): the rebuild takes one name per
 line, top first, so a two-voice staff answered with one name keeps the upper line and
 loses the rest — usually an answer typed once in system 1 and carried into a system
 where the page prints two lines there (Lemmen nosto lost ~150 alto notes that way).
@@ -2481,6 +2651,18 @@ by the OCR's source-staff order, which can be shuffled. `lyric_txt.py` import re
 (`_read_lyrics_system_map`) and resolves each JSON block via the map for the system
 covering its `measure_start`. Tested against `tests/test_files/laulun_aika.mscx` (a
 real converted score kept as a fixture).
+**Bars added in MuseScore after the clean** (#482): the map's bar ranges were written at
+the clean, so a bar added later shifted every later system's words. Every reader goes
+through `per_system.read_system_map(root)` (lyric import, the lyric editor's system labels,
+`bar_readings`, `implode` and `staff_groups`). When the map's last bar is not the score's
+bar count and the score's own line breaks give as many systems as the map has entries, the
+ranges are re-read off the breaks, in memory only (`MAP_RECOUNTED`); otherwise the map is
+`MAP_STALE`, used as recorded, and the Fix panel shows one row (`problems.STALE_MAP`, kind
+`stale-map`) asking for a clean or an `insbar`/`delbar` entry. A map that still ends on the
+last bar is used as recorded, even when a break moved. On this host's songs: 6 stale, none
+recounted. The Fix rows read their printed systems through `pipeline._printed_system_bounds`
+too (`problems._bounds`), so a row's system and its staff come off one numbering, recorded
+`delbar`/`insbar` moves included.
 Caveat: the musical-rank ordering is wrong when an ossia/extra voice is *printed on top*
 (e.g. T3 above T1/T2) — then the PDF's printed numbering doesn't match rank order, so a
 staff_number-based JSON maps to the wrong voice. The robust fix is to address voices in
@@ -2539,7 +2721,10 @@ now needs to offer a person a list of parts to point at.
 sniff). **Diagnostics are returned, never printed**: `LyricImport.mismatches` is a
 list of `Mismatch(kind, message, measure_start, measure_end, staff_ids, syllables,
 slots, verse, voice)` — kinds `too_many` / `too_few` / `no_systems` / `no_system_for_line` /
-`block_count` — plus `filled_measure_starts` for nulls inferred from the printed
+`block_count` / `part_rests` (a line naming a part with no notes in its system, #482) /
+`unknown_part` (a `"parts"` name no part, or more than one, carries) / `two_lines` (a
+named line and a `staff_number` line on one part; the named one is used)
+— plus `filled_measure_starts` for nulls inferred from the printed
 systems. `to_dict()` puts them on the wire for the browser; the CLI wrapper prints
 `Warning: <message>` itself, so terminal output is unchanged.
 
@@ -2592,7 +2777,10 @@ systems. `to_dict()` puts them on the wire for the browser; the CLI wrapper prin
   A null `measure_start` (the LLM emits null when no measure number is printed at the
   start of a line) is auto-filled by `_fill_missing_measure_starts` (reported as `filled_measure_starts`): blocks are one
   per printed system in order, so each null block takes the start measure of the
-  system at its position (`per_system.system_ranges`); explicit values are left alone, and a
+  system at its position (`per_system.system_ranges`), skipping a system the map marks
+  `rest` (#482: it prints no words) unless there is one block for every printed system,
+  rest ones included; a `staff_number` line in a `rest` system is not placed and comes
+  back as `part_rests`; explicit values are left alone, and a
   block-count vs system-count mismatch is warned (so the user verifies alignment).
 - Import is in-place on the tree and **changes only what it names** (#392, #397):
   a JSON line is one part, voice and verse from its block's `measure_start`, and fills
@@ -2647,7 +2835,13 @@ timing are the same parts on the same clock.
   them, not just enough to reach five). The pairs come from `lyricsStaffMap`, or for
   a per-system song the pairs sharing a printed staff in the most bars (a part
   cannot move between staves on the site), or failing both a guess from the names
-  (a b-part with its main part, then S1+S2). The upper part takes voices 1 and 3
+  (a b-part with its main part, then S1+S2). A `lyricsStaffMap` giving every printed staff one
+  part (a score handed over one part to a staff, so the clean split nothing), or a
+  `lyricsSystemMap` where no printed staff ever holds two, says nothing about the page
+  (for shared staves) and goes to the name guess, and a b-part that only borrows its main part's notes
+  (`follow`) sits on that part's printed staff (#482). The panel says "the page prints
+  every part on its own staff" only when a record of the page found no pairs, and names pairs it refused for
+  carrying too many voices. The upper part takes voices 1 and 3
   and the lower 2 and 4, since MuseScore stems 1/3 up and 2/4 down and a unison
   then shares a notehead; a pair needing more is left apart and logged. Only
   `score.musicxml` is merged: the MIDI and the timing come off the unmerged copy,
@@ -2660,6 +2854,25 @@ timing are the same parts on the same clock.
   The copy rewrites every fermata's stretch so it adds one beat (a dotted quarter in
   6/8), worked out from the span MuseScore stretches: from the fermata's beat to the
   next note or rest on *any* staff. A fermata marked not to play is left alone.
+- **A printed rit. or accel. is played** (#483, `score.gradual_marks`, `add_gradual`).
+  MuseScore plays such a text at the speed before it, so a song slowing into its end
+  played straight through, and so did the voices sung off its clock. The copy writes
+  hidden tempo marks beat by beat, easing in a straight line to 75% of the speed
+  (accel.: 125%) on the last beat before the ramp ends: at an "a tempo" or "Tempo I"
+  text (back to the speed before the mark, or the opening one; a visible "a tempo" or
+  "Tempo I" tempo mark is set to that speed rather than to what the scan wrote), a tempo mark (which
+  keeps its own speed), a fermata (the speed before the mark comes back after it), the
+  next rit./accel. (which starts from where this one left off) or the end. A beat inside a
+  held note or rest still gets its mark, written at the voice's end behind a `location`
+  that steps back to the beat (`_place_at`, which MuseScore plays on time); a mark with no beat left is logged and
+  played as written. The spellings are in `_GRADUAL` (rit., ritard., riten., rall.,
+  accel. and their long forms, also inside "dim. e rit."); "ritmico" is not one. The
+  Publish panel lists the marks, each with where its ramp stops and why ("eases until bar 42
+  (fermata)", `gradual_marks`' `until`/`until_why`, counting the panel's saved tempo
+  changes), and saves `publish.gradual`
+  (`[{"measure", "bpm", "off"}]`, matched to the first mark in that bar; a second mark in
+  the bar is listed without controls and eases to 75%): a target BPM in place of 75%, or off. A saved setting whose bar has lost its mark is shown, dropped
+  on save, and ignored by a publish.
 
 `musescore.py` is the MuseScore 3 or 4 command line (`run_musescore`, bounded by
 `CLI_TIMEOUT` because a wedged MuseScore otherwise hangs the publish) and the part
@@ -2788,11 +3001,21 @@ tempo, part names, credits), then for each part: `unroll.py` writes each line (t
 of the staff) on the bundle's clock, `check_onsets.py` stops the run unless every note starts
 within 50 ms of a note in `score.mid`, `spoken.py` cuts a sentence on one held chord into a
 syllable a note, `g2p.py` gives the sounds of a song not in Finnish, `sing_ufr.py` sings it
-(UFR DiffSinger: every part of a men's song REMY and of a women's LYSE, by the song's voicing; in a mixed song or one with no voicing, LYSE for S/A/M parts and REMY for T/B, and a part called just "Solo" stops the run), two different lines of a part are mixed
+(UFR DiffSinger: every part of a men's song REMY and of a women's LYSE, by the song's voicing; in a mixed song or one with no voicing, LYSE for S/A/M parts and REMY for T/B, and a part whose name says no voice, like "Solo", by its clef: treble LYSE, bass or treble-8
+REMY, said in the log; `--voice NAME=VOICE` overrides one part, named case-insensitively when exactly one part has that name, else by its number; two different bare `--voice VOICE` are refused), two different lines of a part are mixed
 at half volume each, and `gate.py` fades the rests where the whole part rests (the voice
 leaves a hiss). `--fold-divisi` folds lettered divisi parts (`S1b`) into their part as further
 voices (Katedralen, eeron-omat-taskit#104). `--publish <choir>` hands the MP3s to
-`publish.publish` as `Bundle.sung`. It came from eeron-omat-taskit's `sing-song/` (#439),
+`publish.publish` as `Bundle.sung`. A publish that sends piano only (`--no-sing --publish`, or the app's
+Publish) is refused, exit 3, when the site already has a sung version for that choir, checked
+against the site's own row right before writing it; `--piano-over-sung` (the panel's "Publish
+piano only" after it asks) replaces it (#483); the panel then also shows the `sing_song.py --publish`
+line that keeps it sung. Each publish writes under its own version prefix (time plus six hex
+characters), so a refused one deletes only its own files. `--try PART:A-B` sings bars A to B of one part
+(the first pass through them, so a repeat is not sung twice; `check_onsets.py` then checks only
+the notes starting in that phrase) and stops, to listen to a phrase before a whole run: it writes `try/<n>-<Name>-bars-A-B.mp3`
+under `--out`, keeps a word that starts in range whole, prints how long the music and the
+singing took, and publishes nothing. It came from eeron-omat-taskit's `sing-song/` (#439),
 where its history is. The bundle's `words.json` (`sung_words()`) lists each part's notes with
 the syllable sung on each; `--publish` sends it along (`Bundle.words`), and the site sings a
 note several parts start together once only where they sing the same syllable
@@ -2817,7 +3040,30 @@ progress to `songs/<slug>/.sing-run.json` (`progress.py`). The song list (`GET /
 `song_app/resing.py`) calls a song pending in a choir where the site lists it sung (its D1 `songs`
 rows, kept in `songs/.site-songs.json`) and this app did not publish that upload with the current
 version; the test list never counts.
+`SINGER_CHANGES` beside it says what each version changed: `"*"` (every song) or a language code
+(#484), so a version that changes English re-sings only songs sung in English. A song's language
+is `songs/<slug>/language.json` (`language_check.py`; not `.song.json`, so a job's stale save
+cannot undo it), set from the New song form, the Start panel (`POST /language`) or the first
+`--lang`; `--change-lang` replaces it. With none saved, a song is sung as Finnish only when its
+words look Finnish (`looks_foreign`), and the re-sing list reads that check once per score
+(`songs/.resing-language.json`).
 
+**Languages and saved readings** (#484): every language a song can be sung in is one entry in
+`languages.py` (name, whether g2p sings it, its exact vowel set, the sound prefixes a reading may
+use, its rules); a variant (`la-de`, Latin the German way) names a `base` and lays its own rules
+over it, and `languages.get` follows the chain. `language_check.LANGUAGES` and `main.G2P` are
+read from it. `g2p.py` loads it by path, since the singer runs it with `python -I`. A saved
+reading in `pronounce.json` carries the `lang` it is sung in (places `{bar, beat, word, sounds,
+lang}`, `everywhere: {lang: {word: sounds}}`; an entry with none is English) and is voice sounds,
+or ARPAbet for English only, checked against the pack's `core/phonemes.json` on save. A run
+copies `pronounce.json` into its work folder once, so a save mid-run waits for the next run; each
+g2p run writes `<notes>.<lang>.used.json`, and the run logs the saved readings none used.
+`src/sing_song/tests/test_g2p_unchanged.py` (host only) pins English and Latin against g2p
+before #484 over every foreign-looking song in `songs/`.
+
+`SING_PROVIDER` (#483, `sing_ufr.providers`) picks the singer's onnxruntime provider: `cpu`,
+`cuda` (or `GPU=1` when unset), or `coreml`, which falls back to the processor when the build has
+no CoreML; each model's provider is logged. The kube runner does not pass it on.
 The singer runs in its own venv (`scripts/install-singer.sh`, default
 `~/.local/share/musescore-choir-plugins/sing-venv`; CUDA 11 onnxruntime when there is an NVIDIA
 card, because eero-pc's GTX 970 is below newer builds' floor; it runs on this host's GTX

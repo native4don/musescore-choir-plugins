@@ -148,7 +148,15 @@ in a name becomes `_`), `score.musicxml`, `score.mid`, and its working files in 
 minutes on a graphics card, much longer on the processor. MuseScore needs a screen even to
 export: run it in the desktop's session, or with its `DISPLAY` and `XAUTHORITY` set.
 
-- Not in Finnish: `--lang en|de|sv|la|et`. Two languages: `--lang-from fi:Word,...` names the
+- The language of the words is saved with the song, in `songs/<slug>/language.json` (#484): set
+  it on the New song form or the song's Start panel, or give `--lang en|de|sv|la|et|no|fi` once and
+  the run saves it. Later runs sing in the saved language; a `--lang` that differs stops the run
+  unless `--change-lang` is given too. A song with no saved language is sung as Finnish only if
+  its words look Finnish: when 15% or more of its distinct words (at least 3) do not, the run stops and asks
+  for `--lang`. Estonian and some Swedish words look Finnish to that check, so save their
+  language. English "I", "ow" and "oy" sounds (child, now, boy) are sung as two vowels;
+  `DIPH` (default 0.5) is the share of the note the first one takes.
+- Two languages: `--lang-from fi:Word,...` names the
   first word of each stretch (it stops and lists the words it thinks you missed).
 - An English word the dictionary reads two ways ("wind" the breeze or the clock's, "read",
   "live", "tear", "bow", "lead"): the song page's Publish stage has a **Pronunciation** list
@@ -159,6 +167,15 @@ export: run it in the desktop's session, or with its `DISPLAY` and `XAUTHORITY` 
   (bar, the beat the word starts on, word), for every part singing the word there together and
   on every pass through the bar; a part entering later on the same word has a place of its own. After a score edit
   the list and the sing run name any choice whose word is no longer at its place.
+- A word in any language g2p sings (English, German, Swedish, Latin, German-style Latin,
+  Estonian) can be given a reading in the voice's own sounds (`it/k it/w it/a`), in the
+  Pronunciation list's "reading in voice sounds" box. Pick the language the word is **sung in**
+  (a Latin refrain in a Finnish song is Latin); the pack's sounds for it are listed beside the box.
+  English readings may also be ARPAbet (`R EH1 D`), never a mix of the two. A reading is used
+  only by the run of its own language; the sing run logs each saved reading no run used
+  ("a saved reading was not used: ...").
+- Latin sung the German way (soft c as "ts", h sounded, qu as "kv"): set the song's language to
+  **Latin (German style)**, `--lang la-de`, or `--lang-from la-de:Word` for a stretch.
 - A word a choir says its own way, in every song: `choirs/<choir>.json`, read for each
   `--publish <choir>`, as a sound-alike spelling: `{"pronounce": {"harvest": "har-vist"}}`.
   A place chosen on the song page wins over it. A spelling that gives a sound the voice lacks
@@ -192,6 +209,28 @@ here. The one runner shipped is `src/kube_runner/runner.py`, for a node with an 
 a Kubernetes cluster: set `REMOTE_KUBE_CONTEXT` to its kubectl context. Its first job builds the
 venv there (minutes), and the first line copies the voices from `UFR_DIR`.
 
+**Any machine you can `ssh` into can sing** with `scripts/ssh-runner.sh` (it sings only; scanned
+bands are read here). On that machine, clone this repository, run `scripts/install-singer.sh
+<the voice pack zip>` there (download the pack onto it yourself: its terms forbid copying it
+around), and check `ssh <host> true` works without a password prompt. Then in `.env` here:
+
+```bash
+REMOTE_RUNNER=scripts/ssh-runner.sh
+SSH_RUNNER_HOST=user@host            # or a ~/.ssh/config name
+# SSH_RUNNER_SING_VENV, SSH_RUNNER_UFR_DIR: only if not install-singer.sh's defaults there
+# SSH_RUNNER_ENV="GPU=1"             # settings for the singer there only
+```
+
+Each line goes over with this checkout's `sing_ufr.py`, so the two machines cannot sing with
+different rules; the song's own settings (its language and so on) go with it, while the voices'
+folder, the card and the provider are the other machine's. A rented GPU machine works the same
+way: install the singer and the voice pack on it, and point `SSH_RUNNER_HOST` at it.
+
+**The singer's provider** is `SING_PROVIDER`: `cpu`, `cuda` (what `GPU=1` meant), or `coreml`,
+which tries Apple's CoreML and falls back to the processor, saying so in the log. The log names
+each model's provider. CoreML has not been measured: time it on one phrase with `--try PART:A-B`
+against `SING_PROVIDER=cpu`, listen to both, and report the numbers on the issue.
+
 ## 7. Publish (optional)
 
 Ask the person which list it goes on. With the site's Cloudflare keys in `.env`
@@ -208,6 +247,30 @@ A part name the site's voice tree does not know stops it; ask the person where i
 `--place "Name=<id>"`, `--place "Name=-"` (no place) or `--place "Name=^<parent>"` (a new place
 under one). Publishing again makes a new version and takes the old one away. Never publish
 piano-only (`--no-sing`) over a sung song.
+
+## Adding a language variant
+
+A variant is a language sung like another with a few sounds changed, as `la-de` is Latin with
+German consonants. Everything about it is one entry in `src/sing_song/languages.py`:
+
+```python
+"la-de": {"name": "Latin (German style)", "base": "la",
+          "rules": {"h": ["de/h"], "c+front": ["de/ts"], ...}, "words": {}},
+```
+
+- `base` is the language it follows. Every field it leaves out (`g2p`, `vowels`, `prefixes`,
+  `finnish_look`) is its base's, and its `rules` are laid over the base's table, so the base
+  itself sings as before.
+- A rule key may end in `+front`: it applies only before e, i, y, ä, ö, é, ae or oe.
+- `words` holds whole-syllable readings, used before any rule.
+- `prefixes` lists the sound prefixes a reading may use (`it/`, `de/`); give it only when the
+  variant's rules use a prefix the base does not have.
+
+Nothing else needs a list: the app's language selects, `--lang`, `--lang-from`, the Finnish-word
+check and the re-sing list all read `languages.py`. A later singer change naming the base (in
+`SINGER_CHANGES`) re-sings the variant's songs too. Run `src/sing_song/tests/test_main.py` and `test_g2p.py` (the first
+checks every rule sound has one of the language's prefixes), then sing a phrase with
+`--try` and listen.
 
 ## Re-singing after the singer changed (#453)
 

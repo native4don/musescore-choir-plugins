@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import tempfile
 import traceback
+import urllib.parse
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Set
 
 import dotenv
@@ -23,7 +26,10 @@ from . import (agentdeck, bar_readings, health, heavy_slot, homr_install, job_st
 from . import clean_backup
 from . import resing
 from src.sing_song import places as song_places
+from src.sing_song import languages
+from src.sing_song import language_check
 from src.sing_song import progress
+from src.clean_score import lyric_txt
 from src.clean_score.utils.score_fixes import FixError
 from src.score_export.score import START as START_TEMPO
 from src.score_export import staff_groups
@@ -164,11 +170,22 @@ def _derived(song: state.Song) -> Dict:
     return {
         **song.data,
         "slug": song.slug,
+        # The language it is sung in (#484): its own file, not .song.json; None when unsaved.
+        "language": song.language,
+        # The lyric warnings with the ids Dismiss sends back (#482).
+        "lyrics": {**(song.data.get("lyrics") or {}),
+                   "warnings": _with_ids((song.data.get("lyrics") or {}).get("warnings"))}
+        if song.data.get("lyrics") else song.data.get("lyrics"),
         "stages": state.STAGES,
         "stage_index": state.STAGES.index(song.stage) if song.stage in state.STAGES else 0,
         "has_pdf": bool(pdf and os.path.exists(pdf)),
         "has_cleaned": bool(cleaned and os.path.exists(cleaned)),
         "needs_initial_bpm": needs_initial_bpm,
+        # the score's printed rit./accel. marks, for the Publish panel (#483)
+        "gradual_marks": pipeline.gradual_marks(
+            cleaned, (song.data.get("publish") or {}).get("tempo_changes"),
+            (song.data.get("publish") or {}).get("bpm"))
+        if cleaned and os.path.exists(cleaned) else [],
         # Printed-system bounds, labelled with the measures they cover: what lets
         # the viewer show one system and the lyric editor ask per system.
         "systems": systems,
@@ -218,6 +235,29 @@ def _job_finish(song: state.Song, kind: str, error: Optional[str] = None) -> Non
         job_state.finish(song.dir, kind, error=error)
     except Exception:
         traceback.print_exc()
+
+
+# Every job that writes a song's cleaned score or reads it at length, and the one
+# tuple each of them is started against (#482): whichever reaches `state.start_job`
+# first runs and the other answers 409, decided in one lock-held check. `lyrics` is
+# the lyric import; `fix` is a short route rewriting the score (an upload, a recorded
+# slur, a picked reading or problem answer, an undo of the last clean).
+WRITERS = ("scan", "clean", "check", "publish", "lyrics", "fix")
+
+
+@contextmanager
+def _fix_job(song: state.Song, refused: str):
+    """Run a short score-rewriting route as a `fix` job, finished on every exit."""
+    if is_scanning(song) or not state.start_job(song, "fix", WRITERS):
+        raise HTTPException(409, refused)
+    error = None
+    try:
+        yield
+    except BaseException as exc:
+        error = str(getattr(exc, "detail", "") or exc) or type(exc).__name__
+        raise
+    finally:
+        _job_finish(song, "fix", error)
 
 
 # --------------------------------------------------------------------------
@@ -325,6 +365,7 @@ async def api_create(
     name: str = Form(""),
     per_system: bool = Form(False),
     voicing: str = Form(""),
+    language: str = Form(""),
     xml: UploadFile = None,
     pdf: UploadFile = None,
 ) -> Dict:
@@ -349,6 +390,8 @@ async def api_create(
 
     if voicing and voicing not in ("men", "women", "mixed"):
         raise HTTPException(400, "voicing must be men, women or mixed")
+    if language and language not in language_check.LANGUAGES:
+        raise HTTPException(400, f"language must be one of {', '.join(language_check.LANGUAGES)}")
     # Read every upload first, then make the song and write them in one step under
     # its lock (#428): no await may fall between claiming a slug and filling it.
     sources = {}
@@ -357,8 +400,35 @@ async def api_create(
     if has_pdf:
         sources["pdf"] = (pdf.filename, await pdf.read())
     song = state.create(name, per_system, voicing, sources=sources,
-                        stage="clean" if has_xml else "scan")
+                        stage="clean" if has_xml else "scan", language=language)
     return {"slug": song.slug}
+
+
+@app.get("/api/languages")
+def api_languages() -> Dict:
+    """The languages a song can be sung in (#484), code -> name, Finnish first."""
+    return {"languages": [{"code": c, "name": n} for c, n in language_check.LANGUAGES.items()]}
+
+
+@app.post("/api/songs/{slug}/language")
+def api_set_language(slug: str, body: Dict) -> Dict:
+    """Save the language the song is sung in (#484). Not held back by a running job: it is its
+    own file, which no job writes. A singing run already going keeps the language it started
+    with, and the reply says so; the song list then shows the song as needing a re-sing."""
+    song = _require(slug)
+    code = (body or {}).get("language")
+    if code not in language_check.LANGUAGES:
+        raise HTTPException(400, f"language must be one of {', '.join(language_check.LANGUAGES)}")
+    with state.song_lock(slug):   # a reading saved meanwhile reads the language under it (#484)
+        old = song.language
+        language_check.save(song.dir, code, "app")
+    reply = {"language": code, "previous": old, "note": None}
+    run = progress.read(song.dir)
+    if run and run.get("state") in progress.RUNNING and run.get("sing", True) \
+            and run.get("language") and run.get("language") != code:
+        reply["note"] = (f"a singing run (pid {run.get('pid')}) is singing this song in "
+                         f"{language_check.describe(run['language'])}; it will be marked for re-singing")
+    return reply
 
 
 @app.get("/api/songs/{slug}")
@@ -446,7 +516,7 @@ def _start_scan(song: state.Song, slug: str, body: Optional[Dict],
         except omr.HomrMissing as exc:
             raise HTTPException(400, str(exc)) from None
     if is_scanning(song) or not state.start_job(
-            song, "scan", ("scan", "clean", "check", "publish"),
+            song, "scan", WRITERS,
             pdf_systems.file_version(song.source_path("pdf"))):
         raise HTTPException(409, "Another scan, clean, or publish is "
                                  "already running for this song.")
@@ -530,24 +600,85 @@ def api_systems(slug: str) -> Dict:
     xml = song.source_path("xml")
     if not xml:
         raise HTTPException(400, "No source file")
-    mscx = pipeline.convert_to_mscx(xml, song.dir)
-    return {"grid": pipeline.system_grid(mscx)}
+    try:
+        mscx = pipeline.convert_to_mscx(xml, song.dir)
+    except RuntimeError as exc:
+        # MuseScore refused the input; say why rather than a bare 500 (#481).
+        raise HTTPException(422, str(exc))
+    # The bars whose voices run past the barline, read off the converted file on
+    # every load, so the Clean panel shows them on its first view and after a
+    # reload alike (#481). The clean's own log names them again as it runs.
+    grid = pipeline.system_grid(mscx)
+    # Which reading of each system this grid shows. The panel sends them back
+    # with its answers, so answers typed against a system read again since the
+    # grid was loaded are refused rather than stamped onto the new reading (#498).
+    stamps = scan.system_stamps(song, range(len(grid)))
+    return {"grid": grid, "overlong": pipeline.overlong_in(mscx),
+            "stamps": {str(i): stamp for i, stamp in stamps.items()}}
 
 
 @app.put("/api/songs/{slug}/systems")
 def api_save_systems(slug: str, answers: Dict = None) -> Dict:
-    """Persist grid answers: {system_index: {staff_id: 'T1,T2'}}."""
+    """Persist grid answers.
+
+    The body is `{"answers": {system_index: {staff_id: 'T1,T2'}}, "stamps":
+    {system_index: reading}}`, the stamps being what `GET /systems` said the grid
+    showed. A bare answers mapping is still taken, checked against the readings
+    as this request found them.
+    """
     song = _require(slug)
+    body = answers or {}
+    client_stamps = body.get("stamps") if isinstance(body.get("answers"), dict) else None
+    if isinstance(body.get("answers"), dict):
+        body = body["answers"]
+    # A system's answers may hold `per_system.ALL_REST` beside the staff ids:
+    # "No voices here" (#482).
+    parsed = pipeline.per_system.parse_answers(body)
+    # The readings these answers are about: the ones the grid showed when the
+    # panel loaded it, or failing that the fragments as this request found them,
+    # before the slow conversion below.
+    if isinstance(client_stamps, dict):
+        answered = {i: client_stamps.get(str(i)) for i in parsed}
+    else:
+        answered = scan.system_stamps(song, list(parsed))
     xml = song.source_path("xml")
     mscx = pipeline.convert_to_mscx(xml, song.dir)
-    parsed = {int(si): {int(sid): v for sid, v in staves.items()}
-              for si, staves in (answers or {}).items()}
-    pipeline.save_system_answers(mscx, parsed)
     # An answer is about the staves of one scanned system, so it is derived from
     # that system's fragment and has to say which one, or a re-scan cannot know
-    # it has invalidated it.
-    scan.stamp_answers(song, list(parsed))
-    song.save()
+    # it has invalidated it. Checked and written on the state as it is now, under
+    # the lock: a system read again meanwhile has other staves, and stamping the
+    # new reading onto answers about the old one would make them look current
+    # (#498).
+    with state.song_lock(slug):
+        fresh = state.load(slug) or song
+        changed = sorted(i for i, stamp in scan.system_stamps(fresh, list(parsed)).items()
+                         if stamp != answered[i])
+        if changed:
+            raise HTTPException(
+                409, "System " + ", ".join(str(i + 1) for i in changed)
+                + " was read again while these answers were saved. "
+                "Reload the grid and answer it again.")
+        # A band read again since the score was put together: the grid still
+        # shows the old reading, and answers about it would be stamped with a
+        # reading they are not about. After a crash no scan is running to finish
+        # it, so the sentence says to press Scan rather than to wait.
+        unassembled = scan.unassembled_rows(fresh, list(parsed))
+        if unassembled:
+            raise HTTPException(
+                409, "System " + ", ".join(str(i + 1) for i in unassembled)
+                + " was read again since the score was put together. Press Scan "
+                "on the Scan stage to finish it, then reload the grid.")
+        # The stamp is saved before the answers: a crash between the two leaves
+        # a stamp with no new answers, which is harmless. The other order could
+        # leave answers no stamp ties to a reading, which a re-read never drops.
+        # Both stay inside this one lock, so no re-read lands between them.
+        scan.stamp_answers(fresh, list(parsed))
+        fresh.save()
+        try:
+            pipeline.save_system_answers(mscx, parsed)
+        except (OSError, pipeline.per_system.AnswerFileError) as exc:
+            raise HTTPException(500, f"Could not save the answers: {exc}")
+    song.adopt(fresh)
     return {"ok": True}
 
 
@@ -601,13 +732,17 @@ def _run_clean(slug: str) -> None:
         }
         # Run the health check.
         found = _health_scan(song, cleaned)
-        prev = song.data.get("health", {}).get("issues", [])
-        song.data["health"] = {
-            "checked_against": song.data["cleaned_fingerprint"],
-            "issues": health.merge_issues(found, prev),
-        }
-        song.set_stage("fix")
-        song.save()
+        # The issues as they are now, not as this clean found them minutes ago,
+        # so a row dismissed while it ran stays dismissed (#498).
+        with state.song_lock(slug):
+            now = state.load(slug) or song
+            prev = now.data.get("health", {}).get("issues", [])
+            song.data["health"] = {
+                "checked_against": song.data["cleaned_fingerprint"],
+                "issues": health.merge_issues(found, prev),
+            }
+            song.set_stage("fix")
+            song.save()
         # Findings, not rows: a collapsed meter row stands for many, and this line is
         # the first number anyone sees about a score. See health.finding_count.
         open_issues = _derived(song)["open_issues"]
@@ -627,7 +762,7 @@ def _run_clean(slug: str) -> None:
 async def api_clean(slug: str) -> Dict:
     song = _require(slug)
     if is_scanning(song) or not state.start_job(
-            song, "clean", ("scan", "clean", "check", "publish"),
+            song, "clean", WRITERS,
             state.file_fingerprint(song.source_path("xml"))):
         raise HTTPException(409, "Another scan, clean, or publish is already running for this song.")
     asyncio.get_running_loop().run_in_executor(None, _run_clean, slug)
@@ -638,11 +773,8 @@ async def api_clean(slug: str) -> Dict:
 def api_undo_clean(slug: str) -> Dict:
     """Put back the cleaned score the last clean replaced, with its records (#391)."""
     song = _require(slug)
-    if is_scanning(song) or any(
-            job_state.is_running(song.dir, kind)
-            for kind in ("clean", "check", "publish")):
-        raise HTTPException(409, "Something is running for this song; undo once it has finished.")
-    with state.song_lock(song.slug):
+    with _fix_job(song, "Something is running for this song; undo once it has finished."), \
+            state.song_lock(song.slug):
         fresh = state.load(song.slug) or song
         try:
             clean_backup.restore(fresh)
@@ -653,7 +785,7 @@ def api_undo_clean(slug: str) -> Dict:
         # The restored fingerprint is in the state before the watcher sees the file
         # change, so it is read as our own write and not checked a second time.
         fresh.save()
-    song.data = fresh.data
+    song.adopt(fresh)
     hub.emit(slug, {"type": "log", "line": "Undid the last clean: the previous cleaned score is back."})
     hub.emit(slug, {"type": "state"})
     return _derived(song)
@@ -662,7 +794,7 @@ def api_undo_clean(slug: str) -> Dict:
 def _run_check(slug: str) -> None:
     """Run the clean's checks again on the cleaned score as it is now (#391).
 
-    A clean compares the notes against the scan and asks MuseScore 3 whether it would
+    A clean compares the notes against the scan and asks MuseScore whether it would
     open the result, and those answers hold only for the file they were made on. A
     score fixed in MuseScore, uploaded, or changed by a recorded fix showed both as
     stale, and the only way to refresh them was a re-clean, which throws the score
@@ -681,21 +813,21 @@ def _run_check(slug: str) -> None:
         log("Comparing the notes with the scan…")
         notes = verification.compare_notes(source_mscx, cleaned)
         log(notes.get("detail") or "Notes compared.")
-        log("Asking MuseScore 3 whether it opens the score…")
+        name = pipeline.checker()
+        log(f"Asking {name} whether it opens the score…")
         found = pipeline.musescore_check(cleaned)
         if found is None:
-            opens = {"status": "not_checked", "reset": [], "rejected": []}
-            log("Not checked: no MuseScore 3 answered (MUSESCORE_CLI_PATH). "
-                "MuseScore 4 does not run this check.")
+            opens = {"status": "not_checked", "reset": [], "rejected": [], "by": name}
+            log("Not checked: no MuseScore answered (MUSESCORE_CLI_PATH).")
         elif found:
-            opens = {"status": "rejected", "reset": [], "rejected": found}
-            log(f"MuseScore 3 calls this score corrupted ({len(found)} problem(s)); "
+            opens = {"status": "rejected", "reset": [], "rejected": found, "by": name}
+            log(f"{name} calls this score corrupted ({len(found)} problem(s)); "
                 "listed in the Fix panel:")
             for one in found:
                 log("  " + one["message"])
         else:
-            opens = {"status": "passed", "reset": [], "rejected": []}
-            log("MuseScore 3 opens it without calling it corrupted.")
+            opens = {"status": "passed", "reset": [], "rejected": [], "by": name}
+            log(f"{name} opens it without calling it corrupted.")
         with state.song_lock(song.slug):
             fresh = state.load(song.slug) or song
             if state.file_fingerprint(cleaned) != fingerprint:
@@ -730,7 +862,7 @@ async def api_recheck(slug: str) -> Dict:
     # Not beside a publish either: each saves the whole song state, and the later
     # save would put back the earlier one's copy of the other's result.
     if is_scanning(song) or not state.start_job(
-            song, "check", ("scan", "clean", "check", "publish")):
+            song, "check", WRITERS):
         raise HTTPException(409, "A scan, clean, check, or publish is already running "
                                  "for this song.")
     asyncio.get_running_loop().run_in_executor(None, _run_check, slug)
@@ -786,7 +918,7 @@ def _rescan(song: state.Song) -> None:
                 "issues": health.merge_issues(found, current.get("issues", [])),
             }
             fresh.save()
-    song.data = fresh.data
+    song.adopt(fresh)
 
 
 @app.post("/api/songs/{slug}/rescan")
@@ -845,15 +977,17 @@ def api_record_slur(slug: str, body: Dict) -> Dict:
         index, span = int(body.get("index", 0)), int(body.get("span", 1))
     except (TypeError, ValueError):
         raise HTTPException(400, "staff, measure, index and span have to be numbers")
-    try:
-        done = pipeline.record_slur_fix(
-            song.dir, cleaned, staff, measure, index, span, body.get("why", ""))
-    except FixError as exc:
-        raise HTTPException(400, str(exc))
-    except (OSError, RuntimeError) as exc:
-        raise HTTPException(500, str(exc))
-    # Straight to the log, not through job_state: this is instant, and opening a job
-    # for it would leave a "fix" job showing as running with nothing to finish it.
+    # A short `fix` job, so a clean, an upload or a lyric import cannot rewrite the
+    # score at the same time (#482); the log line goes straight to the page.
+    with _fix_job(song, "A scan, clean, lyric import or another fix is running for "
+                        "this song — wait for it to finish, then record the slur."):
+        try:
+            done = pipeline.record_slur_fix(
+                song.dir, cleaned, staff, measure, index, span, body.get("why", ""))
+        except FixError as exc:
+            raise HTTPException(400, str(exc))
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(500, str(exc))
     hub.emit(slug, {"type": "log", "line": f"Recorded a missing slur — {done['applied']}"})
     # Our own write, so claim it: otherwise the file watcher reads the score as
     # edited in MuseScore and re-checks it a second time.
@@ -900,17 +1034,15 @@ def api_pick_reading(slug: str, body: Dict) -> Dict:
     offer, choice = str(body.get("offer") or ""), str(body.get("choice") or "")
     if not offer or not choice:
         raise HTTPException(400, "say which bar (offer) and which reading (choice)")
-    # A clean or a publish reads the score this rewrites.
-    if is_scanning(song) or any(
-            job_state.is_running(song.dir, kind) for kind in ("clean", "publish")):
-        raise HTTPException(409, "A scan, clean, or publish is running for this "
-                                 "song — wait for it to finish, then pick again.")
-    try:
-        done = bar_readings.record_pick(song, offer, choice)
-    except FixError as exc:
-        raise HTTPException(400, str(exc))
-    except (OSError, RuntimeError) as exc:
-        raise HTTPException(500, str(exc))
+    # A clean, a publish or a lyric import reads the score this rewrites.
+    with _fix_job(song, "A scan, clean, publish or lyric import is running for this "
+                        "song — wait for it to finish, then pick again."):
+        try:
+            done = bar_readings.record_pick(song, offer, choice)
+        except FixError as exc:
+            raise HTTPException(400, str(exc))
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(500, str(exc))
     hub.emit(slug, {"type": "log", "line": f"Picked a reading — {done['applied']}"})
     # Our own write, as with a recorded slur: claim it, or the watcher re-checks it.
     _rescan(song)
@@ -942,23 +1074,21 @@ def api_pick_problem(slug: str, body: Dict) -> Dict:
     choice, kind, letter = (str(body.get(k) or "") for k in ("choice", "kind", "letter"))
     if not choice or not letter:
         raise HTTPException(400, "say which problem (choice) and which answer (letter)")
-    if is_scanning(song) or any(
-            job_state.is_running(song.dir, k) for k in ("clean", "publish")):
-        raise HTTPException(409, "A scan, clean, or publish is running for this "
-                                 "song — wait for it to finish, then pick again.")
-    try:
-        if kind == "slur":
-            done = problems.record_slur_choice(song, choice, letter)
-        elif kind == "repeat":
-            done = problems.record_repeat_choice(song, choice, letter)
-        elif kind == "volta":
-            done = problems.record_volta_choice(song, choice, letter)
-        else:
-            done = bar_readings.record_pick(song, choice, letter)
-    except FixError as exc:
-        raise HTTPException(400, str(exc))
-    except (OSError, RuntimeError) as exc:
-        raise HTTPException(500, str(exc))
+    with _fix_job(song, "A scan, clean, publish or lyric import is running for this "
+                        "song — wait for it to finish, then pick again."):
+        try:
+            if kind == "slur":
+                done = problems.record_slur_choice(song, choice, letter)
+            elif kind == "repeat":
+                done = problems.record_repeat_choice(song, choice, letter)
+            elif kind == "volta":
+                done = problems.record_volta_choice(song, choice, letter)
+            else:
+                done = bar_readings.record_pick(song, choice, letter)
+        except FixError as exc:
+            raise HTTPException(400, str(exc))
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(500, str(exc))
     hub.emit(slug, {"type": "log", "line": f"Picked {letter} — {done['applied']}"})
     _rescan(song)
     return _derived(song)
@@ -967,10 +1097,15 @@ def api_pick_problem(slug: str, body: Dict) -> Dict:
 @app.post("/api/songs/{slug}/issues/{issue_id}/dismiss")
 def api_dismiss(slug: str, issue_id: str) -> Dict:
     song = _require(slug)
-    for i in song.data.get("health", {}).get("issues", []):
-        if i["id"] == issue_id:
-            i["status"] = "dismissed"
-    song.save()
+    # Read and written in one step, so a clean or check finishing in between
+    # does not get its health record replaced by the one read here (#498).
+    with state.song_lock(slug):
+        fresh = state.load(slug) or song
+        for i in fresh.data.get("health", {}).get("issues", []):
+            if i["id"] == issue_id:
+                i["status"] = "dismissed"
+        fresh.save()
+    song.adopt(fresh)
     return _derived(song)
 
 
@@ -1058,10 +1193,14 @@ def api_approve_review(slug: str, body: Dict = None) -> Dict:
 # Lyrics stage
 # --------------------------------------------------------------------------
 @app.get("/api/prompt")
-def api_prompt() -> Dict:
+def api_prompt(slug: str = "") -> Dict:
+    """The AI lyric prompt; given a song, it lists that song's part names (#482)."""
     path = os.path.join(SCRIPT_DIR, "lyric_json_prompt.txt")
     with open(path, "r", encoding="utf-8") as f:
-        return {"prompt": f.read()}
+        prompt = f.read()
+    if not slug:
+        return {"prompt": prompt}
+    return {"prompt": pipeline.lyric_prompt(prompt, _require(slug).cleaned_path() or "")}
 
 
 @app.get("/api/songs/{slug}/lyric-grid")
@@ -1117,13 +1256,20 @@ def api_landed(slug: str, index: int):
     return FileResponse(path, media_type="image/svg+xml", headers=dict(REVALIDATE))
 
 
-def _kept_warnings(previous: List, result) -> List[Dict]:
-    """Earlier import warnings this import did not answer (#397).
+def _kept_warnings(previous: List, result, box_import: bool = False) -> List[Dict]:
+    """Earlier import warnings this import did not answer (#397, #482).
 
     An import now changes only what it names, so a warning about a box it did not
     touch still stands. One is answered when the import rewrote its bars on one of
     its parts, for the same voice and verse. A warning with no bars to it, or one
     an older app saved as a sentence, belonged to the import that made it.
+
+    A warning about a source line (`part_rests`, `unknown_part`, `two_lines`) is
+    answered only when the match is certain (#482): this import sent a line with
+    the same identity (the part as written, in the same bar, verse and voice), or,
+    for a `part_rests` or `two_lines` warning, a Type by system box import wrote
+    its staff for the same verse and voice over its bars (an emptied box counts).
+    Anything else stays until a person dismisses it.
     """
     kept = []
     for w in previous or []:
@@ -1131,15 +1277,61 @@ def _kept_warnings(previous: List, result) -> List[Dict]:
             continue
         start, end = w["measure_start"], w.get("measure_end") or w["measure_start"]
         verse, voice = w.get("verse") or 1, w.get("voice") or 1
+
+        def wrote(sid):
+            return any(x.staff == sid and x.verse == verse and x.voice == voice
+                       and x.start <= end and x.end >= start for x in result.written)
+
+        if w.get("kind") in lyric_txt.LINE_KINDS:
+            if set(w.get("lines") or ()) & set(getattr(result, "lines", ()) or ()):
+                continue
+            if (box_import and w.get("kind") != lyric_txt.UNKNOWN_PART
+                    and any(wrote(sid) for sid in w.get("staff_ids") or [])):
+                continue
+            kept.append(w)
+            continue
         # One warning can name several staves (the same range, kind and counts are
         # said once); only the staves this import rewrote are answered.
-        left = [sid for sid in (w.get("staff_ids") or []) if not any(
-            x.staff == sid and x.verse == verse and x.voice == voice
-            and x.start <= end and x.end >= start
-            for x in result.written)]
+        left = [sid for sid in (w.get("staff_ids") or []) if not wrote(sid)]
         if left:
             kept.append({**w, "staff_ids": left})
     return kept
+
+
+def _with_ids(warnings) -> List:
+    """The stored lyric warnings, each with the id Dismiss sends back (#482).
+
+    Worked out on reading (`lyric_txt.warning_id`), so a warning saved before ids
+    existed has one too and no `.song.json` needs rewriting. One saved as a plain
+    sentence goes out as `{"message", "id"}`, so it can be dismissed like the rest.
+    """
+    return [{**w, "id": lyric_txt.warning_id(w)} if isinstance(w, dict)
+            else {"message": w, "id": lyric_txt.warning_id(w)}
+            for w in warnings or [] if isinstance(w, (dict, str))]
+
+
+def _settle_lyrics_stage(song: state.Song, cleaned: Optional[str]) -> bool:
+    """Move a song on Lyrics to Review once nothing is left to answer (#482).
+
+    Only when the warnings were made against the score as it is now: an import
+    against an older score proves nothing about this one. Returns whether it moved.
+    """
+    lyrics = song.data.get("lyrics") or {}
+    if (song.stage == "lyrics" and cleaned and os.path.exists(cleaned)
+            and lyrics.get("imported_against")
+            and lyrics["imported_against"] == state.file_fingerprint(cleaned)
+            and not lyrics.get("warnings")):
+        song.set_stage("review")
+        return True
+    return False
+
+
+# The lyric import places the words here first and moves the file over the score
+# only once it knows the score did not change meanwhile (#482). The name does not
+# end in `_cleaned.mscx`, so the file watcher never reads it as a score.
+LYRICS_TMP = ".lyrics-tmp"
+SCORE_MOVED = ("the score changed while the words were being imported "
+               "(saved in MuseScore?); import again")
 
 
 @app.get("/api/songs/{slug}/lyrics-json")
@@ -1161,6 +1353,12 @@ def api_lyrics(slug: str, body: Dict) -> Dict:
     the boxes changed, an empty one clearing its words (#397). `cells` is the older
     editor's verse-1 form. Either way only what is named changes; every other verse,
     voice, part and system keeps its words, and so do the warnings about them.
+
+    It runs as a `lyrics` job (#482), so a clean, an upload or a recorded fix cannot
+    rewrite the score under it, nor it under them. Nothing that reads the score runs
+    before the job starts. The score's fingerprint is taken first; the words are
+    placed into a temp file and moved over the score under the song lock only if the
+    score on disk still has that fingerprint (a save in MuseScore takes no job).
     """
     song = _require(slug)
     cleaned = song.cleaned_path()
@@ -1169,6 +1367,8 @@ def api_lyrics(slug: str, body: Dict) -> Dict:
     body = body or {}
     cells = body.get("cells")
     boxes = body.get("boxes")
+    verse = 1
+    json_text = ""
     if boxes:
         try:
             verse = int(body.get("verse") or 1)
@@ -1176,78 +1376,148 @@ def api_lyrics(slug: str, body: Dict) -> Dict:
             raise HTTPException(400, "Which verse?")
         if verse < 1:
             raise HTTPException(400, "Which verse?")
-        blocks = pipeline.lyric_box_blocks(cleaned, verse, boxes, song.dir)
-        if not blocks:
-            raise HTTPException(400, "Nothing changed")
-        json_text = json.dumps(blocks, ensure_ascii=False, indent=2)
-        json_name = "lyrics-editor.json"
-    elif cells:
-        blocks = pipeline.lyric_blocks(cleaned, cells, song.dir)
-        if not blocks:
-            raise HTTPException(400, "Nothing typed yet")
-        json_text = json.dumps(blocks, ensure_ascii=False, indent=2)
-        json_name = "lyrics-editor.json"
-    else:
+    elif not cells:
         json_text = body.get("json", "")
-        if not json_text.strip():
+        if not isinstance(json_text, str) or not json_text.strip():
             raise HTTPException(400, "Paste the lyric JSON first")
-        json_name = "lyrics.json"
-    # The editor's import is kept beside the paste rather than over it, so the
-    # paste box still opens on what was pasted.
-    json_path = song.path(json_name)
-    with open(json_path, "w", encoding="utf-8") as f:
-        f.write(json_text)
-    previous_fingerprint = state.file_fingerprint(cleaned)
+    if is_scanning(song) or not state.start_job(song, "lyrics", WRITERS):
+        raise HTTPException(409, "Another job is changing this score; import again once it is done")
+    tmp = cleaned + LYRICS_TMP
+    error: Optional[str] = "Import stopped"
+    finished = False
     try:
-        result = pipeline.run_lyric_import(json_path, cleaned, song_dir=song.dir)
-    except Exception as exc:
-        raise HTTPException(400, f"Import failed: {exc}")
-    current_fingerprint = state.file_fingerprint(cleaned)
-    # Claim the write before the slow health check below (#336). The file watcher
-    # sees the score change at once, and until the new fingerprint is on disk it
-    # takes the import for an edit made in MuseScore: it checks the score again and
-    # tells the page the score moved, so the page fetches every system's picture
-    # again instead of the one or two the import changed.
-    with state.song_lock(song.slug):
-        claimed = state.load(song.slug) or song
-        claimed.data["cleaned_fingerprint"] = current_fingerprint
-        claimed.save()
-    previous = song.data.get("lyrics") or {}
-    # Earlier warnings are about the score they were made against; after a re-clean
-    # or an edit their staves and bars may mean something else.
-    if previous.get("imported_against") != previous_fingerprint:
-        previous = {**previous, "warnings": []}
-    song.data["lyrics"] = {
-        "json": "lyrics.json" if json_name == "lyrics.json" else previous.get("json") or json_name,
-        "imported_against": current_fingerprint,
-        "warnings": _kept_warnings(previous.get("warnings"), result)
-                    + [m.to_dict() for m in result.mismatches],
-    }
-    # Import may add full-measure rests to otherwise empty measures, so health must
-    # be checked again rather than rebound to the new fingerprint without evidence.
-    # Pitch events do not change during lyric placement, so this narrower result can
-    # safely follow the controlled XML edit without repeating the source comparison.
-    # Nor do note lengths, which are all MuseScore's own check looks at.
-    for name in ("notes", "musescore"):
-        data = song.data.get("verification", {}).get(name, {})
-        if data.get("checked_against") == previous_fingerprint:
-            data["checked_against"] = current_fingerprint
-    previous_issues = song.data.get("health", {}).get("issues", [])
-    song.data["health"] = {
-        "checked_against": current_fingerprint,
-        "issues": health.merge_issues(_health_scan(song, cleaned), previous_issues),
-    }
-    song.data["cleaned_fingerprint"] = current_fingerprint
-    if not song.data["lyrics"]["warnings"]:
-        song.set_stage("review")
-    song.save()
+        # First, before anything reads the score: the compare below is against this.
+        before = state.file_fingerprint(cleaned)
+        if boxes:
+            blocks = pipeline.lyric_box_blocks(cleaned, verse, boxes, song.dir)
+            if not blocks:
+                raise HTTPException(400, "Nothing changed")
+        elif cells:
+            blocks = pipeline.lyric_blocks(cleaned, cells, song.dir)
+            if not blocks:
+                raise HTTPException(400, "Nothing typed yet")
+        if boxes or cells:
+            json_text = json.dumps(blocks, ensure_ascii=False, indent=2)
+            json_name = "lyrics-editor.json"
+        else:
+            json_name = "lyrics.json"
+        # The editor's import is kept beside the paste rather than over it, so the
+        # paste box still opens on what was pasted.
+        json_path = song.path(json_name)
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(json_text)
+        try:
+            result = pipeline.run_lyric_import(json_path, cleaned, song_dir=song.dir, out_path=tmp)
+        except Exception as exc:
+            raise HTTPException(400, f"Import failed: {exc}")
+        with state.song_lock(song.slug):
+            song.check_still_here()
+            fresh = state.load(song.slug) or song
+            if state.file_fingerprint(cleaned) != before:
+                raise HTTPException(409, SCORE_MOVED)
+            os.replace(tmp, cleaned)
+            after = state.file_fingerprint(cleaned)
+            # Claimed in the same hold as the write (#336): the file watcher sees the
+            # score change at once, and must read it as the app's own write.
+            fresh.data["cleaned_fingerprint"] = after
+            previous = fresh.data.get("lyrics") or {}
+            # Earlier warnings are about the score they were made against; after a
+            # re-clean or an edit their staves and bars may mean something else.
+            kept = (_kept_warnings(previous.get("warnings"), result, box_import=bool(boxes))
+                    if previous.get("imported_against") == before else [])
+            fresh.data["lyrics"] = {
+                "json": "lyrics.json" if json_name == "lyrics.json"
+                        else previous.get("json") or json_name,
+                "imported_against": after,
+                "warnings": kept + [m.to_dict() for m in result.mismatches],
+            }
+            if not fresh.data["lyrics"]["warnings"]:
+                fresh.set_stage("review")
+            elif fresh.stage == "review":
+                fresh.set_stage("lyrics")
+            # Pitches and note lengths do not change during lyric placement, so the
+            # note comparison and MuseScore's check still hold for the new file.
+            for name in ("notes", "musescore"):
+                data = fresh.data.get("verification", {}).get(name, {})
+                if data.get("checked_against") == before:
+                    data["checked_against"] = after
+            fresh.save()
+        song.adopt(fresh)
+        # Import may add full-measure rests to otherwise empty measures, so health
+        # must be checked again rather than rebound to the new fingerprint.
+        found = _health_scan(song, cleaned)
+        with state.song_lock(song.slug):
+            song.check_still_here()
+            late = state.load(song.slug) or song
+            # Saved since the hold (MuseScore, an upload): the watcher checks that
+            # file, and these findings are about one that is gone.
+            if state.file_fingerprint(cleaned) == after:
+                late.data["health"] = {
+                    "checked_against": after,
+                    "issues": health.merge_issues(
+                        found, late.data.get("health", {}).get("issues", [])),
+                }
+            # A dismiss while this ran could not move the stage itself.
+            _settle_lyrics_stage(late, cleaned)
+            late.save()
+            _job_finish(song, "lyrics")
+            finished = True
+        song.adopt(late)
+        error = None
+    except BaseException as exc:
+        error = str(getattr(exc, "detail", "") or exc) or type(exc).__name__
+        raise
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        if not finished:
+            try:
+                with state.song_lock(song.slug):
+                    _job_finish(song, "lyrics", error)
+                    if os.path.isdir(song.dir):
+                        left = state.load(song.slug)
+                        if left is not None and _settle_lyrics_stage(left, cleaned):
+                            left.save()
+            except Exception:
+                traceback.print_exc()
     # The bars that did not take their words, said in the reply itself rather than
     # left for the caller to dig out of the song's `lyrics.warnings` (#340).
     # `imported` is what this import alone said, so a caller can tell its own, and
     # `written` the bars it rewrote, which can run on past the system it was sent for.
-    return {**_derived(song), "mismatches": song.data["lyrics"]["warnings"],
+    return {**_derived(song), "mismatches": _with_ids(song.data["lyrics"]["warnings"]),
             "imported": [m.to_dict() for m in result.mismatches],
             "written": [w.to_dict() for w in result.written]}
+
+
+@app.post("/api/songs/{slug}/lyrics/warnings/dismiss")
+def api_dismiss_lyric_warning(slug: str, body: Dict) -> Dict:
+    """Take one lyric warning off the list: the person has answered it (#482).
+
+    Any kind, by the id `GET /songs/{slug}` gives it. Writes only `lyrics.warnings`
+    and the stage, never the score, so it is no job. The last one moves a song on
+    Lyrics to Review only when the warnings were made against the score as it is
+    now, and never while an import runs: that import decides the stage itself.
+    """
+    wid = (body or {}).get("id")
+    if not isinstance(wid, str) or not wid:
+        raise HTTPException(400, "Which warning?")
+    song = _require(slug)
+    with state.song_lock(song.slug):
+        song.check_still_here()
+        fresh = state.load(song.slug) or song
+        lyrics = dict(fresh.data.get("lyrics") or {})
+        warnings = lyrics.get("warnings") or []
+        left = [w for w in warnings
+                if not (isinstance(w, (dict, str)) and lyric_txt.warning_id(w) == wid)]
+        if len(left) == len(warnings):
+            raise HTTPException(404, "That warning is no longer on the list")
+        lyrics["warnings"] = left
+        fresh.data["lyrics"] = lyrics
+        if not job_state.is_running(fresh.dir, "lyrics"):
+            _settle_lyrics_stage(fresh, fresh.cleaned_path())
+        fresh.save()
+    song.adopt(fresh)
+    return _derived(song)
 
 
 # --------------------------------------------------------------------------
@@ -1290,20 +1560,27 @@ def api_bounds(slug: str) -> Dict:
     return {
         "pages": pipeline.page_count(pdf),
         "systems": systems,
+        "skipped_pages": pipeline.skipped_pages(song.dir),
         "declared": declared,       # how many systems the score says there are
     }
 
 
 @app.put("/api/songs/{slug}/bounds")
 def api_save_bounds(slug: str, body: Dict = None) -> Dict:
-    """Persist edited boundaries: {"systems": [{page, top, bottom}, ...]}."""
+    """Persist edited boundaries: {"systems": [{page, top, bottom}, ...]}.
+
+    An optional `"skipped_pages": [n, ...]` says which pages hold no music to scan
+    (#480); left out of the body, the pages already left out stay so.
+    """
     song = _require(slug)
-    _song_pdf(song)
+    pdf = _song_pdf(song)
     bands = (body or {}).get("systems")
     if bands is None:
         raise HTTPException(400, "No systems given")
+    skipped = (body or {}).get("skipped_pages")
     try:
-        saved = pipeline.save_system_bounds(song.dir, bands, _bounds_score(song))
+        saved = pipeline.save_system_bounds(song.dir, bands, _bounds_score(song), skipped,
+                                            pages=_pages_of(pdf) if skipped is not None else None)
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(400, f"Bad bounds: {exc}")
     # Moving a band is changing the input a fragment was read from. Both the
@@ -1311,7 +1588,11 @@ def api_save_bounds(slug: str, body: Dict = None) -> Dict:
     # silently re-points everything after it — which is why nothing here compares
     # indices; each fragment is checked against the geometry now at its own.
     song = _require(slug)
-    return {"systems": saved, "discarded": scan.reconcile(song)}
+    discarded = scan.reconcile(song)
+    # The Scan panel's button waits for every page to be marked or left out.
+    hub.emit(slug, {"type": "state"})
+    return {"systems": saved, "skipped_pages": pipeline.skipped_pages(song.dir),
+            "discarded": discarded}
 
 
 @app.post("/api/songs/{slug}/find-systems")
@@ -1341,13 +1622,28 @@ async def api_find_systems(slug: str, body: Dict = None) -> Dict:
         except Exception as exc:
             traceback.print_exc()
             raise HTTPException(500, str(exc)) from None
-        return {"systems": found}
+        return {"systems": _outside_skipped(song, found)}
     try:
         reader = homr_install.begin_read()
     except homr_install.Refused as exc:
         raise HTTPException(409, str(exc)) from None
     with reader:
-        return await _find_with_homr(slug, pdf, body)
+        answer = await _find_with_homr(slug, pdf, body)
+    return {**answer, "systems": _outside_skipped(song, answer.get("systems", []))}
+
+
+def _pages_of(pdf: str) -> Optional[int]:
+    """The PDF's page count, or None when poppler cannot say."""
+    try:
+        return pipeline.page_count(pdf)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _outside_skipped(song, systems: List[Dict]) -> List[Dict]:
+    """A proposal holds no band on a page left out of the scan (#480)."""
+    skipped = set(pipeline.skipped_pages(song.dir))
+    return [b for b in systems if int(b.get("page", 0)) not in skipped]
 
 
 async def _find_with_homr(slug: str, pdf: str, body: Optional[Dict]) -> Dict:
@@ -1504,7 +1800,8 @@ def api_render(slug: str, doc: str = "cleaned"):
                 breaks = pipeline.cleaned_line_breaks(
                     song.dir, pipeline.convert_to_mscx(xml, song.dir)) or None
             tidy = True
-        rendered = pipeline.render_score_pdf(mscx, breaks, tidy=tidy)
+        rendered = pipeline.render_score_pdf(mscx, breaks, tidy=tidy,
+                                             force=doc == "original")
     except HTTPException:
         raise
     except Exception as exc:
@@ -1532,12 +1829,23 @@ def api_score_file(slug: str):
 
     `open-score` above only works for somebody sitting at this host. This is the
     other half of the same idea for everybody else: take the file to whatever
-    machine has MuseScore on it.
+    machine has MuseScore on it. Singing parts get voice instruments in the copy
+    sent (#481), so MuseScore 4 puts new dynamics above the staff; the file here is
+    not touched.
     """
     song = _require(slug)
     cleaned = _cleaned_or_400(song)
-    return FileResponse(cleaned, media_type="application/octet-stream",
-                        filename=os.path.basename(cleaned), headers=dict(REVALIDATE))
+    name = os.path.basename(cleaned)
+    copy = pipeline.score_for_download(cleaned)
+    if copy is None:
+        return FileResponse(cleaned, media_type="application/octet-stream",
+                            filename=name, headers=dict(REVALIDATE))
+    # Said the way FileResponse says it, so a name with ä in it survives.
+    quoted = urllib.parse.quote(name)
+    disposition = (f"attachment; filename*=utf-8''{quoted}" if quoted != name
+                   else f'attachment; filename="{name}"')
+    return Response(copy, media_type="application/octet-stream",
+                    headers={**REVALIDATE, "Content-Disposition": disposition})
 
 
 @app.post("/api/songs/{slug}/score-file")
@@ -1553,18 +1861,16 @@ async def api_upload_score_file(slug: str, file: UploadFile = None) -> Dict:
     cleaned = _cleaned_or_400(song)
     if not file or not file.filename:
         raise HTTPException(400, "No file was uploaded")
-    if is_scanning(song) or any(
-            job_state.is_running(song.dir, kind)
-            for kind in ("clean", "check", "publish")):
-        raise HTTPException(409, "A scan, clean, check, or publish is running for this "
-                                 "song — replacing the score underneath it would be read "
-                                 "half-written.")
-    try:
-        summary = pipeline.accept_uploaded_score(cleaned, file.filename, await file.read())
-    except pipeline.ScoreUploadError as exc:
-        raise HTTPException(400, str(exc))
-    except OSError as exc:
-        raise HTTPException(500, str(exc))
+    data = await file.read()
+    with _fix_job(song, "A scan, clean, check, publish, lyric import or fix is running "
+                        "for this song — replacing the score underneath it would be "
+                        "read half-written."):
+        try:
+            summary = pipeline.accept_uploaded_score(cleaned, file.filename, data)
+        except pipeline.ScoreUploadError as exc:
+            raise HTTPException(400, str(exc))
+        except OSError as exc:
+            raise HTTPException(500, str(exc))
     hub.emit(slug, {"type": "log", "line": (
         f"Replaced the cleaned score with {os.path.basename(file.filename)} — "
         f"{summary['staves']} staves, {summary['measures']} bars")})
@@ -1762,6 +2068,38 @@ def _places(value) -> List[Dict]:
     return out
 
 
+def _gradual(cleaned: str, value) -> List[Dict]:
+    """The Publish panel's say on the score's printed rit./accel. marks (#483):
+    `[{"measure": 30, "bpm": 50, "off": false}]`. `bpm` null eases to the default
+    (three quarters for a rit., five quarters for an accel.). A bar with no mark
+    in the score is a 400, so a setting cannot quietly point at nothing."""
+    if not isinstance(value, list):
+        raise HTTPException(400, "Gradual changes must be a list")
+    marks = {m["measure"] for m in pipeline.gradual_marks(cleaned)}
+    out: Dict[int, Dict] = {}
+    for item in value:
+        try:
+            measure = _whole_number(item.get("measure"))
+        except (AttributeError, TypeError, ValueError):
+            raise HTTPException(400, "Each rit./accel. setting needs a whole bar number") from None
+        if measure not in marks:
+            raise HTTPException(400, f"Bar {measure} has no rit. or accel. in the score")
+        bpm = item.get("bpm")
+        if bpm is not None and bpm != "":
+            try:
+                bpm = _whole_number(bpm)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"rit./accel. at bar {measure}: BPM must be "
+                                         "a whole number") from None
+            if not 20 <= bpm <= 300:
+                raise HTTPException(400, f"rit./accel. at bar {measure}: BPM must be "
+                                         "between 20 and 300")
+        else:
+            bpm = None
+        out[measure] = {"measure": measure, "bpm": bpm, "off": bool(item.get("off"))}
+    return [out[m] for m in sorted(out)]
+
+
 def _publish_settings(song: state.Song, opts: Dict) -> Dict:
     """What the site plays and shows a song with, out of a request (#400).
 
@@ -1777,6 +2115,10 @@ def _publish_settings(song: state.Song, opts: Dict) -> Dict:
         raise HTTPException(400, "Clean the score first")
     out: Dict = {"tempo_changes": _tempo_changes(
         cleaned, opts.get("tempo_changes", saved.get("tempo_changes", [])))}
+    if "gradual" in opts:
+        out["gradual"] = _gradual(cleaned, opts["gradual"])
+    elif "gradual" in saved:
+        out["gradual"] = saved["gradual"]
     if not pipeline.has_opening_tempo(cleaned):
         try:
             bpm = _whole_number(opts.get("bpm", saved.get("bpm", publish.DEFAULT_BPM)))
@@ -1809,16 +2151,17 @@ def _publish_settings(song: state.Song, opts: Dict) -> Dict:
 
 def _publish_busy(song: state.Song) -> bool:
     return is_scanning(song) or any(job_state.is_running(song.dir, kind)
-                                    for kind in ("clean", "check", "publish"))
+                                    for kind in WRITERS if kind != "scan")
 
 
-def _readings(words: List[str]) -> Dict:
+def _readings(words: List[str]) -> Optional[Dict]:
     """{word: readings} of the words the dictionary reads more than one way, from
-    src/sing_song/readings.py in the singer's venv (g2p_en and its dictionary live there)."""
+    src/sing_song/readings.py in the singer's venv (g2p_en and its dictionary live there), or
+    None on a host with no singer venv: the readings typed by hand need none (#484 review)."""
     from src.sing_song.main import sing_venv
     python = os.path.join(sing_venv(), "bin", "python")
     if not os.path.exists(python):
-        raise HTTPException(503, f"No singer at {sing_venv()}: run scripts/install-singer.sh")
+        return None
     script = os.path.join(os.path.dirname(song_places.__file__), "readings.py")
     r = subprocess.run([python, "-I", script], input=json.dumps(words), capture_output=True,
                        text=True, timeout=300)
@@ -1827,39 +2170,127 @@ def _readings(words: List[str]) -> Dict:
     return json.loads(r.stdout)
 
 
+NO_PACK = "not checked against a voice pack: none found at UFR_DIR"
+
+
+def _pack_sounds() -> Optional[set]:
+    """The voice pack's sounds (UFR_DIR/core/phonemes.json, the file the singer reads), or None
+    when this host has no pack."""
+    ufr = os.environ.get("UFR_DIR")
+    path = os.path.join(ufr, "core", "phonemes.json") if ufr else None
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return set(json.load(f))
+
+
+def _pack_by_language(pack: Optional[set]) -> Optional[Dict[str, List[str]]]:
+    """{language g2p sings: the pack's sounds with that language's prefixes}"""
+    if pack is None:
+        return None
+    return {code: sorted(p for p in pack if any(p.startswith(x) for x in languages.get(code, "prefixes", [])))
+            for code in sorted(languages.sung_by_g2p())}
+
+
+def _check_reading(word: str, sounds: str, lang: str, pack: Optional[set]) -> str:
+    """The reading with its whitespace normalised, or a 400 naming the word: voice sounds
+    ("it/k it/w") in the pack, or with no pack in one of the language's prefixes; ARPAbet only
+    for English; never a mix (#484). g2p checks it again against the pack it sings with."""
+    if lang not in languages.sung_by_g2p():
+        raise HTTPException(400, f"{word!r}: {lang!r} is not a language g2p sings "
+                                 f"({', '.join(sorted(languages.sung_by_g2p()))})")
+    toks = str(sounds).split()
+    if not toks:
+        raise HTTPException(400, f"{word!r}: the reading is empty")
+    voiced = ["/" in t for t in toks]
+    if any(voiced) and not all(voiced):
+        raise HTTPException(400, f"{word!r}: give the reading all in voice sounds (it/k) or all in "
+                                 f"ARPAbet (K AA1), not both: {' '.join(toks)}")
+    if not any(voiced):
+        if lang != "en":
+            raise HTTPException(400, f"{word!r}: ARPAbet is for English readings; give a "
+                                     f"{languages.get(lang, 'name')} reading in voice sounds (it/k ...)")
+        return " ".join(toks)   # g2p checks ARPAbet against its own sound list, as before #484
+    if pack is not None:
+        bad = [t for t in toks if t not in pack]
+        if bad:
+            raise HTTPException(400, f"{word!r}: the voice pack has no sound {bad[0]!r}")
+    else:
+        prefixes = languages.get(lang, "prefixes", [])
+        bad = [t for t in toks if not re.match(r"^[a-z]+/[a-z0-9]+$", t)
+               or not any(t.startswith(x) for x in prefixes)]
+        if bad:
+            raise HTTPException(400, f"{word!r}: {bad[0]!r} is not a {languages.get(lang, 'name')} "
+                                     f"voice sound ({', '.join(prefixes)}...)")
+    return " ".join(toks)
+
+
 @app.get("/api/songs/{slug}/pronunciation")
 def api_pronunciation(slug: str) -> Dict:
-    """The song page's Pronunciation list (eeron-omat-taskit#144): every place a part sings a
-    word the dictionary reads more than one way, its readings (the one sung by default first),
-    the readings chosen, and the chosen places the score no longer has."""
+    """The song page's Pronunciation list (eeron-omat-taskit#144, #484): every place a part sings
+    a word the English dictionary reads more than one way, its readings (the one sung by default
+    first) and the English reading chosen there; every saved reading in any language ("saved");
+    the chosen places the score no longer has; the song's language, the languages g2p sings, and
+    the voice pack's sounds for each (null with no pack, and "note" says so)."""
     song = _require(slug)
     cleaned = _cleaned_or_400(song)
     every = song_places.places(cleaned)
     readings = _readings(sorted({p["word"] for p in every}))
+    english_note = None
+    if readings is None:
+        from src.sing_song.main import sing_venv
+        english_note = (f"The English dictionary's readings are not listed: no singer at {sing_venv()} "
+                        "(scripts/install-singer.sh). Readings typed in voice sounds still work.")
+        readings = {}
     choices = song_places.load(song.dir)
-    chosen = {song_places.key(c): c["sounds"] for c in choices["places"]}
+    chosen = {song_places.key(c): c["sounds"] for c in choices["places"] if c["lang"] == "en"}
     rows = [dict(p, readings=readings[p["word"]], chosen=chosen.get(song_places.key(p)))
             for p in every if p["word"] in readings]
-    return {"places": rows, "everywhere": choices["everywhere"],
-            "stale": song_places.stale(choices, cleaned)}
+    saved = [dict(c) for c in choices["places"]]
+    saved += [{"bar": None, "beat": None, "word": w, "sounds": v, "lang": lang}
+              for lang, m in choices["everywhere"].items() for w, v in m.items()]
+    pack = _pack_by_language(_pack_sounds())
+    return {"places": rows, "everywhere": choices["everywhere"], "saved": saved,
+            "stale": song_places.stale(choices, cleaned), "language": song.language,
+            "languages": [{"code": c, "name": n} for c, n in languages.names().items()
+                          if c in languages.sung_by_g2p()],
+            "pack": pack, "note": None if pack is not None else NO_PACK, "english_note": english_note}
 
 
 @app.post("/api/songs/{slug}/pronunciation")
 def api_pronunciation_save(slug: str, body: Dict = None) -> Dict:
-    """Save the readings chosen on the song page: {"places": [{"bar", "beat", "word", "sounds"}],
-    "everywhere": {word: sounds}}. A place left out sings the dictionary's reading."""
+    """Save the readings chosen on the song page (#484): {"places": [{"bar", "beat", "word",
+    "sounds", "lang"}], "everywhere": {lang: {word: sounds}}, "langs": [lang, ...]}. Only the
+    readings in a language `langs` names are replaced; every other language's are kept. With no
+    `langs`, an entry with no `lang`, or a flat everywhere map {word: sounds} (an older page or a
+    script), the language is English, which is all a save could mean before #484. A place left out
+    sings the dictionary's reading."""
     body = body or {}
+    pack = _pack_sounds()
     try:
-        chosen = [{"bar": int(c["bar"]), "beat": float(c["beat"]), "word": song_places.word_key(str(c["word"])),
-                   "sounds": " ".join(str(c["sounds"]).split())} for c in body.get("places") or []]
-        everywhere = {song_places.word_key(str(w)): " ".join(str(v).split())
-                      for w, v in (body.get("everywhere") or {}).items()}
+        langs = [str(x) for x in (body.get("langs") or ["en"])]
+        sent = song_places.normalise({"places": list(body.get("places") or []),
+                                      "everywhere": dict(body.get("everywhere") or {})})
+        chosen = [{"bar": int(c["bar"]), "beat": float(c["beat"]),
+                   "word": languages.word_key(str(c["word"]), c["lang"]),
+                   "sounds": _check_reading(str(c["word"]), c["sounds"], c["lang"], pack), "lang": c["lang"]}
+                  for c in sent["places"]]
+        everywhere = {lang: {languages.word_key(str(w), lang): _check_reading(str(w), v, lang, pack)
+                             for w, v in m.items()} for lang, m in sent["everywhere"].items()}
     except (KeyError, TypeError, ValueError, AttributeError):
-        raise HTTPException(400, "Give places as [{bar, beat, word, sounds}] and everywhere as {word: sounds}")
+        raise HTTPException(400, "Give places as [{bar, beat, word, sounds, lang}], everywhere as "
+                                 "{lang: {word: sounds}} and langs as [lang, ...]")
+    outside = sorted(({c["lang"] for c in chosen} | set(everywhere)) - set(langs))
+    if outside:
+        raise HTTPException(400, f"readings in {', '.join(outside)} are not in langs {langs}")
     with state.song_lock(slug):
         song = _require(slug)
-        song_places.save(song.dir, {"places": chosen, "everywhere": everywhere})
-    return api_pronunciation(slug)
+        old = song_places.load(song.dir)
+        kept = [c for c in old["places"] if c["lang"] not in langs]
+        kept_every = {lang: m for lang, m in old["everywhere"].items() if lang not in langs}
+        song_places.save(song.dir, {"places": kept + chosen, "everywhere": {**kept_every, **everywhere}})
+    reply = api_pronunciation(slug)
+    return reply
 
 
 @app.post("/api/songs/{slug}/publish-settings")
@@ -1881,8 +2312,14 @@ async def api_publish_settings(slug: str, body: Dict = None) -> Dict:
     return _derived(song)
 
 
+def _publish_records_now(slug: str) -> Dict[str, Dict]:
+    """The song's publish records as saved now, not as the job found them (#483)."""
+    with state.song_lock(slug):
+        return publish.records(_require(slug).data.get("publish") or {})
+
+
 def _run_publish(slug: str, choir: str, config: "publish.Config",
-                 choirs: Optional[List[Dict]] = None) -> None:
+                 choirs: Optional[List[Dict]] = None, piano_over_sung: bool = False) -> None:
     song = _require(slug)
     log = lambda m: _job_emit(slug, "publish", m)
     try:
@@ -1901,27 +2338,45 @@ def _run_publish(slug: str, choir: str, config: "publish.Config",
                     tempo_changes=settings.get("tempo_changes"),
                     part_names=settings.get("part_names"),
                     staff_groups=settings.get("staff_groups"),
+                    gradual=settings.get("gradual"),
                     log=slot.guard(log))
                 slot.check()
             record = publish.publish(
                 slug=song.slug, title=song.name, choir=choir, bundle=bundle,
                 client=publish.Cloudflare(config), credits=credits,
                 published=published, choirs=choirs,
-                places=settings.get("places") or [], log=log)
+                places=settings.get("places") or [], log=log,
+                piano_over_sung=piano_over_sung,
+                records_now=lambda: _publish_records_now(slug))
         record["published_against"] = state.file_fingerprint(cleaned)
         with state.song_lock(slug):
             song = _require(slug)
             pub = song.data.setdefault("publish", {})
             sites = publish.records(pub)
-            staging = [c["id"] for c in (choirs or []) if c.get("staging")]
-            for gone in publish.replaced(choir, sites, staging):
-                del sites[gone]
-            sites[choir] = record
+            if record.pop("live", True):
+                staging = [c["id"] for c in (choirs or []) if c.get("staging")]
+                for gone in publish.replaced(choir, sites, staging):
+                    del sites[gone]
+                sites[choir] = record
+            else:
+                # Another publish wrote the site's row after this one (#483): its
+                # record, not this one, says what the site serves.
+                log("Another publish replaced this one before it was recorded; "
+                    "its record was not saved.")
             # One record per choir (#384): a song can be in public and one choir at once.
             pub.pop("site", None)
             pub.update({"sites": sites, "choir": choir, "error": None})
             song.save()
         _job_finish(song, "publish")
+    except publish.SungOnSite as exc:
+        # Kept as a kind, not a sentence, so the panel can offer the confirm (#483).
+        error = {"kind": exc.kind, "choir": exc.choir, "message": str(exc)}
+        with state.song_lock(slug):
+            song = _require(slug)
+            song.data.setdefault("publish", {}).update({"error": error, "choir": choir})
+            song.save()
+        _job_emit(slug, "publish", str(exc), "error")
+        _job_finish(song, "publish", str(exc))
     except Exception as exc:
         traceback.print_exc()
         with state.song_lock(slug):
@@ -1965,6 +2420,16 @@ async def api_publish(slug: str, body: Dict = None) -> Dict:
     # to publish against, and the upload would fail anyway.
     if not choir:
         raise HTTPException(400, "Choose a choir first.")
+    # The app publishes piano only (#483): a sung version this app recorded for the
+    # choir is not replaced unless the panel's confirm says so. The job checks the
+    # site itself too, since a sung version may have come from elsewhere.
+    piano_over_sung = bool(body.get("piano_only"))
+    if not piano_over_sung:
+        with state.song_lock(slug):
+            recorded = publish.records(_require(slug).data.get("publish") or {}).get(choir) or {}
+        if recorded.get("sung"):
+            raise HTTPException(409, {"kind": publish.SungOnSite.kind, "choir": choir,
+                                      "message": publish.sung_message(choir)})
     if _publish_busy(song):
         raise HTTPException(409, "Another job is running for this song — publish "
                                  "after it finishes.")
@@ -1983,7 +2448,7 @@ async def api_publish(slug: str, body: Dict = None) -> Dict:
     if tree.get("error"):
         raise HTTPException(tree.get("status", 400), tree["error"])
     if _publish_busy(song) or not state.start_job(
-            song, "publish", ("scan", "clean", "check", "publish"), fingerprint):
+            song, "publish", WRITERS, fingerprint):
         raise HTTPException(409, "Another job is running for this song — publish "
                                  "after it finishes.")
     with state.song_lock(slug):
@@ -1991,7 +2456,7 @@ async def api_publish(slug: str, body: Dict = None) -> Dict:
         song.data.setdefault("publish", {}).update(settings)
         song.save()
     asyncio.get_running_loop().run_in_executor(None, _run_publish, slug, choir, config,
-                                               listing["choirs"])
+                                               listing["choirs"], piano_over_sung)
     return {"started": True}
 
 
@@ -2046,7 +2511,7 @@ async def api_resing() -> Dict:
     def answer() -> Dict:
         version = progress.singer_version()
         listed = resing.site(publish.Config.from_env(), state.SONGS_DIR)
-        return resing.overview(state.list_songs(), listed, version)
+        return resing.overview(state.list_songs(), listed, version, progress.singer_changes())
     return await asyncio.get_running_loop().run_in_executor(None, answer)
 
 
@@ -2093,6 +2558,12 @@ def _on_cleaned_saved(slug: str) -> bool:
     return True
 
 
+def _is_save_temp(name: str) -> bool:
+    """A hidden temp file a score save writes (`lyric_txt._save_mscx`)."""
+    return (name.startswith(".") and name.endswith(".tmp")
+            and (f"{LYRICS_TMP}." in name or ".mscx." in name))
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     hub.loop = asyncio.get_running_loop()
@@ -2104,6 +2575,15 @@ async def _startup() -> None:
         traceback.print_exc()
     for song in state.list_songs():
         job_state.interrupt_running(song.dir)
+        # A lyric import cut off by the restart leaves its temp score (#482), and a
+        # save cut off mid-write leaves the hidden file it was writing
+        # (`.<score>.<random>.tmp`, `lyric_txt._save_mscx`).
+        try:
+            for name in os.listdir(song.dir):
+                if name.endswith(LYRICS_TMP) or _is_save_temp(name):
+                    os.remove(os.path.join(song.dir, name))
+        except OSError:
+            traceback.print_exc()
     if os.path.isdir(state.SONGS_DIR):
         asyncio.create_task(_watch_cleaned())
 

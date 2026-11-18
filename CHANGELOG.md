@@ -7,6 +7,127 @@ developers are listed under *Behind the scenes*.
 
 ## Unreleased
 
+- **Clean** marks a bar whose tie or slur the page prints **dashed** (`⚠ dashed tie?`,
+  `⚠ dashed slur?`): such an arc usually belongs to a later verse only, so check whether
+  verse 1 sings it and take it out with an `untie` or `unslur` fix if not. Needs a homr
+  that reads dashes (eerovil/homr#100); short dashed ties can still be missed. (#482)
+- **Publish**: a big song handed over with one part to a staff now gets its shared staves
+  guessed from the part names (and says so) instead of being told the page prints every
+  part on its own staff; a b-part that only borrows its main part's notes now shares that
+  part's staff, as the page prints it. (#482)
+- The Clean grid has a **No voices here (piano or instruments only)** tick under each
+  system: every part rests there, the part names carry on past it, and pasted lines with
+  no bar number skip it. (#482)
+- The **Clean** grid's Part names box no longer slides off the panel when a staff's
+  note list is long; the list wraps instead (#500).
+- The prompt for **Paste from AI** now lists the song's part names and asks for them on
+  every line, so words go to the right part even where a resting part changes the printed
+  staff numbers. A line naming a part that has no notes there is not placed and is shown
+  as a warning, and so is a name the song has no part for (that line goes by its staff
+  number, or is not placed if that number is no staff of the song). Each such warning
+  stays until its own line is pasted again, until a resting-part or two-lines warning's staff is typed in Type by system, or until it is dismissed with its Dismiss button (a corrected name is another line, so check it and dismiss the old warning). An import no longer overwrites a score saved in MuseScore meanwhile; it says so instead. A line naming its part stays in its own printed system, and when a pasted line names a part another line already reaches by staff number, the named one is used and the other is warned about. The Clean grid shows a system where every staff rests as one line. (#482)
+- Words typed for a part now land on the right bars after bars were added to a cleaned
+  score in MuseScore: the systems are counted again from the score's own line breaks. When
+  they cannot be, the Fix panel says the words map is out of date and asks for a clean. (#482)
+- A song can be sung in Latin the German way (soft c as "ts", h sounded, qu as "kv"): pick
+  **Latin (German style)** as its language. The Pronunciation list now takes a reading in the
+  voice's own sounds for a word in any language the singer reads (Latin, German, Swedish,
+  Estonian, English), with the language it is sung in; the sing run says which saved readings
+  it did not use. English and Latin songs sing exactly as before. (#484)
+- A clean, scan or other long job no longer erases what was saved to the song while it ran,
+  such as the publish record `sing_song.py --publish` writes: a save now writes only what that
+  job changed, and the app and the command-line tools take turns with the song's file. Reading
+  a system again now drops that system's Clean-grid answers, not the next system's, and
+  removing several systems at once drops each one's. The Clean grid refuses answers for a
+  system read again until a Scan puts the score together again. (#498)
+- *Find systems* splits a page into the systems it prints more often: a page cropped
+  tight to the music no longer comes back as one system per staff, and a scan with a
+  printed frame or a grey shadow down its side no longer comes back as one system for the
+  whole page. (#502)
+- *Find systems* (the quick finder, not *Ask homr*) now finds the systems on a scan with grey
+  paper; before, it found none on any page of such a scan. The lyric editor's staff pictures
+  and the Fix panel's bar box read such a scan too. (#494)
+- Publish and Clean panels tidied after the day's new features: the note about a sung
+  version on the site is one red line and a *Replace with piano only* button, with the
+  sing command folded under *Keep it sung instead*; its error lines are shown in red; each
+  rit. or accel. reads as one sentence with its controls on the next line; and the Clean
+  panel lists a scan's too-long voices bar by bar ("Bar 81, staff 4, voice 2: notes add up to
+  3/4 in a 1/2 bar"), folded into one line once the song is cleaned. (#501)
+- A new fix kind, `rehearsal`, puts a rehearsal mark the scan could not read on a bar, and
+  it reaches the published score. (#493)
+- A song's language is saved with it: choose it on the New song form or the song's Start panel,
+  or with the first `sing_song.py --lang`. A song with no language whose words do not look
+  Finnish is no longer sung as Finnish; the run stops and asks. English "I", "ow" and "oy"
+  sounds (child, now, boy) are sung as two vowels, and only songs sung in English wait for a
+  re-sing because of it. (#484)
+- A `delbar` fix refused by a repeat sign in the bar now says how to take the sign off first: an
+  `unrepeat` entry before it, written out with the bar and which sign. (#492)
+- A page with no music to sing, such as a title page, can be left out of a scan with a
+  *Leave this page out* switch in the Systems editor. Before, the Scan button stayed off until
+  every page had a system drawn on it, so the page had to be cut from the PDF first. (#490)
+- Cleaning's "was 9/8, cut to 4/4" red mark now says which voice lost notes, and a `bar` fix
+  that rewrites that voice (voice 1) takes the mark off, so the bar stops showing red; before,
+  only an `unmark` took it off. A cut in voice 2 still needs an `unmark`. (#488)
+- A time signature homr reads on only a few staves of a system, over a bar that is as long as
+  the meter before it, is no longer written onto every part (a stray 1/1 in a 3/4 song). And the
+  `timesig` fix can now change a bar's length, bar 1 included, where every bar the signature
+  covers is already that long; it takes their length overrides off. (#487)
+- A printed rit. or accel. now slows down or speeds up the practice track and the sung voices,
+  beat by beat, to three quarters (or five quarters) of the speed by the next "a tempo", tempo
+  change, fermata or the end. The Publish panel lists each one, with a target BPM or "play as
+  written". A part whose name says no voice ("Solo") is sung by its clef instead of stopping
+  the run (`--voice NAME=VOICE` to choose), `sing_song.py --try PART:A-B` sings one phrase of
+  one part to listen to, and publishing piano only asks before it replaces a sung version on
+  the site. (#483)
+
+- Lines can be sung on another machine over plain SSH: `REMOTE_RUNNER=scripts/ssh-runner.sh`
+  with `SSH_RUNNER_HOST`, and that machine's singer and voices. (#483)
+
+- `SING_PROVIDER` picks how the singer runs: `cpu`, `cuda` or `coreml` (tried, with the processor
+  as the fallback); the log names each model's provider. (#483)
+
+- A scan keeps a page when homr crashes as it exits after writing a whole result, and says so in
+  the log. (#483)
+
+- `scripts/install-homr.sh` installs into and reports on the venv `HOMR_BIN` in `.env` points
+  at, so `--status` no longer says homr is missing when it is installed elsewhere. (#483)
+
+- MuseScore 4 can now read a scan where a voice runs past its barline. Before, it refused the
+  whole file and the staff list failed with an error blaming `MUSESCORE_CLI_PATH`. The raw scan
+  is now converted with `-f`, the Clean panel lists each over-long bar, the clean's log names
+  them too, and a cleaned score
+  is checked by the same rule when the MuseScore is 4, so the bar is reset and listed in Fix. A
+  MuseScore error now gives the reason from MuseScore's own log, and the staff list answers with
+  it instead of a server error. (#491)
+
+- The Publish panel keeps the choir you chose when it is drawn again: a saved score redrew it with
+  the choir box empty, and Publish said "Choose a choir first." (#474)
+
+- Every singing part of a cleaned score is now a voice (soprano, alto, tenor, bass, baritone, or
+  plain voice), and so is the score you download for a song cleaned earlier. MuseScore 4 took
+  these parts for a piano and put a dynamic added there below the staff, over the words; now it
+  goes above. The sound is not changed. Dynamics already in an older score keep their side.
+  (#497)
+
+- Behind the scenes: `scripts/` is a regular package, so the tests import its scripts even
+  where another project's `scripts` package is on the path. (#475)
+
+- Behind the scenes: the runner tests in `src/kube_runner/tests/` pass on macOS as well as
+  Linux. (#476)
+
+- A whole-bar rest the scan stored as four beats in 3/4 is fitted to its bar when the song is
+  cleaned, so MuseScore 4 no longer refuses the score ("Incomplete measure") and the song
+  publishes. Publishing fits it too, so a song cleaned before this publishes without a
+  re-clean. (#477)
+
+- The site no longer shows a doubtful note's stem red: publishing takes the red off stems as well
+  as notes, also where the note itself is already black. MuseScore 4 colours the stem with its
+  head when it reads a scan; MuseScore 3 does not. (#478)
+
+- A song that prints its verses under one pass of the notes, with no repeat signs, can now sing
+  every verse: a new `endrepeat` fix (`measure`, `times`) closes a repeat on every staff and plays
+  it that many times (Kesän kukkiva maa, three verses). (#473)
+
 - The song page's Pronunciation list no longer asks about scat: "da", "di" and the like took 106
   of the 115 rows of Butterfly. A reading that only says a word's letters ("us" as U-S, "am" as
   A-M) is gone from it too. What is sung does not change. (#472)

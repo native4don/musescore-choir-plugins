@@ -802,6 +802,57 @@ def test_a_one_bar_change_the_page_prints_is_kept(tmp_path):
     assert declared_meters(score.findall("part")[0]) == [("1", "2/4"), ("3", "5/4")]
 
 
+def test_a_signature_one_staff_of_five_reads_is_dropped(tmp_path):
+    """#480: homr wrote a 1/1 on one staff of five over a bar three quarters
+    long, the last bar of a 3/4 system. A one-bar change can never gather two
+    bars of evidence, so it used to go onto every part. A change the page prints
+    is printed on every staff, and the bar measures the meter already in force."""
+    stray = a_staff([3] * 5, time=(3, 4), changes={4: (1, 1)})
+    staves = [a_staff([3] * 5, time=(3, 4))] * 4 + [stray]
+    heard = []
+    score = read(omr_systems.assemble([a_scan(1, staves)],
+                                      str(tmp_path / "s.musicxml"), heard.append))
+    for part in score.findall("part"):
+        assert declared_meters(part) == [("1", "3/4")]
+    assert any("Bar 5" in line and "1/1" in line and "1 of 5" in line
+               for line in heard)
+
+
+def test_a_stray_on_the_top_staff_does_not_outvote_the_others(tmp_path):
+    """The stray read first, and the other five staves restating 3/4 at that bar:
+    the bar declares what most staves read, not what the top one does."""
+    stray = a_staff([3, 3, 2], time=(3, 4), changes={1: (1, 1), 2: (2, 4)})
+    restating = a_staff([3, 3, 2], time=(3, 4), changes={1: (3, 4), 2: (2, 4)})
+    score = assembled(tmp_path, a_scan(1, [stray] + [restating] * 5))
+    for part in score.findall("part"):
+        assert declared_meters(part) == [("1", "3/4"), ("3", "2/4")]
+
+
+def test_a_stray_on_the_opening_bar_does_not_outvote_the_others(tmp_path):
+    stray = a_staff([3, 3], time=(1, 1), changes={1: (3, 4)})
+    others = a_staff([3, 3], time=(3, 4), changes={1: (3, 4)})
+    score = assembled(tmp_path, a_scan(1, [stray] + [others] * 5))
+    for part in score.findall("part"):
+        assert declared_meters(part) == [("1", "3/4")]
+
+
+def test_a_minority_signature_over_a_bar_that_changed_length_is_kept(tmp_path):
+    """The rule drops only a label the bar contradicts. A bar that really is
+    the new length keeps the signature, read on however few staves."""
+    odd = a_staff([3, 3, 2], time=(3, 4), changes={2: (2, 4)})
+    staves = [a_staff([3, 3, 2], time=(3, 4))] * 2 + [odd]
+    score = assembled(tmp_path, a_scan(1, staves))
+    assert declared_meters(score.findall("part")[0]) == [("1", "3/4"), ("3", "2/4")]
+
+
+def test_a_signature_half_the_staves_read_is_kept(tmp_path):
+    """Half is not fewer than half: two of four staves is not a stray."""
+    changed = a_staff([3, 3], time=(3, 4), changes={1: (4, 4)})
+    staves = [a_staff([3, 3], time=(3, 4))] * 2 + [changed] * 2
+    score = assembled(tmp_path, a_scan(1, staves))
+    assert declared_meters(score.findall("part")[0]) == [("1", "3/4"), ("2", "4/4")]
+
+
 def test_a_bar_whose_staves_disagree_is_not_an_observation(tmp_path):
     """Two staves, two answers, and nothing to choose between them: that bar says
     nothing about the meter, so a span made of such bars keeps what it was given.
@@ -1369,6 +1420,43 @@ def test_a_tie_over_the_break_comes_back_as_a_tie(tmp_path):
     assert _marks(out) == []
 
 
+def _dash(scan_):
+    for staff in scan_.staves:
+        for measure in staff.measures:
+            for slur in measure.iter("slur"):
+                slur.set("line-type", "dashed")
+    return scan_
+
+
+def test_a_dashed_half_makes_the_tie_over_the_break_dashed(tmp_path):
+    """#482: a later verse's tie is printed dashed and homr says so on the half it
+    saw dashed; the tie written over the line is dashed at both ends."""
+    out = omr_systems.assemble(
+        [_dash(_held_over_system(1, 1, {(1, 1, 4): "start"}, "G")),
+         _held_over_system(2, 1, {(1, 1, 1): "stop"}, "G")],
+        str(tmp_path / "a.musicxml"))
+    root = etree.parse(out).getroot()
+    assert [t.get("line-type") for t in root.iter("tied")] == ["dashed", "dashed"]
+
+
+def test_a_solid_tie_over_the_break_stays_solid(tmp_path):
+    out = omr_systems.assemble(
+        [_held_over_system(1, 1, {(1, 1, 4): "start"}, "G"),
+         _held_over_system(2, 1, {(1, 1, 1): "stop"}, "G")],
+        str(tmp_path / "a.musicxml"))
+    root = etree.parse(out).getroot()
+    assert [t.get("line-type") for t in root.iter("tied")] == [None, None]
+
+
+def test_a_dashed_half_makes_the_joined_slur_dashed(tmp_path):
+    out = omr_systems.assemble(
+        [_slurred_system(1, 1, {(1, 1, 4): "start"}),
+         _dash(_slurred_system(2, 1, {(1, 1, 1): "stop"}))],
+        str(tmp_path / "a.musicxml"))
+    root = etree.parse(out).getroot()
+    assert [s.get("line-type") for s in root.iter("slur")] == ["dashed", "dashed"]
+
+
 def test_a_half_that_cannot_be_joined_is_marked_even_beside_a_held_note(tmp_path):
     """The staff count changes at the break, so the halves cannot be joined. The
     same pitch opening the next system says nothing about which staff or voice
@@ -1487,6 +1575,19 @@ def test_a_slur_and_a_tie_ending_on_one_note_share_its_stop(tmp_path):
     root = etree.parse(out).getroot()
     assert [t.get("type") for t in root.iter("tied")] == ["start", "stop"]
 
+
+
+def test_a_dashed_slur_sharing_a_tie_s_stop_stays_dashed(tmp_path):
+    """The same shape with the slur drawn dashed (#482): the stop written for
+    it is dashed too, so the slur reads dashed at both ends."""
+    first = _slurred_system(1, 1, {(1, 1, 2): "start", (1, 1, 4): "start"})
+    _steps(first, 1, 1, "CAGA")
+    _slur_at(first, 1, 2).set("line-type", "dashed")
+    second = _slurred_system(2, 1, {(1, 1, 1): "stop"})
+    _steps(second, 1, 1, "ADEF")
+    out = omr_systems.assemble([first, second], str(tmp_path / "a.musicxml"))
+    root = etree.parse(out).getroot()
+    assert [s.get("line-type") for s in root.iter("slur")] == ["dashed", "dashed"]
 
 def _slur_at(scan_, bar, note):
     """The slur element on one note (staff 1) of a `_slurred_system`."""
